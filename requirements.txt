@@ -1,0 +1,6 @@
+numpy>=1.24
+shapely>=2.0
+torch>=2.0
+matplotlib>=3.7
+tensorboard>=2.10
+pytest>=8.0

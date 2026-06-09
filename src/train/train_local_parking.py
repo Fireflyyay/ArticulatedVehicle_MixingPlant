@@ -1,0 +1,391 @@
+import argparse
+from dataclasses import asdict, replace
+from datetime import datetime
+import json
+import os
+import time
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+from config import (
+    DEFAULT_ENV_CONFIG,
+    DEFAULT_MASK_CONFIG,
+    DEFAULT_PPO_CONFIG,
+    DEFAULT_SCENE_CONFIG,
+    DEFAULT_VEHICLE_PARAMS,
+)
+from env.local_parking_env import LocalParkingEnv
+from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
+from planning.passenger_hybrid_astar import PassengerHybridAStar
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _safe_mean(values):
+    return float(np.mean(values)) if values else 0.0
+
+
+def _write_jsonl(path, record):
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _resolve_output_dir(output_dir, seed, timestamp=None):
+    if output_dir:
+        return os.path.abspath(output_dir)
+    run_time = timestamp or datetime.now()
+    run_name = "local_parking_{}_seed{}".format(
+        run_time.strftime("%Y%m%d_%H%M%S"),
+        int(seed),
+    )
+    return os.path.join(REPO_ROOT, "runs", run_name)
+
+
+def _write_config_snapshot(path, args, env_config, ppo_config):
+    sections = (
+        ("training_arguments", vars(args)),
+        ("vehicle", asdict(DEFAULT_VEHICLE_PARAMS)),
+        ("action_mask", asdict(DEFAULT_MASK_CONFIG)),
+        ("scene", asdict(DEFAULT_SCENE_CONFIG)),
+        ("environment", asdict(env_config)),
+        ("ppo", asdict(ppo_config)),
+    )
+    with open(path, "w", encoding="utf-8") as handle:
+        for section_name, values in sections:
+            handle.write("[{}]\n".format(section_name))
+            for key in sorted(values):
+                handle.write("{} = {}\n".format(key, repr(values[key])))
+            handle.write("\n")
+
+
+def _update_reward_plot(path, episode_rewards):
+    episodes = np.arange(1, len(episode_rewards) + 1)
+    rewards = np.asarray(episode_rewards, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(episodes, rewards, color="#2b6cb0", linewidth=1.2, label="Episode reward")
+    if len(rewards) >= 10:
+        kernel = np.ones(10, dtype=np.float64) / 10.0
+        moving_average = np.convolve(rewards, kernel, mode="valid")
+        ax.plot(
+            episodes[9:],
+            moving_average,
+            color="#c53030",
+            linewidth=2.0,
+            label="10-episode mean",
+        )
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Reward")
+    ax.set_title("Local Parking Training Reward")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    temporary_path = path + ".tmp.png"
+    fig.savefig(temporary_path, dpi=150)
+    plt.close(fig)
+    os.replace(temporary_path, path)
+
+
+def _build_update_record(
+    buffer,
+    infos,
+    completed,
+    update_stats,
+    global_step,
+    episode_index,
+    update_index,
+    start_time,
+):
+    raw_actions = np.asarray(buffer.raw_actions)
+    executed_actions = np.asarray(buffer.executed_actions)
+    return {
+        "global_step": global_step,
+        "episode": episode_index,
+        "update": update_index,
+        "rollout_size": len(buffer),
+        "steps_per_second": global_step / max(time.perf_counter() - start_time, 1e-6),
+        **update_stats,
+        "raw_action_mean": raw_actions.mean(axis=0).tolist(),
+        "raw_action_std": raw_actions.std(axis=0).tolist(),
+        "executed_action_mean": executed_actions.mean(axis=0).tolist(),
+        "executed_action_std": executed_actions.std(axis=0).tolist(),
+        "speed_clip_rate": _safe_mean([item["speed_clip_rate"] for item in infos]),
+        "mask_invalid_rate": _safe_mean([item["mask_invalid_rate"] for item in infos]),
+        "mask_zero_fraction": _safe_mean([item["mask_zero_fraction"] for item in infos]),
+        "mask_safe_ratio_mean": _safe_mean([item["mask_safe_ratio"] for item in infos]),
+        "mask_safe_ratio_min": float(min(item["mask_safe_ratio"] for item in infos)),
+        "front_overlap": _safe_mean([item["front_overlap"] for item in infos]),
+        "best_front_overlap": _safe_mean(
+            [item["best_front_overlap"] for item in infos]
+        ),
+        "rear_body_overlap": _safe_mean(
+            [item["rear_body_overlap"] for item in infos]
+        ),
+        "heading_error_deg": _safe_mean(
+            [item["heading_error_deg"] for item in infos]
+        ),
+        "rear_heading_error_deg": _safe_mean(
+            [item["rear_heading_error_deg"] for item in infos]
+        ),
+        "distance_to_goal": _safe_mean(
+            [item["distance_to_goal"] for item in infos]
+        ),
+        "phi_mean": _safe_mean([item["phi"] for item in infos]),
+        "phi_abs_mean": _safe_mean([abs(item["phi"]) for item in infos]),
+        "min_lidar_distance": float(
+            min(item["min_lidar_distance"] for item in infos)
+        ),
+        "success_rate": _safe_mean([float(item["success"]) for item in completed]),
+        "collision_rate": _safe_mean(
+            [float(item["collision"]) for item in completed]
+        ),
+        "timeout_rate": _safe_mean([float(item["timeout"]) for item in completed]),
+        "hybrid_astar_valid_rate": _safe_mean(
+            [item["hybrid_astar_valid_rate"] for item in infos]
+        ),
+    }
+
+
+def _write_tensorboard_update(writer, record):
+    if writer is None:
+        return
+    episode = record["episode"]
+    for key, value in record.items():
+        if isinstance(value, (int, float)):
+            writer.add_scalar("update/{}".format(key), value, episode)
+    for field in (
+        "raw_action_mean",
+        "raw_action_std",
+        "executed_action_mean",
+        "executed_action_std",
+    ):
+        for index, value in enumerate(record[field]):
+            writer.add_scalar(
+                "update/{}/{}".format(field, index),
+                value,
+                episode,
+            )
+
+
+def train(args):
+    if args.total_episodes <= 0:
+        raise ValueError("--total-episodes must be positive")
+    if args.rollout_steps <= 0:
+        raise ValueError("--rollout-steps must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.checkpoint_interval <= 0:
+        raise ValueError("--checkpoint-interval must be positive")
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    env_config = replace(
+        DEFAULT_ENV_CONFIG,
+        curriculum_stage=args.stage,
+        use_hybrid_astar=bool(args.use_hybrid_astar),
+    )
+    ppo_config = replace(
+        DEFAULT_PPO_CONFIG,
+        rollout_steps=args.rollout_steps,
+        batch_size=min(args.batch_size, args.rollout_steps),
+    )
+    output_dir = _resolve_output_dir(args.output_dir, args.seed)
+    os.makedirs(output_dir, exist_ok=True)
+    args.output_dir = output_dir
+    _write_config_snapshot(
+        os.path.join(output_dir, "config.txt"),
+        args,
+        env_config,
+        ppo_config,
+    )
+
+    planner = PassengerHybridAStar() if args.use_hybrid_astar else None
+    env = LocalParkingEnv(
+        config=env_config,
+        hybrid_planner=planner,
+        seed=args.seed,
+    )
+    agent = ContinuousPPOAgent(config=ppo_config, device=args.device)
+
+    update_jsonl_path = os.path.join(output_dir, "training_metrics.jsonl")
+    episode_jsonl_path = os.path.join(output_dir, "episode_metrics.jsonl")
+    reward_plot_path = os.path.join(output_dir, "reward_curve.png")
+    writer = (
+        SummaryWriter(os.path.join(output_dir, "tensorboard"))
+        if SummaryWriter is not None
+        else None
+    )
+
+    observation, reset_info = env.reset(seed=args.seed)
+    global_step = 0
+    episode_index = 0
+    update_index = 0
+    last_done = False
+    episode_rewards = []
+    buffer = RolloutBuffer()
+    rollout_infos = []
+    rollout_completed = []
+    start_time = time.perf_counter()
+
+    while episode_index < args.total_episodes:
+        episode_reward = 0.0
+        episode_steps = 0
+        final_info = None
+        done = False
+        while not done:
+            raw_action, log_prob, value = agent.act(observation)
+            next_observation, reward, terminated, truncated, info = env.step(raw_action)
+            done = terminated or truncated
+            buffer.add(
+                observation=observation,
+                raw_action=raw_action,
+                executed_action=info["executed_action"],
+                log_prob=log_prob,
+                reward=reward,
+                done=done,
+                value=value,
+            )
+            rollout_infos.append(info)
+            observation = next_observation
+            global_step += 1
+            episode_steps += 1
+            episode_reward += float(reward)
+            final_info = info
+            last_done = done
+
+        episode_index += 1
+        episode_rewards.append(episode_reward)
+        rollout_completed.append(final_info)
+        episode_record = {
+            "episode": episode_index,
+            "global_step": global_step,
+            "episode_steps": episode_steps,
+            "episode_reward": episode_reward,
+            "success": bool(final_info["success"]),
+            "collision": bool(final_info["collision"]),
+            "timeout": bool(final_info["timeout"]),
+            "front_overlap": float(final_info["front_overlap"]),
+            "best_front_overlap": float(final_info["best_front_overlap"]),
+            "heading_error_deg": float(final_info["heading_error_deg"]),
+            "distance_to_goal": float(final_info["distance_to_goal"]),
+            "scenario_type": reset_info.get("scenario_type", ""),
+        }
+        _write_jsonl(episode_jsonl_path, episode_record)
+        if writer is not None:
+            writer.add_scalar("episode/reward", episode_reward, episode_index)
+            writer.add_scalar("episode/steps", episode_steps, episode_index)
+            writer.add_scalar(
+                "episode/success",
+                float(final_info["success"]),
+                episode_index,
+            )
+        if episode_index % 10 == 0 or episode_index == args.total_episodes:
+            _update_reward_plot(reward_plot_path, episode_rewards)
+
+        print(
+            "episode={}/{} reward={:.3f} episode_steps={} global_step={} "
+            "success={} collision={} timeout={}".format(
+                episode_index,
+                args.total_episodes,
+                episode_reward,
+                episode_steps,
+                global_step,
+                int(final_info["success"]),
+                int(final_info["collision"]),
+                int(final_info["timeout"]),
+            )
+        )
+
+        checkpoint_due = episode_index % args.checkpoint_interval == 0
+        should_update = (
+            len(buffer) >= ppo_config.rollout_steps
+            or episode_index == args.total_episodes
+            or checkpoint_due
+        )
+        if should_update:
+            update_stats = agent.update(buffer, observation, last_done)
+            update_index += 1
+            record = _build_update_record(
+                buffer=buffer,
+                infos=rollout_infos,
+                completed=rollout_completed,
+                update_stats=update_stats,
+                global_step=global_step,
+                episode_index=episode_index,
+                update_index=update_index,
+                start_time=start_time,
+            )
+            _write_jsonl(update_jsonl_path, record)
+            _write_tensorboard_update(writer, record)
+            print(
+                "ppo_update={update} episode={episode} rollout={rollout} "
+                "success_rate={success:.3f} kl={kl:.5f}".format(
+                    update=update_index,
+                    episode=episode_index,
+                    rollout=record["rollout_size"],
+                    success=record["success_rate"],
+                    kl=record["approx_kl"],
+                )
+            )
+            buffer = RolloutBuffer()
+            rollout_infos = []
+            rollout_completed = []
+
+        if checkpoint_due:
+            agent.save(
+                os.path.join(
+                    output_dir,
+                    "checkpoint_episode_{:06d}.pt".format(episode_index),
+                ),
+                extra={
+                    "global_step": global_step,
+                    "episode": episode_index,
+                    "stage": args.stage,
+                },
+            )
+        if episode_index < args.total_episodes:
+            observation, reset_info = env.reset()
+
+    agent.save(
+        os.path.join(output_dir, "checkpoint_final.pt"),
+        extra={
+            "global_step": global_step,
+            "episode": episode_index,
+            "stage": args.stage,
+        },
+    )
+    if writer is not None:
+        writer.close()
+    print("training artifacts: {}".format(output_dir))
+    return output_dir
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train continuous PPO for local parking.")
+    parser.add_argument("--total-episodes", type=int, default=10_000)
+    parser.add_argument("--rollout-steps", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
+    parser.add_argument("--use-hybrid-astar", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=100)
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Run directory. Default: <repo>/runs/local_parking_<timestamp>_seedN",
+    )
+    train(parser.parse_args())
+
+
+if __name__ == "__main__":
+    main()

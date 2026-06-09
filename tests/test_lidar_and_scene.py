@@ -1,0 +1,194 @@
+from types import SimpleNamespace
+import math
+
+import numpy as np
+
+from config import DEFAULT_VEHICLE_PARAMS
+from dataclasses import replace
+from config import DEFAULT_ENV_CONFIG
+from env.geometry import oriented_box
+from env.lidar import DualBodyLidar
+from env.local_parking_env import LocalParkingEnv
+from env.mixing_plant_scene import generate_cached_mixing_plant_scene
+from env.vehicle import ArticulatedState, ArticulatedVehicleModel
+
+
+def _edges(polygons):
+    result = []
+    for polygon in polygons:
+        coords = np.asarray(polygon.exterior.coords)
+        result.extend(np.stack([coords[:-1], coords[1:]], axis=1))
+    return np.asarray(result)
+
+
+def test_front_rear_lidar_frames_dimensions_and_normalization():
+    p = DEFAULT_VEHICLE_PARAMS
+    model = ArticulatedVehicleModel(p)
+    state = ArticulatedState(0.0, 0.0, 0.0, math.pi / 2.0)
+    rear_center = model.rear_center(state)
+    obstacles = [
+        oriented_box((6.0, 0.0), 0.0, 1.0, 1.0),
+        oriented_box((rear_center[0], rear_center[1] + 6.0), 0.0, 1.0, 1.0),
+    ]
+    scene = SimpleNamespace(obstacle_edges=_edges(obstacles))
+    lidar = DualBodyLidar(p)
+    front, rear = lidar.observe(state, model, scene, normalize=True)
+    assert front.shape == (54,)
+    assert rear.shape == (54,)
+    assert np.all((front >= 0.0) & (front <= 1.0))
+    assert np.all((rear >= 0.0) & (rear <= 1.0))
+    assert np.isclose(front[0] * p.lidar_range, 5.5, atol=0.1)
+    assert np.isclose(rear[0] * p.lidar_range, 5.5, atol=0.1)
+
+
+def test_rule_carved_scene_is_cached_and_deterministic():
+    first = generate_cached_mixing_plant_scene(stage=3, seed=7)
+    second = generate_cached_mixing_plant_scene(stage=3, seed=7)
+    assert first is second
+    assert (
+        first.metadata["generation_mode"]
+        == "blocked_grid_then_constructive_corridor_and_bay_carve"
+    )
+    assert np.array_equal(first.occupancy_grid, second.occupancy_grid)
+    assert 0.0 < first.metadata["free_ratio"] < 1.0
+    assert first.world_bounds == (-40.0, -40.0, 40.0, 40.0)
+    assert first.occupancy_grid.shape == (80, 80)
+    assert float(first.metadata["corridor_width"]) >= 13.0
+    assert len(first.parking_bays) >= 2
+
+
+def test_different_seeds_produce_distinct_parameterized_layouts():
+    scenes = [generate_cached_mixing_plant_scene(stage=3, seed=seed) for seed in range(16)]
+    grid_signatures = {scene.occupancy_grid.tobytes() for scene in scenes}
+    slot_poses = {
+        (
+            round(scene.slot.x_goal, 3),
+            round(scene.slot.y_goal, 3),
+            round(scene.slot.theta_goal, 3),
+        )
+        for scene in scenes
+    }
+    assert len(grid_signatures) == len(scenes)
+    assert len(slot_poses) >= 12
+    assert {scene.metadata["goal_orientation_mode"] for scene in scenes} == {
+        "head_in",
+        "parallel",
+    }
+
+
+def test_target_slot_is_inside_bay_with_supported_orientation_modes():
+    model = ArticulatedVehicleModel(DEFAULT_VEHICLE_PARAMS)
+    modes = set()
+    for seed in range(16):
+        scene = generate_cached_mixing_plant_scene(stage=3, seed=seed)
+        modes.add(scene.metadata["goal_orientation_mode"])
+        goal = scene.slot
+        target_state = ArticulatedState(
+            goal.x_goal,
+            goal.y_goal,
+            goal.theta_goal,
+            goal.theta_goal,
+        )
+        front_box, rear_box = model.body_boxes(target_state)
+        assert scene.target_bay.polygon.covers(front_box)
+        assert scene.target_bay.polygon.covers(rear_box)
+        assert not scene.prepared_obstacles.intersects(front_box)
+        assert not scene.prepared_obstacles.intersects(rear_box)
+
+        goal_direction = np.asarray(
+            [math.cos(goal.theta_goal), math.sin(goal.theta_goal)]
+        )
+        corridor_direction = np.asarray(
+            [
+                math.cos(scene.target_bay.corridor_heading),
+                math.sin(scene.target_bay.corridor_heading),
+            ]
+        )
+        inward_direction = np.asarray(
+            [
+                math.cos(scene.target_bay.inward_heading),
+                math.sin(scene.target_bay.inward_heading),
+            ]
+        )
+        if scene.metadata["goal_orientation_mode"] == "parallel":
+            assert abs(float(np.dot(goal_direction, corridor_direction))) > 0.999
+        else:
+            assert float(np.dot(goal_direction, inward_direction)) > 0.999
+    assert modes == {"head_in", "parallel"}
+
+
+def test_target_bay_mouth_connects_to_main_corridor():
+    for seed in range(16):
+        scene = generate_cached_mixing_plant_scene(stage=3, seed=seed)
+        mouth = np.asarray(scene.target_bay.mouth_center)
+        inward = np.asarray(
+            [
+                math.cos(scene.target_bay.inward_heading),
+                math.sin(scene.target_bay.inward_heading),
+            ]
+        )
+        assert not scene.is_occupied_world(*(mouth - 0.5 * inward))
+        assert not scene.is_occupied_world(*(mouth + 0.5 * inward))
+
+
+def test_parking_bays_do_not_overlap_each_other():
+    for seed in range(16):
+        scene = generate_cached_mixing_plant_scene(stage=3, seed=seed)
+        for index, first in enumerate(scene.parking_bays):
+            for second in scene.parking_bays[index + 1 :]:
+                assert first.polygon.intersection(second.polygon).area <= 1e-8
+
+
+def test_recovery_samples_are_diverse_near_obstacles_and_articulated(
+    synthetic_action_mask,
+):
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=4),
+        action_mask=synthetic_action_mask,
+        seed=10,
+    )
+    samples = []
+    state_signatures = set()
+    collisions = []
+    for _ in range(16):
+        _, info = env.reset()
+        samples.append(info)
+        state_signatures.add(tuple(np.round(env.state.as_array()[:4], 3)))
+        collisions.append(env._state_collides(env.state))
+    assert all(item["scenario_type"] == "recovery" for item in samples)
+    assert all(item["min_lidar_distance"] <= 2.2 for item in samples)
+    assert all(abs(item["phi"]) >= math.radians(18.0) for item in samples)
+    assert not any(collisions)
+    assert len(state_signatures) >= 12
+
+
+def test_near_goal_initial_states_cover_distance_heading_lateral_and_phi(
+    synthetic_action_mask,
+):
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=2),
+        action_mask=synthetic_action_mask,
+        seed=31,
+    )
+    states = []
+    for _ in range(32):
+        _, info = env.reset()
+        position_error = env.slot.position_error_in_slot_frame(
+            env.state.x_front,
+            env.state.y_front,
+        )
+        states.append(
+            (
+                info["distance_to_goal"],
+                abs(info["heading_error_deg"]),
+                abs(float(position_error[1])),
+                abs(math.degrees(env.state.phi)),
+                tuple(np.round(env.state.as_array()[:4], 3)),
+            )
+        )
+
+    assert len({item[4] for item in states}) == len(states)
+    assert max(item[0] for item in states) - min(item[0] for item in states) > 4.0
+    assert max(item[1] for item in states) > 45.0
+    assert max(item[2] for item in states) > 2.0
+    assert max(item[3] for item in states) > 10.0
