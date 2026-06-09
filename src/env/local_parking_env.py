@@ -79,7 +79,18 @@ class LocalParkingEnv:
                 scene_config=scene_config,
             )
         self.hybrid_reward = OptionalHybridAStarReward(
-            planner=hybrid_planner if config.use_hybrid_astar else None
+            planner=hybrid_planner if config.use_hybrid_astar else None,
+            gamma=0.98,
+            cost_scale=config.planner_cost_scale,
+            potential_coef=config.planner_potential_coef,
+            potential_clip=config.planner_potential_clip,
+            max_cost=config.planner_max_cost,
+            lateral_residual_weight=config.planner_lateral_residual_weight,
+            goal_heading_weight=config.planner_goal_heading_weight,
+            lateral_clip=config.planner_lateral_clip,
+            fallback_position_weight=config.planner_fallback_position_weight,
+            fallback_heading_weight=config.planner_fallback_heading_weight,
+            failure_bias=config.planner_failure_bias,
         )
         self.reward_model = LocalParkingReward(config)
         self.observation_space = BoxSpace(-np.inf, np.inf, (self.OBS_DIM,))
@@ -431,6 +442,9 @@ class LocalParkingEnv:
             "phi": float(self.state.phi),
             "min_lidar_distance": min_lidar,
             "hybrid_astar_valid_rate": 1.0 if self.hybrid_reward.valid else 0.0,
+            "planner_valid": self.hybrid_reward.valid,
+            "planner_fallback_used": self.hybrid_reward._fallback_used,
+            "planner_fail_reason": str(self.hybrid_reward.fail_reason),
             "scene_seed": int(self.scene.metadata["seed"]),
             "goal_orientation_mode": str(
                 self.scene.metadata.get("goal_orientation_mode", "")
@@ -478,6 +492,7 @@ class LocalParkingEnv:
         hybrid_value, hybrid_info = self.hybrid_reward.step(
             self.state.x_front,
             self.state.y_front,
+            self.state.theta_front,
         )
         reward, reward_components = self.reward_model.compute(
             front_overlap=metrics["front_overlap"],

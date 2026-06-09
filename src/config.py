@@ -139,7 +139,30 @@ class LocalParkingEnvConfig:
     w_dist: float = 0.0
     w_heading: float = 0.3
     w_time: float = 0.1
-    w_hybrid: float = 0.5
+    w_hybrid: float = 1.0
+
+    # --- Planner potential oracle (Hybrid A* → PBRS) ---
+    planner_position_tolerance: float = 0.8
+    planner_heading_tolerance_deg: float = 15.0
+
+    # PBRS core:  Φ(s) = -J(s) / planner_cost_scale
+    # reward = planner_potential_coef * (gamma^tau * Φ' - Φ)
+    planner_cost_scale: float = 25.0
+    planner_potential_coef: float = 0.5
+    planner_potential_clip: float = 1.0
+    planner_max_cost: float = 80.0
+
+    # J_state = remaining_path_length
+    #   + planner_lateral_residual_weight * clip(lateral, planner_lateral_clip)
+    #   + planner_goal_heading_weight * abs(wrap_to_pi(theta - theta_goal))
+    planner_lateral_residual_weight: float = 0.5
+    planner_goal_heading_weight: float = 1.0
+    planner_lateral_clip: float = 5.0
+
+    # Fallback cost when planner fails (pose-based J)
+    planner_fallback_position_weight: float = 1.0
+    planner_fallback_heading_weight: float = 2.0
+    planner_failure_bias: float = 3.0
 
 
 @dataclass(frozen=True)

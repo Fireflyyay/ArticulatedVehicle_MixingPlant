@@ -157,6 +157,18 @@ def _build_update_record(
         "hybrid_astar_episode_valid_rate": _safe_mean(
             [float(item.get("hybrid_astar_valid_rate", 0.0)) for item in completed]
         ),
+        "planner_valid_rate": _safe_mean(
+            [float(item.get("planner_valid", False)) for item in infos]
+        ),
+        "planner_cost_mean": _safe_mean(
+            [float(item.get("planner_cost", 0.0)) for item in infos]
+        ),
+        "planner_potential_reward_mean": _safe_mean(
+            [float(item.get("planner_potential_reward", 0.0)) for item in infos]
+        ),
+        "planner_fallback_used_rate": _safe_mean(
+            [float(item.get("planner_fallback_used", False)) for item in infos]
+        ),
     }
 
 
@@ -239,6 +251,9 @@ def train(args):
         env.set_active_stage(actual_stage)
     agent = ContinuousPPOAgent(config=ppo_config, device=args.device)
 
+    if env.hybrid_reward.planner is not None:
+        env.hybrid_reward._gamma = float(ppo_config.gamma)
+
     update_jsonl_path = os.path.join(output_dir, "training_metrics.jsonl")
     episode_jsonl_path = os.path.join(output_dir, "episode_metrics.jsonl")
     reward_plot_path = os.path.join(output_dir, "reward_curve.png")
@@ -308,6 +323,9 @@ def train(args):
             "hybrid_astar_valid_rate": float(
                 final_info.get("hybrid_astar_valid_rate", 0.0)
             ),
+            "planner_valid": bool(final_info.get("planner_valid", False)),
+            "planner_fallback_used": bool(final_info.get("planner_fallback_used", False)),
+            "planner_fail_reason": str(final_info.get("planner_fail_reason", "")),
         }
         _write_jsonl(episode_jsonl_path, episode_record)
         if writer is not None:
