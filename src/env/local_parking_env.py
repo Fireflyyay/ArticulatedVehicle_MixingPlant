@@ -53,6 +53,7 @@ class LocalParkingEnv:
         hybrid_planner=None,
         scene_config=DEFAULT_SCENE_CONFIG,
         seed=0,
+        multi_stage_pool=None,
     ):
         self.config = config
         self.vehicle_params = vehicle_params
@@ -66,12 +67,17 @@ class LocalParkingEnv:
         )
         if self.action_mask.feature_dim != self.MASK_FEATURE_DIM:
             raise ValueError("LocalParkingEnv currently requires 11 phi_dot mask bins")
-        self.scene_pool = CachedScenePool(
-            stage=config.curriculum_stage,
-            pool_size=config.scene_pool_size,
-            base_seed=int(seed),
-            scene_config=scene_config,
-        )
+        self._multi_pool = multi_stage_pool
+        self._active_stage = int(config.curriculum_stage)
+        if multi_stage_pool is not None:
+            self.scene_pool = multi_stage_pool.pool_for(self._active_stage)
+        else:
+            self.scene_pool = CachedScenePool(
+                stage=config.curriculum_stage,
+                pool_size=config.scene_pool_size,
+                base_seed=int(seed),
+                scene_config=scene_config,
+            )
         self.hybrid_reward = OptionalHybridAStarReward(
             planner=hybrid_planner if config.use_hybrid_astar else None
         )
@@ -86,6 +92,13 @@ class LocalParkingEnv:
         self.current_mask = None
         self.last_front_lidar_m = None
         self.last_rear_lidar_m = None
+
+    def set_active_stage(self, stage):
+        stage = int(np.clip(stage, 1, 4))
+        if self._multi_pool is None:
+            raise RuntimeError("set_active_stage requires a MultiStageScenePool")
+        self._active_stage = stage
+        self.scene_pool = self._multi_pool.pool_for(stage)
 
     def _state_collides(self, state):
         front_box, rear_box = self.vehicle_model.body_boxes(state)
@@ -148,11 +161,6 @@ class LocalParkingEnv:
     def _sample_initial_state(self):
         stage = int(np.clip(self.config.curriculum_stage, 1, 4))
         goal = self.slot
-        axis = np.asarray(
-            [math.cos(goal.theta_goal), math.sin(goal.theta_goal)],
-            dtype=np.float64,
-        )
-        normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
         index = stage - 1
         distance_range = self.config.stage_distance_ranges[index]
         lateral_range = float(self.config.stage_lateral_ranges[index])
@@ -165,9 +173,32 @@ class LocalParkingEnv:
             4: "recovery",
         }[stage]
 
+        goal_orientation_mode = self.scene.metadata.get("goal_orientation_mode", "head_in")
+        if goal_orientation_mode == "parallel":
+            corridor_heading = float(self.scene.metadata["corridor_heading"])
+            corridor_origin = np.asarray(self.scene.metadata["corridor_origin"])
+            corridor_width = float(self.scene.metadata["corridor_width"])
+            axis = np.asarray([math.cos(corridor_heading), math.sin(corridor_heading)])
+            normal = np.asarray([-axis[1], axis[0]])
+            delta = np.asarray(goal.center) - corridor_origin
+            along_proj = float(np.dot(delta, axis))
+            ref_center = corridor_origin + axis * along_proj
+            half_width = self.vehicle_params.overall_width / 2.0
+            max_lateral = max(0.3, corridor_width / 2.0 - half_width - 0.3)
+            effective_lateral_range = min(lateral_range, max_lateral)
+        else:
+            axis = np.asarray(
+                [math.cos(goal.theta_goal), math.sin(goal.theta_goal)],
+                dtype=np.float64,
+            )
+            normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+            ref_center = np.asarray(goal.center)
+            effective_lateral_range = lateral_range
+
+        fallback_used = False
         for _ in range(max(1, int(self.config.initial_sampling_attempts))):
             distance = self.rng.uniform(*distance_range)
-            lateral = self.rng.uniform(-lateral_range, lateral_range)
+            lateral = self.rng.uniform(-effective_lateral_range, effective_lateral_range)
             heading_error = self.rng.uniform(-heading_range, heading_range)
             phi = self.rng.uniform(-phi_range, phi_range)
 
@@ -183,10 +214,10 @@ class LocalParkingEnv:
                 elif pose_mode == 1:
                     min_lateral = min(
                         float(self.config.poor_pose_min_lateral),
-                        lateral_range,
+                        effective_lateral_range,
                     )
                     lateral = math.copysign(
-                        self.rng.uniform(min_lateral, lateral_range),
+                        self.rng.uniform(min_lateral, effective_lateral_range),
                         self.rng.choice((-1.0, 1.0)),
                     )
                     scenario = "poor_terminal_lateral"
@@ -201,7 +232,7 @@ class LocalParkingEnv:
             if stage == 4:
                 min_phi = math.radians(self.config.recovery_min_abs_phi_deg)
                 lateral = math.copysign(
-                    self.rng.uniform(min(1.8, lateral_range), lateral_range),
+                    self.rng.uniform(min(1.8, effective_lateral_range), effective_lateral_range),
                     self.rng.choice((-1.0, 1.0)),
                 )
                 phi = math.copysign(
@@ -209,7 +240,7 @@ class LocalParkingEnv:
                     self.rng.choice((-1.0, 1.0)),
                 )
 
-            center = np.asarray(goal.center) - distance * axis + lateral * normal
+            center = ref_center - distance * axis + lateral * normal
             theta_front = wrap_to_pi(goal.theta_goal + heading_error)
             state = ArticulatedState(
                 x_front=float(center[0]),
@@ -220,10 +251,10 @@ class LocalParkingEnv:
             if stage == 4:
                 if not self._valid_recovery_state(state):
                     continue
-                return state, scenario
+                return state, scenario, fallback_used
             if self._state_collides(state):
                 continue
-            return state, scenario
+            return state, scenario, fallback_used
 
         if stage == 4:
             state = self._structured_recovery_state(goal, axis, normal)
@@ -233,19 +264,25 @@ class LocalParkingEnv:
                         self.scene.metadata["seed"]
                     )
                 )
-            return state, "recovery"
+            return state, "recovery", fallback_used
 
-        # Deterministic open-corridor fallback; scene construction guarantees it.
-        center = np.asarray(goal.center) - 6.0 * axis
-        return (
-            ArticulatedState(
-                x_front=float(center[0]),
-                y_front=float(center[1]),
-                theta_front=float(goal.theta_goal),
-                theta_rear=float(goal.theta_goal),
-            ),
-            scenario + "_fallback",
+        fallback_used = True
+        center = ref_center - 6.0 * axis
+        state = ArticulatedState(
+            x_front=float(center[0]),
+            y_front=float(center[1]),
+            theta_front=float(goal.theta_goal),
+            theta_rear=float(goal.theta_goal),
         )
+        if self._state_collides(state):
+            raise RuntimeError(
+                "fallback initial state collides for scene seed {} mode {} stage {}".format(
+                    self.scene.metadata["seed"],
+                    goal_orientation_mode,
+                    stage,
+                )
+            )
+        return state, scenario + "_fallback", fallback_used
 
     def _boxes_and_metrics(self):
         front_box, rear_box = self.vehicle_model.body_boxes(self.state)
@@ -352,7 +389,7 @@ class LocalParkingEnv:
         self.episode_index += 1
         self.slot = self.scene.slot
         self.step_count = 0
-        self.state, scenario_type = self._sample_initial_state()
+        self.state, scenario_type, fallback_used = self._sample_initial_state()
         metrics = self._boxes_and_metrics()
         self.reward_model.reset(
             initial_distance=metrics["distance_to_goal"],
@@ -364,6 +401,12 @@ class LocalParkingEnv:
         obs = self._observation(metrics)
         info = self._base_info(metrics)
         info["scenario_type"] = scenario_type
+        info["scene_seed"] = int(self.scene.metadata["seed"])
+        info["goal_orientation_mode"] = str(
+            self.scene.metadata.get("goal_orientation_mode", "")
+        )
+        info["fallback_used"] = bool(fallback_used)
+        info["initial_collision"] = self._state_collides(self.state)
         return obs, info
 
     def _out_of_bounds(self, front_box, rear_box):
@@ -388,6 +431,10 @@ class LocalParkingEnv:
             "phi": float(self.state.phi),
             "min_lidar_distance": min_lidar,
             "hybrid_astar_valid_rate": 1.0 if self.hybrid_reward.valid else 0.0,
+            "scene_seed": int(self.scene.metadata["seed"]),
+            "goal_orientation_mode": str(
+                self.scene.metadata.get("goal_orientation_mode", "")
+            ),
         }
 
     def step(self, raw_action):

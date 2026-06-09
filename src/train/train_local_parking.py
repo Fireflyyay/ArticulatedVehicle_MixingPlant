@@ -22,6 +22,7 @@ from config import (
 from env.local_parking_env import LocalParkingEnv
 from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
 from planning.passenger_hybrid_astar import PassengerHybridAStar
+from train.curriculum import CurriculumStageSelector, MultiStageScenePool
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -153,6 +154,9 @@ def _build_update_record(
         "hybrid_astar_valid_rate": _safe_mean(
             [item["hybrid_astar_valid_rate"] for item in infos]
         ),
+        "hybrid_astar_episode_valid_rate": _safe_mean(
+            [float(item.get("hybrid_astar_valid_rate", 0.0)) for item in completed]
+        ),
     }
 
 
@@ -208,12 +212,31 @@ def train(args):
         ppo_config,
     )
 
+    curriculum = bool(args.curriculum)
+    stage_selector = None
+    multi_pool = None
+    if curriculum:
+        multi_pool = MultiStageScenePool(
+            pool_size=env_config.scene_pool_size,
+            base_seed=args.seed,
+            scene_config=DEFAULT_SCENE_CONFIG,
+        )
+        stage_selector = CurriculumStageSelector(
+            target_success_rate=float(args.curriculum_target_success),
+        )
+        actual_stage = stage_selector.select_stage(0)
+    else:
+        actual_stage = args.stage
+
     planner = PassengerHybridAStar() if args.use_hybrid_astar else None
     env = LocalParkingEnv(
         config=env_config,
         hybrid_planner=planner,
         seed=args.seed,
+        multi_stage_pool=multi_pool,
     )
+    if curriculum:
+        env.set_active_stage(actual_stage)
     agent = ContinuousPPOAgent(config=ppo_config, device=args.device)
 
     update_jsonl_path = os.path.join(output_dir, "training_metrics.jsonl")
@@ -278,6 +301,13 @@ def train(args):
             "heading_error_deg": float(final_info["heading_error_deg"]),
             "distance_to_goal": float(final_info["distance_to_goal"]),
             "scenario_type": reset_info.get("scenario_type", ""),
+            "scene_seed": int(reset_info.get("scene_seed", -1)),
+            "goal_orientation_mode": str(reset_info.get("goal_orientation_mode", "")),
+            "fallback_used": bool(reset_info.get("fallback_used", False)),
+            "initial_collision": bool(reset_info.get("initial_collision", False)),
+            "hybrid_astar_valid_rate": float(
+                final_info.get("hybrid_astar_valid_rate", 0.0)
+            ),
         }
         _write_jsonl(episode_jsonl_path, episode_record)
         if writer is not None:
@@ -309,7 +339,6 @@ def train(args):
         should_update = (
             len(buffer) >= ppo_config.rollout_steps
             or episode_index == args.total_episodes
-            or checkpoint_due
         )
         if should_update:
             update_stats = agent.update(buffer, observation, last_done)
@@ -352,6 +381,11 @@ def train(args):
                     "stage": args.stage,
                 },
             )
+        if curriculum:
+            stage_selector.record(actual_stage, bool(final_info["success"]))
+            actual_stage = stage_selector.select_stage(episode_index)
+            env.set_active_stage(actual_stage)
+
         if episode_index < args.total_episodes:
             observation, reset_info = env.reset()
 
@@ -383,6 +417,17 @@ def main():
         "--output-dir",
         default=None,
         help="Run directory. Default: <repo>/runs/local_parking_<timestamp>_seedN",
+    )
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        help="Enable multi-stage curriculum training (auto-selects stages 1-4)",
+    )
+    parser.add_argument(
+        "--curriculum-target-success",
+        type=float,
+        default=0.75,
+        help="Target success rate for curriculum worst-performance selection",
     )
     train(parser.parse_args())
 
