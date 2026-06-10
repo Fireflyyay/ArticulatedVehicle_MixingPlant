@@ -67,7 +67,7 @@ class ActionMaskConfig:
     n_phi_dot_bins: int = 11
     n_speed_bins: int = 8
     n_phi_state_bins: int = 13
-    safety_margin: float = 0.15
+    safety_margin: float = 0.10
     min_safe_ratio: float = 1e-3
     table_horizon_steps: int = 1
 
@@ -136,10 +136,10 @@ class LocalParkingEnvConfig:
     failure_reward: float = -5.0
     distance_d_min: float = 1.0
     w_iou: float = 1.0
-    w_dist: float = 0.0
+    w_dist: float = 0.05
     w_heading: float = 0.3
     w_time: float = 0.1
-    w_hybrid: float = 1.0
+    w_hybrid: float = 3.0
 
     # --- Planner potential oracle (Hybrid A* → PBRS) ---
     planner_position_tolerance: float = 0.8
@@ -163,6 +163,17 @@ class LocalParkingEnvConfig:
     planner_fallback_position_weight: float = 1.0
     planner_fallback_heading_weight: float = 2.0
     planner_failure_bias: float = 3.0
+
+    # --- Safe-speed-ratio action parameterization ---
+    gear_deadband: float = 0.10
+    mask_cost_stop_weight: float = 0.5
+    mask_cost_abs_weight: float = 0.15
+    mask_cost_rel_weight: float = 0.10
+    mask_cost_rel_delta: float = 0.05
+    mask_cost_clip_weight: float = 0.05
+    mask_cost_safe_threshold: float = 0.15
+    mask_cost_max: float = 3.0
+    mask_cost_coef_final: float = 0.8
 
 
 @dataclass(frozen=True)

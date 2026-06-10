@@ -33,15 +33,15 @@ class BoxSpace:
 
 class LocalParkingEnv:
     SLOT_FEATURE_DIM = 13
-    VEHICLE_FEATURE_DIM = 5
+    VEHICLE_FEATURE_DIM = 6
     LIDAR_FEATURE_DIM = 108
     MASK_FEATURE_DIM = 22
-    OBS_DIM = 148
+    OBS_DIM = 149
     OBS_SLICES = {
         "slot": slice(0, 13),
-        "vehicle": slice(13, 18),
-        "lidar": slice(18, 126),
-        "mask": slice(126, 148),
+        "vehicle": slice(13, 19),
+        "lidar": slice(19, 127),
+        "mask": slice(127, 149),
     }
 
     def __init__(
@@ -103,6 +103,8 @@ class LocalParkingEnv:
         self.current_mask = None
         self.last_front_lidar_m = None
         self.last_rear_lidar_m = None
+        self.prev_motion_gear = None
+        self.prev_gear_in_obs = 0.0
 
     def set_active_stage(self, stage):
         stage = int(np.clip(stage, 1, 4))
@@ -372,6 +374,7 @@ class LocalParkingEnv:
                 self.state.phi_dot / p.phi_dot_max,
                 math.cos(phi),
                 math.sin(phi),
+                self.prev_gear_in_obs,
             ],
             dtype=np.float32,
         )
@@ -401,6 +404,8 @@ class LocalParkingEnv:
         self.slot = self.scene.slot
         self.step_count = 0
         self.state, scenario_type, fallback_used = self._sample_initial_state()
+        self.prev_motion_gear = None
+        self.prev_gear_in_obs = 0.0
         metrics = self._boxes_and_metrics()
         self.reward_model.reset(
             initial_distance=metrics["distance_to_goal"],
@@ -449,19 +454,34 @@ class LocalParkingEnv:
             "goal_orientation_mode": str(
                 self.scene.metadata.get("goal_orientation_mode", "")
             ),
+            "max_safe_ratio": 0.0,
+            "raw_safe_ratio": 0.0,
+            "exec_safe_ratio": 0.0,
+            "forced_stop": False,
+            "clip_ratio": 0.0,
+            "mask_cost": 0.0,
+            "gear": 0,
         }
 
     def step(self, raw_action):
         if self.state is None:
             raise RuntimeError("reset() must be called before step()")
-        execution = self.action_mask.filter_and_clip_action(
+        decoded = self.action_mask.decode_safe_speed_and_cost(
             raw_action,
             self.current_mask,
             self.state.phi,
             dt=self.vehicle_params.dt,
+            prev_motion_gear=self.prev_motion_gear,
+            config=self.config,
         )
-        self.state = self.vehicle_model.step(self.state, execution.executed_action)
+        executed_action = np.asarray(
+            [decoded["v_exec"], decoded["phi_dot_exec"]],
+            dtype=np.float32,
+        )
+        self.state = self.vehicle_model.step(self.state, executed_action)
         self.step_count += 1
+        self.prev_motion_gear = decoded["prev_motion_gear"]
+        self.prev_gear_in_obs = decoded["prev_gear_in_obs"]
         metrics = self._boxes_and_metrics()
 
         collision = bool(
@@ -514,19 +534,25 @@ class LocalParkingEnv:
                 "out_of_bounds": bool(out_of_bounds),
                 "timeout": bool(timeout),
                 "articulation_limit_violation": bool(articulation_violation),
-                "raw_action": execution.raw_action.copy(),
-                "decoded_action": execution.decoded_action.copy(),
-                "executed_action": execution.executed_action.copy(),
-                "mask_safe_ratio": float(execution.safe_ratio),
+                "raw_action": np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0),
+                "executed_action": executed_action,
+                "mask_safe_ratio": float(decoded["r_raw"]),
                 "mask_safe_ratio_mean": float(np.mean(self.current_mask)),
                 "mask_safe_ratio_min": float(np.min(self.current_mask)),
                 "mask_zero_fraction": float(
                     np.mean(self.current_mask <= self.action_mask.min_safe_ratio)
                 ),
-                "mask_invalid_rate": 1.0 if execution.invalid else 0.0,
-                "selected_action_masked": bool(execution.invalid),
-                "speed_clip_rate": 1.0 if execution.speed_clipped else 0.0,
+                "mask_invalid_rate": 1.0 if decoded["forced_stop"] else 0.0,
+                "selected_action_masked": bool(decoded["forced_stop"]),
+                "speed_clip_rate": 1.0 if decoded["clip_ratio"] > 0.01 else 0.0,
                 "reward_components": reward_components,
+                "gear": int(decoded["gear"]),
+                "raw_safe_ratio": float(decoded["r_raw"]),
+                "exec_safe_ratio": float(decoded["r_exec"]),
+                "max_safe_ratio": float(decoded["r_max"]),
+                "forced_stop": bool(decoded["forced_stop"]),
+                "clip_ratio": float(decoded["clip_ratio"]),
+                "mask_cost": float(decoded["mask_cost"]),
             }
         )
         return obs, reward, terminated, truncated, info

@@ -169,6 +169,32 @@ def _build_update_record(
         "planner_fallback_used_rate": _safe_mean(
             [float(item.get("planner_fallback_used", False)) for item in infos]
         ),
+        "forced_stop_rate": _safe_mean(
+            [float(item.get("forced_stop", False)) for item in infos]
+        ),
+        "low_safe_abs_rate": _safe_mean(
+            [float(item.get("raw_safe_ratio", 0.0) < 0.15) for item in infos]
+        ),
+        "mean_raw_safe_ratio": _safe_mean(
+            [item.get("raw_safe_ratio", 0.0) for item in infos]
+        ),
+        "mean_max_safe_ratio": _safe_mean(
+            [item.get("max_safe_ratio", 0.0) for item in infos]
+        ),
+        "clip_rate": _safe_mean(
+            [float(item.get("clip_ratio", 0.0) > 0.01) for item in infos]
+        ),
+        "mask_cost_mean": _safe_mean(
+            [float(item.get("mask_cost", 0.0)) for item in infos]
+        ),
+        "gear_switch_rate": _safe_mean([
+            float(i > 0 and infos[i].get("gear", 0) != infos[i - 1].get("gear", 0))
+            for i in range(1, len(infos))
+        ]) if len(infos) > 1 else 0.0,
+        "mask_loss_ratio_abs": float(
+            abs(update_stats.get("aux_mask_loss", 0.0))
+            / max(abs(update_stats.get("policy_loss", 0.0)), 1e-8)
+        ),
     }
 
 
@@ -275,6 +301,15 @@ def train(args):
     start_time = time.perf_counter()
 
     while episode_index < args.total_episodes:
+        mask_coef_final = float(env_config.mask_cost_coef_final)
+        if episode_index < 20:
+            current_mask_coef = 0.0
+        elif episode_index < 220:
+            progress = (episode_index - 20) / 200.0
+            current_mask_coef = mask_coef_final * progress
+        else:
+            current_mask_coef = mask_coef_final
+
         episode_reward = 0.0
         episode_steps = 0
         final_info = None
@@ -291,6 +326,7 @@ def train(args):
                 reward=reward,
                 done=done,
                 value=value,
+                mask_cost=float(info.get("mask_cost", 0.0)),
             )
             rollout_infos.append(info)
             observation = next_observation
@@ -326,6 +362,10 @@ def train(args):
             "planner_valid": bool(final_info.get("planner_valid", False)),
             "planner_fallback_used": bool(final_info.get("planner_fallback_used", False)),
             "planner_fail_reason": str(final_info.get("planner_fail_reason", "")),
+            "mask_cost": float(final_info.get("mask_cost", 0.0)),
+            "forced_stop": int(final_info.get("forced_stop", False)),
+            "raw_safe_ratio_final": float(final_info.get("raw_safe_ratio", 0.0)),
+            "mask_coef": float(current_mask_coef),
         }
         _write_jsonl(episode_jsonl_path, episode_record)
         if writer is not None:
@@ -359,7 +399,7 @@ def train(args):
             or episode_index == args.total_episodes
         )
         if should_update:
-            update_stats = agent.update(buffer, observation, last_done)
+            update_stats = agent.update(buffer, observation, last_done, mask_coef=current_mask_coef)
             update_index += 1
             record = _build_update_record(
                 buffer=buffer,

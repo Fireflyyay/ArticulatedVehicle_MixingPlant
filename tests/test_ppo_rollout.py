@@ -19,10 +19,10 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
     raw_action, log_prob, value = agent.act(obs)
     next_obs, reward, terminated, truncated, info = env.step(raw_action)
 
-    assert obs.shape == (148,)
+    assert obs.shape == (149,)
     assert raw_action.shape == (2,)
     assert info["executed_action"].shape == (2,)
-    assert next_obs.shape == (148,)
+    assert next_obs.shape == (149,)
 
     buffer = RolloutBuffer()
     buffer.add(

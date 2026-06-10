@@ -22,6 +22,8 @@ from env.vehicle import (
 FORWARD_GEAR = 0
 REVERSE_GEAR = 1
 
+STOP_GEAR = -1
+
 
 def default_action_mask_path():
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -177,6 +179,147 @@ class ArticulatedActionMask:
             safe_speeds = np.where(speed_safe[gear], speed_bins[None, :], 0.0)
             mask[gear] = np.max(safe_speeds, axis=1) / float(vmax)
         return np.clip(mask, 0.0, 1.0)
+
+    def filter_and_clip_action_fallback(self, v_exec, v_safe_max, phi_dot, phi, dt=None):
+        p = self.vehicle_params
+        duration = p.dt if dt is None else float(dt)
+        phi_dot_executed = float(np.clip(phi_dot, -p.phi_dot_max, p.phi_dot_max))
+        phi_dot_executed = clip_phi_dot_to_limit(
+            phi,
+            phi_dot_executed,
+            duration,
+            p.phi_max,
+        )
+        was_clipped = False
+        if abs(v_exec) > v_safe_max + 1e-5:
+            v_exec = math.copysign(v_safe_max, v_exec)
+            was_clipped = True
+        return v_exec, phi_dot_executed, was_clipped
+
+    def _r_raw_at_gear_phi_dot(self, mask, gear, phi_dot_executed):
+        return float(
+            np.interp(
+                phi_dot_executed,
+                self.phi_dot_bins,
+                np.asarray(mask, dtype=np.float32)[gear],
+            )
+        )
+
+    def _r_max_overall(self, mask):
+        return float(np.max(np.asarray(mask, dtype=np.float32)))
+
+    def decode_safe_speed_and_cost(self, raw_action, mask, phi, dt, prev_motion_gear, config):
+        raw = np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0)
+        if raw.shape != (2,):
+            raise ValueError("raw_action must have shape (2,)")
+        p = self.vehicle_params
+        duration = p.dt if dt is None else float(dt)
+        deadband = float(getattr(config, "gear_deadband", 0.10))
+
+        phi_dot_raw = float(raw[1]) * p.phi_dot_max
+        phi_dot_exec = clip_phi_dot_to_limit(phi, phi_dot_raw, duration, p.phi_max)
+
+        if abs(raw[0]) < deadband:
+            if prev_motion_gear is None:
+                gear = STOP_GEAR
+                rho = 0.0
+            else:
+                gear = prev_motion_gear
+                rho = 0.0
+            a0_sign = 0.0
+        else:
+            if raw[0] >= 0.0:
+                gear = FORWARD_GEAR
+            else:
+                gear = REVERSE_GEAR
+            rho = abs(float(raw[0]))
+            a0_sign = math.copysign(1.0, raw[0])
+
+        if gear == STOP_GEAR:
+            v_exec = 0.0
+            r_raw = 0.0
+            forced_stop = False
+            v_safe_max = 0.0
+            clip_ratio = 0.0
+        else:
+            gear_vmax = (
+                p.parking_v_forward_max if gear == FORWARD_GEAR
+                else p.parking_v_reverse_max
+            )
+            r_raw = self._r_raw_at_gear_phi_dot(mask, gear, phi_dot_exec)
+            r_min = float(self.min_safe_ratio)
+            forced_stop = (r_raw <= r_min)
+            if forced_stop:
+                r_exec = 0.0
+                v_safe_max = 0.0
+                v_exec = 0.0
+            else:
+                r_exec = r_raw
+                v_safe_max = r_exec * gear_vmax
+                v_decoded = a0_sign * rho * v_safe_max
+                v_exec = float(v_decoded)
+            clip_ratio_check = (
+                abs(rho * gear_vmax) + 1e-7 if not forced_stop else 0.0
+            )
+
+        v_exec, phi_dot_exec, was_clipped = self.filter_and_clip_action_fallback(
+            v_exec, v_safe_max, phi_dot_exec, phi, dt
+        )
+
+        if gear != STOP_GEAR and not forced_stop:
+            if v_safe_max > 1e-7:
+                clip_ratio = abs(rho * v_safe_max - abs(v_exec)) / (abs(rho * v_safe_max) + 1e-6)
+            else:
+                clip_ratio = 0.0
+        else:
+            clip_ratio = 0.0
+        if was_clipped:
+            clip_ratio = max(clip_ratio, 0.01)
+
+        r_max = self._r_max_overall(mask) if gear != STOP_GEAR else 0.0
+        r_min = float(self.min_safe_ratio)
+        tau_safe = float(getattr(config, "mask_cost_safe_threshold", 0.15))
+        delta_rel = float(getattr(config, "mask_cost_rel_delta", 0.05))
+        c_max = float(getattr(config, "mask_cost_max", 3.0))
+
+        c_stop = float(getattr(config, "mask_cost_stop_weight", 0.5)) * (1.0 if forced_stop else 0.0)
+        c_abs = float(getattr(config, "mask_cost_abs_weight", 0.15)) * max(0.0, tau_safe - r_raw)
+        c_rel = (
+            float(getattr(config, "mask_cost_rel_weight", 0.10))
+            * max(0.0, r_max - r_raw - delta_rel)
+        )
+        c_clip = float(getattr(config, "mask_cost_clip_weight", 0.05)) * clip_ratio
+        mask_cost = float(np.clip(c_stop + c_abs + c_rel + c_clip, 0.0, c_max))
+
+        if abs(raw[0]) >= deadband:
+            if raw[0] >= 0.0:
+                new_motion_gear = FORWARD_GEAR
+            else:
+                new_motion_gear = REVERSE_GEAR
+        else:
+            new_motion_gear = prev_motion_gear
+
+        if gear == STOP_GEAR:
+            prev_gear_in_obs = 0.0
+        elif gear == FORWARD_GEAR:
+            prev_gear_in_obs = 1.0
+        else:
+            prev_gear_in_obs = -1.0
+
+        return {
+            "v_exec": float(v_exec),
+            "phi_dot_exec": float(phi_dot_exec),
+            "gear": int(gear),
+            "rho": float(rho),
+            "r_raw": float(r_raw),
+            "r_exec": float(r_raw if not forced_stop else 0.0),
+            "r_max": float(r_max),
+            "forced_stop": bool(forced_stop),
+            "clip_ratio": float(clip_ratio),
+            "mask_cost": float(mask_cost),
+            "prev_motion_gear": new_motion_gear,
+            "prev_gear_in_obs": float(prev_gear_in_obs),
+        }
 
     def filter_and_clip_action(self, raw_action, mask, phi, dt=None):
         raw = np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0)

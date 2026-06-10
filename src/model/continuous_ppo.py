@@ -19,7 +19,7 @@ class ObservationEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.slot_vehicle_encoder = nn.Sequential(
-            nn.Linear(18, 64),
+            nn.Linear(19, 64),
             nn.Tanh(),
         )
         self.lidar_encoder = nn.Sequential(
@@ -33,9 +33,9 @@ class ObservationEncoder(nn.Module):
         self.apply(_orthogonal_init)
 
     def forward(self, obs):
-        slot_vehicle = self.slot_vehicle_encoder(obs[..., :18])
-        lidar = self.lidar_encoder(obs[..., 18:126])
-        mask = self.mask_encoder(obs[..., 126:148])
+        slot_vehicle = self.slot_vehicle_encoder(obs[..., :19])
+        lidar = self.lidar_encoder(obs[..., 19:127])
+        mask = self.mask_encoder(obs[..., 127:149])
         return torch.cat([slot_vehicle, lidar, mask], dim=-1)
 
 
@@ -129,6 +129,7 @@ class RolloutBuffer:
         self.rewards = []
         self.dones = []
         self.values = []
+        self.mask_costs = []
 
     def add(
         self,
@@ -139,6 +140,7 @@ class RolloutBuffer:
         reward,
         done,
         value,
+        mask_cost=0.0,
     ):
         self.observations.append(np.asarray(observation, dtype=np.float32))
         self.raw_actions.append(np.asarray(raw_action, dtype=np.float32))
@@ -147,6 +149,7 @@ class RolloutBuffer:
         self.rewards.append(float(reward))
         self.dones.append(float(done))
         self.values.append(float(value))
+        self.mask_costs.append(float(mask_cost))
 
     def __len__(self):
         return len(self.rewards)
@@ -222,7 +225,7 @@ class ContinuousPPOAgent:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages, returns
 
-    def update(self, buffer, last_observation, last_done):
+    def update(self, buffer, last_observation, last_done, mask_coef=0.0):
         if len(buffer) == 0:
             raise ValueError("cannot update PPO from an empty rollout")
         last_value = 0.0 if last_done else self.value(last_observation)
@@ -255,9 +258,11 @@ class ContinuousPPOAgent:
             "entropy": [],
             "approx_kl": [],
             "clip_fraction": [],
+            "aux_mask_loss": [],
         }
         rollout_size = len(buffer)
         batch_size = min(int(self.config.batch_size), rollout_size)
+        clip_range = float(self.config.clip_range)
         for _ in range(int(self.config.ppo_epochs)):
             permutation = np.random.permutation(rollout_size)
             for start in range(0, rollout_size, batch_size):
@@ -276,13 +281,30 @@ class ContinuousPPOAgent:
                 clipped = (
                     torch.clamp(
                         ratio,
-                        1.0 - self.config.clip_range,
-                        1.0 + self.config.clip_range,
+                        1.0 - clip_range,
+                        1.0 + clip_range,
                     )
                     * advantages_t[indices]
                 )
                 policy_loss = -torch.min(unclipped, clipped).mean()
-                actor_loss = policy_loss - self.config.entropy_coef * entropy.mean()
+
+                aux_mask_loss = torch.tensor(0.0, device=self.device)
+                if mask_coef > 0.0 and len(buffer.mask_costs) == rollout_size:
+                    mask_costs_t = torch.as_tensor(
+                        np.asarray(buffer.mask_costs, dtype=np.float32),
+                        device=self.device,
+                    )[indices]
+                    ratio_clip = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+                    aux_mask_loss = torch.max(
+                        ratio * mask_costs_t,
+                        ratio_clip * mask_costs_t,
+                    ).mean()
+
+                actor_loss = (
+                    policy_loss
+                    - self.config.entropy_coef * entropy.mean()
+                    + mask_coef * aux_mask_loss
+                )
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -304,7 +326,7 @@ class ContinuousPPOAgent:
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - log_ratio).mean()
                     clip_fraction = (
-                        (torch.abs(ratio - 1.0) > self.config.clip_range)
+                        (torch.abs(ratio - 1.0) > clip_range)
                         .float()
                         .mean()
                     )
@@ -313,6 +335,7 @@ class ContinuousPPOAgent:
                 stats["entropy"].append(float(entropy.mean().item()))
                 stats["approx_kl"].append(float(approx_kl.item()))
                 stats["clip_fraction"].append(float(clip_fraction.item()))
+                stats["aux_mask_loss"].append(float(aux_mask_loss.item()))
 
         return {key: float(np.mean(values)) for key, values in stats.items()}
 
