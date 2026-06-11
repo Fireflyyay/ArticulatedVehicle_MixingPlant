@@ -88,10 +88,10 @@ class MixingPlantSceneConfig:
         8.0,
     )
     branch_width_ratio: float = 0.85
-    head_in_bay_width: float = 6.0
-    head_in_bay_depth: float = 9.0
-    parallel_bay_length: float = 6.0
-    parallel_bay_depth: float = 9.0
+    head_in_bay_width: float = 8.0
+    head_in_bay_depth: float = 10.0
+    parallel_bay_length: float = 12.0
+    parallel_bay_depth: float = 6.0
     parking_head_wall_clearance: float = 1.0
     main_origin_jitter: float = 2.0
     target_bay_along_range: Tuple[float, float] = (-18.0, 18.0)
@@ -111,10 +111,10 @@ class LocalParkingEnvConfig:
     collision_tolerance: float = 1e-8
     articulation_tolerance: float = math.radians(1.0)
     success_overlap: float = 0.80
-    success_heading_error: float = math.radians(10.0)
+    success_heading_error: float = math.radians(15.0)
     curriculum_stage: int = 1
     scene_pool_size: int = 16
-    use_hybrid_astar: bool = True
+    use_hybrid_astar: bool = False
     initial_sampling_attempts: int = 128
     stage_distance_ranges: Tuple[Tuple[float, float], ...] = (
         (8.0, 15.0),
@@ -136,10 +136,10 @@ class LocalParkingEnvConfig:
     failure_reward: float = -5.0
     distance_d_min: float = 1.0
     w_iou: float = 1.0
-    w_dist: float = 0.05
+    w_dist: float = 0.01
     w_heading: float = 0.3
     w_time: float = 0.1
-    w_hybrid: float = 3.0
+    w_hybrid: float = 4.0
 
     # --- Planner potential oracle (Hybrid A* → PBRS) ---
     planner_position_tolerance: float = 0.8
@@ -163,6 +163,13 @@ class LocalParkingEnvConfig:
     planner_fallback_position_weight: float = 1.0
     planner_fallback_heading_weight: float = 2.0
     planner_failure_bias: float = 3.0
+
+    # --- Near-goal Reeds-Shepp potential ---
+    rs_potential_enabled: bool = True
+    rs_potential_d_rs: float = 15.0
+    rs_potential_k: int = 2
+    rs_potential_coef: float = 0.5
+    rs_potential_clip: float = 1.0
 
     # --- Safe-speed-ratio action parameterization ---
     gear_deadband: float = 0.10

@@ -42,6 +42,37 @@ def _write_jsonl(path, record):
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _rs_metrics_by_mode(infos):
+    grouped = {}
+    for mode in ("head_in", "parallel"):
+        selected = [
+            item
+            for item in infos
+            if str(item.get("goal_orientation_mode", "")) == mode
+        ]
+        if not selected:
+            continue
+        grouped[mode] = {
+            "step_count": len(selected),
+            "latched_rate": _safe_mean(
+                [float(item.get("rs_latched", False)) for item in selected]
+            ),
+            "valid_rate": _safe_mean(
+                [float(item.get("rs_valid_rate", 0.0)) for item in selected]
+            ),
+            "reward_mean": _safe_mean(
+                [float(item.get("rs_reward", 0.0)) for item in selected]
+            ),
+            "plan_time_ms_mean": _safe_mean(
+                [float(item.get("rs_plan_time_ms_mean", 0.0)) for item in selected]
+            ),
+            "plan_time_ms_max": max(
+                float(item.get("rs_plan_time_ms_max", 0.0)) for item in selected
+            ),
+        }
+    return grouped
+
+
 def _resolve_output_dir(output_dir, seed, timestamp=None):
     if output_dir:
         return os.path.abspath(output_dir)
@@ -169,6 +200,52 @@ def _build_update_record(
         "planner_fallback_used_rate": _safe_mean(
             [float(item.get("planner_fallback_used", False)) for item in infos]
         ),
+        "rs_attempt_count": sum(
+            int(item.get("rs_attempt_count", 0)) for item in completed
+        ),
+        "rs_success_count": sum(
+            int(item.get("rs_success_count", 0)) for item in completed
+        ),
+        "rs_latched_rate": _safe_mean(
+            [float(item.get("rs_latched", False)) for item in infos]
+        ),
+        "rs_valid_rate": _safe_mean(
+            [float(item.get("rs_valid_rate", 0.0)) for item in completed]
+        ),
+        "rs_plan_time_ms_mean": _safe_mean(
+            [float(item.get("rs_plan_time_ms_mean", 0.0)) for item in completed]
+        ),
+        "rs_plan_time_ms_max": max(
+            [float(item.get("rs_plan_time_ms_max", 0.0)) for item in completed]
+            or [0.0]
+        ),
+        "rs_reward_mean": _safe_mean(
+            [float(item.get("rs_reward", 0.0)) for item in infos]
+        ),
+        "rs_cost_mean": _safe_mean(
+            [float(item.get("rs_cost", 0.0)) for item in infos]
+        ),
+        "rs_remaining_length_mean": _safe_mean(
+            [float(item.get("rs_remaining_length", 0.0)) for item in infos]
+        ),
+        "rs_projection_error_mean": _safe_mean(
+            [float(item.get("rs_projection_error", 0.0)) for item in infos]
+        ),
+        "rs_heading_error_mean": _safe_mean(
+            [float(item.get("rs_heading_error", 0.0)) for item in infos]
+        ),
+        "rs_fail_reasons": dict(
+            (reason, sum(
+                1
+                for item in completed
+                if str(item.get("rs_fail_reason", "")) == reason
+            ))
+            for reason in sorted(
+                set(str(item.get("rs_fail_reason", "")) for item in completed)
+            )
+            if reason
+        ),
+        "rs_by_goal_orientation_mode": _rs_metrics_by_mode(infos),
         "forced_stop_rate": _safe_mean(
             [float(item.get("forced_stop", False)) for item in infos]
         ),
@@ -234,6 +311,9 @@ def train(args):
         DEFAULT_ENV_CONFIG,
         curriculum_stage=args.stage,
         use_hybrid_astar=bool(args.use_hybrid_astar),
+        rs_potential_enabled=not bool(
+            getattr(args, "disable_rs_potential", False)
+        ),
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -279,6 +359,7 @@ def train(args):
 
     if env.hybrid_reward.planner is not None:
         env.hybrid_reward._gamma = float(ppo_config.gamma)
+    env.rs_potential.gamma = float(ppo_config.gamma)
 
     update_jsonl_path = os.path.join(output_dir, "training_metrics.jsonl")
     episode_jsonl_path = os.path.join(output_dir, "episode_metrics.jsonl")
@@ -362,6 +443,27 @@ def train(args):
             "planner_valid": bool(final_info.get("planner_valid", False)),
             "planner_fallback_used": bool(final_info.get("planner_fallback_used", False)),
             "planner_fail_reason": str(final_info.get("planner_fail_reason", "")),
+            "planner_source": str(final_info.get("planner_source", "")),
+            "rs_attempt_count": int(final_info.get("rs_attempt_count", 0)),
+            "rs_success_count": int(final_info.get("rs_success_count", 0)),
+            "rs_latched": bool(final_info.get("rs_latched", False)),
+            "rs_valid_rate": float(final_info.get("rs_valid_rate", 0.0)),
+            "rs_plan_time_ms_mean": float(
+                final_info.get("rs_plan_time_ms_mean", 0.0)
+            ),
+            "rs_plan_time_ms_max": float(
+                final_info.get("rs_plan_time_ms_max", 0.0)
+            ),
+            "rs_reward": float(final_info.get("rs_reward", 0.0)),
+            "rs_cost": float(final_info.get("rs_cost", 0.0)),
+            "rs_remaining_length": float(
+                final_info.get("rs_remaining_length", 0.0)
+            ),
+            "rs_projection_error": float(
+                final_info.get("rs_projection_error", 0.0)
+            ),
+            "rs_heading_error": float(final_info.get("rs_heading_error", 0.0)),
+            "rs_fail_reason": str(final_info.get("rs_fail_reason", "")),
             "mask_cost": float(final_info.get("mask_cost", 0.0)),
             "forced_stop": int(final_info.get("forced_stop", False)),
             "raw_safe_ratio_final": float(final_info.get("raw_safe_ratio", 0.0)),
@@ -468,6 +570,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument("--use-hybrid-astar", action="store_true")
+    parser.add_argument(
+        "--disable-rs-potential",
+        action="store_true",
+        help="Disable near-goal Reeds-Shepp potential shaping",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=100)

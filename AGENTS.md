@@ -40,12 +40,15 @@ SMDP here.
   vehicle geometry, dynamics, LiDAR beams, mask bins, or mask horizon:
   `conda run -n HOPE python scripts/generate_articulated_action_mask_table.py`.
 - Parking success uses front-body target overlap >= 0.80 and wrapped front
-  heading error <= 10 degrees. Rear overlap and rear heading are diagnostics,
+  heading error <= 15 degrees. Rear overlap and rear heading are diagnostics,
   not success conditions.
 - Collision termination uses real front/rear polygons against scene obstacles.
   LiDAR and the action mask are not collision truth.
 - Hybrid A* is optional auxiliary shaping. Planner failure returns zero hybrid
   reward and must not terminate the episode or remove base reward terms.
+- RS potential is near-goal reward guidance only. It may latch one
+  collision-free directed RS path per episode; after latch it replaces the
+  Hybrid A* contribution and never controls the continuous action.
 
 ## Scene Policy
 

@@ -16,6 +16,7 @@ from env.hybrid_astar_reward import OptionalHybridAStarReward
 from env.lidar import DualBodyLidar
 from env.mixing_plant_scene import CachedScenePool
 from env.reward import LocalParkingReward
+from env.rs_potential import RSPotentialOracle, RSPotentialPlanner
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
 
 
@@ -51,6 +52,7 @@ class LocalParkingEnv:
         action_mask=None,
         action_mask_path=None,
         hybrid_planner=None,
+        rs_planner=None,
         scene_config=DEFAULT_SCENE_CONFIG,
         seed=0,
         multi_stage_pool=None,
@@ -92,6 +94,37 @@ class LocalParkingEnv:
             fallback_heading_weight=config.planner_fallback_heading_weight,
             failure_bias=config.planner_failure_bias,
         )
+        if rs_planner is None and config.rs_potential_enabled:
+            collision_checker = hybrid_planner
+            if not hasattr(collision_checker, "_is_rectangle_occupied"):
+                from planning.passenger_hybrid_astar import PassengerHybridAStar
+
+                collision_checker = PassengerHybridAStar(
+                    goal_pos_tol=config.planner_position_tolerance,
+                    goal_heading_tol_deg=config.planner_heading_tolerance_deg,
+                    front_half_length=0.5 * vehicle_params.front_body_length,
+                    front_half_width=0.5 * vehicle_params.front_body_width,
+                )
+            rs_planner = RSPotentialPlanner(
+                collision_checker=collision_checker,
+                turning_radius=vehicle_params.minimum_turning_radius,
+                candidate_limit=config.rs_potential_k,
+                sample_step=float(getattr(collision_checker, "step_length", 1.0))
+                / float(getattr(collision_checker, "intermediate_checks", 2) + 1),
+            )
+        self.rs_potential = RSPotentialOracle(
+            planner=rs_planner,
+            enabled=config.rs_potential_enabled,
+            d_rs=config.rs_potential_d_rs,
+            gamma=0.98,
+            cost_scale=config.planner_cost_scale,
+            potential_coef=config.rs_potential_coef,
+            potential_clip=config.rs_potential_clip,
+            max_cost=config.planner_max_cost,
+            lateral_weight=config.planner_lateral_residual_weight,
+            heading_weight=config.planner_goal_heading_weight,
+            lateral_clip=config.planner_lateral_clip,
+        )
         self.reward_model = LocalParkingReward(config)
         self.observation_space = BoxSpace(-np.inf, np.inf, (self.OBS_DIM,))
         self.action_space = BoxSpace(-1.0, 1.0, (2,))
@@ -105,6 +138,7 @@ class LocalParkingEnv:
         self.last_rear_lidar_m = None
         self.prev_motion_gear = None
         self.prev_gear_in_obs = 0.0
+        self.scenario_type = ""
 
     def set_active_stage(self, stage):
         stage = int(np.clip(stage, 1, 4))
@@ -172,7 +206,7 @@ class LocalParkingEnv:
         return None
 
     def _sample_initial_state(self):
-        stage = int(np.clip(self.config.curriculum_stage, 1, 4))
+        stage = int(np.clip(self._active_stage, 1, 4))
         goal = self.slot
         index = stage - 1
         distance_range = self.config.stage_distance_ranges[index]
@@ -404,6 +438,7 @@ class LocalParkingEnv:
         self.slot = self.scene.slot
         self.step_count = 0
         self.state, scenario_type, fallback_used = self._sample_initial_state()
+        self.scenario_type = str(scenario_type)
         self.prev_motion_gear = None
         self.prev_gear_in_obs = 0.0
         metrics = self._boxes_and_metrics()
@@ -413,6 +448,7 @@ class LocalParkingEnv:
             initial_heading_error=metrics["heading_error"],
         )
         self.hybrid_reward.reset(self.scene, self.state, self.slot)
+        self.rs_potential.reset()
         self._update_sensors_and_mask()
         obs = self._observation(metrics)
         info = self._base_info(metrics)
@@ -437,7 +473,7 @@ class LocalParkingEnv:
         min_lidar = float(
             min(np.min(self.last_front_lidar_m), np.min(self.last_rear_lidar_m))
         )
-        return {
+        info = {
             "front_overlap": float(metrics["front_overlap"]),
             "best_front_overlap": float(self.reward_model.best_front_overlap),
             "rear_body_overlap": float(metrics["rear_overlap"]),
@@ -454,6 +490,7 @@ class LocalParkingEnv:
             "goal_orientation_mode": str(
                 self.scene.metadata.get("goal_orientation_mode", "")
             ),
+            "scenario_type": str(self.scenario_type),
             "max_safe_ratio": 0.0,
             "raw_safe_ratio": 0.0,
             "exec_safe_ratio": 0.0,
@@ -462,10 +499,19 @@ class LocalParkingEnv:
             "mask_cost": 0.0,
             "gear": 0,
         }
+        info.update(
+            {
+                key: value
+                for key, value in self.rs_potential.diagnostics().items()
+                if not key.startswith("planner_")
+            }
+        )
+        return info
 
     def step(self, raw_action):
         if self.state is None:
             raise RuntimeError("reset() must be called before step()")
+        previous_state = self.state
         decoded = self.action_mask.decode_safe_speed_and_cost(
             raw_action,
             self.current_mask,
@@ -509,11 +555,42 @@ class LocalParkingEnv:
         terminated = bool(success or collision or out_of_bounds or articulation_violation)
         truncated = bool(timeout and not terminated)
 
-        hybrid_value, hybrid_info = self.hybrid_reward.step(
-            self.state.x_front,
-            self.state.y_front,
-            self.state.theta_front,
+        rs_value, rs_info = self.rs_potential.step(
+            self.scene,
+            previous_state,
+            self.state,
+            self.slot,
         )
+        if self.rs_potential.rs_latched:
+            hybrid_value = 0.0
+            hybrid_info = {
+                "hybrid_astar_suppressed_by_rs": True,
+            }
+            planner_value = rs_value
+            planner_source = "rs"
+        elif (
+            self.config.rs_potential_enabled
+            and self.hybrid_reward.planner is None
+        ):
+            hybrid_value = 0.0
+            hybrid_info = {
+                "planner_valid": False,
+                "planner_cost": 0.0,
+                "planner_phi": 0.0,
+                "planner_potential_reward": 0.0,
+                "planner_fallback_used": False,
+                "planner_fail_reason": "disabled",
+            }
+            planner_value = 0.0
+            planner_source = "none"
+        else:
+            hybrid_value, hybrid_info = self.hybrid_reward.step(
+                self.state.x_front,
+                self.state.y_front,
+                self.state.theta_front,
+            )
+            planner_value = hybrid_value
+            planner_source = "hybrid_astar"
         reward, reward_components = self.reward_model.compute(
             front_overlap=metrics["front_overlap"],
             distance_to_goal=metrics["distance_to_goal"],
@@ -521,12 +598,27 @@ class LocalParkingEnv:
             step_count=self.step_count,
             success=success,
             failure=failure,
-            hybrid_reward=hybrid_value,
+            hybrid_reward=planner_value,
         )
+        reward_components["hybrid_astar"] = float(hybrid_value)
+        reward_components["rs_potential"] = (
+            float(rs_value) if self.rs_potential.rs_latched else 0.0
+        )
+        reward_components["planner"] = float(planner_value)
+        reward_components["planner_source"] = planner_source
         self._update_sensors_and_mask()
         obs = self._observation(metrics)
         info = self._base_info(metrics)
         info.update(hybrid_info)
+        info.update(
+            rs_info
+            if self.rs_potential.rs_latched
+            else {
+                key: value
+                for key, value in rs_info.items()
+                if not key.startswith("planner_")
+            }
+        )
         info.update(
             {
                 "success": bool(success),
@@ -553,6 +645,7 @@ class LocalParkingEnv:
                 "forced_stop": bool(decoded["forced_stop"]),
                 "clip_ratio": float(decoded["clip_ratio"]),
                 "mask_cost": float(decoded["mask_cost"]),
+                "planner_source": planner_source,
             }
         )
         return obs, reward, terminated, truncated, info

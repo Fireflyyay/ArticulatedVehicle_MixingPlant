@@ -60,6 +60,7 @@ class LocalParkingReward:
             "heading_improvement": heading_improvement,
             "time": time_reward,
             "hybrid_astar": float(hybrid_reward),
+            "planner": float(hybrid_reward),
         }
         total = (
             terminal_reward
