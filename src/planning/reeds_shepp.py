@@ -33,6 +33,11 @@ import numpy as np
 from env.geometry import wrap_to_pi
 
 
+MAX_PATH_TOTAL_LENGTH_M = 256.0
+MAX_PATH_SEGMENT_LENGTH_M = 128.0
+MAX_PATH_SAMPLE_COUNT = 8192
+
+
 @dataclass
 class ReedsSheppPath:
     lengths: List[float]
@@ -377,11 +382,46 @@ def _to_world(local_poses, start):
     return world
 
 
+def _predicted_pose_count(lengths, max_curvature, sample_step):
+    normalized_step = float(sample_step) * float(max_curvature)
+    if normalized_step <= 0.0:
+        raise ValueError("sample_step and max_curvature must be positive")
+    total = 0
+    for segment_length in lengths:
+        total += int(math.ceil(abs(float(segment_length)) / normalized_step)) + 1
+    return total
+
+
+def _within_sampling_limits(
+    path,
+    max_curvature,
+    sample_step,
+    max_total_length,
+    max_segment_length,
+    max_sample_count,
+):
+    total_length_m = float(path.total_length) / float(max_curvature)
+    if total_length_m > float(max_total_length):
+        return False
+    if any(
+        abs(float(segment_length)) / float(max_curvature) > float(max_segment_length)
+        for segment_length in path.lengths
+    ):
+        return False
+    return (
+        _predicted_pose_count(path.lengths, max_curvature, sample_step)
+        <= int(max_sample_count)
+    )
+
+
 def generate_reeds_shepp_paths(
     start: Sequence[float],
     goal: Sequence[float],
     turning_radius: float,
     sample_step: float,
+    max_total_length: float = MAX_PATH_TOTAL_LENGTH_M,
+    max_segment_length: float = MAX_PATH_SEGMENT_LENGTH_M,
+    max_sample_count: int = MAX_PATH_SAMPLE_COUNT,
 ):
     """Return all analytical candidates, sampled and sorted by path length."""
     radius = float(turning_radius)
@@ -391,6 +431,18 @@ def generate_reeds_shepp_paths(
         raise ValueError("sample_step must be positive")
     max_curvature = 1.0 / radius
     paths = _normalized_candidates(start, goal, max_curvature, sample_step)
+    paths = [
+        path
+        for path in paths
+        if _within_sampling_limits(
+            path=path,
+            max_curvature=max_curvature,
+            sample_step=sample_step,
+            max_total_length=max_total_length,
+            max_segment_length=max_segment_length,
+            max_sample_count=max_sample_count,
+        )
+    ]
     for path in paths:
         local_poses, directions = _sample_local_path(
             path.lengths,

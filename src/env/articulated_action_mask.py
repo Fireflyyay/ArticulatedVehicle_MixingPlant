@@ -15,7 +15,6 @@ from config import (
 from env.vehicle import (
     ArticulatedState,
     ArticulatedVehicleModel,
-    clip_phi_dot_to_limit,
 )
 
 
@@ -180,21 +179,32 @@ class ArticulatedActionMask:
             mask[gear] = np.max(safe_speeds, axis=1) / float(vmax)
         return np.clip(mask, 0.0, 1.0)
 
-    def filter_and_clip_action_fallback(self, v_exec, v_safe_max, phi_dot, phi, dt=None):
+    def _decode_phi_dot(self, normalized_phi_dot, phi, dt):
         p = self.vehicle_params
-        duration = p.dt if dt is None else float(dt)
-        phi_dot_executed = float(np.clip(phi_dot, -p.phi_dot_max, p.phi_dot_max))
-        phi_dot_executed = clip_phi_dot_to_limit(
-            phi,
-            phi_dot_executed,
-            duration,
-            p.phi_max,
+        duration = float(dt)
+        if duration <= 0.0:
+            raise ValueError("dt must be positive")
+
+        phi_value = float(phi)
+        rate_limit = float(p.phi_dot_max)
+        angle_limit = float(p.phi_max)
+        # The vehicle model has d(phi) / dt = phi_dot exactly.
+        lower = max(
+            -rate_limit,
+            (-angle_limit - phi_value) / duration,
         )
-        was_clipped = False
-        if abs(v_exec) > v_safe_max + 1e-5:
-            v_exec = math.copysign(v_safe_max, v_exec)
-            was_clipped = True
-        return v_exec, phi_dot_executed, was_clipped
+        upper = min(
+            rate_limit,
+            (angle_limit - phi_value) / duration,
+        )
+        if lower > upper:
+            # An already-invalid state may be too far out to recover in one step.
+            recovery_rate = math.copysign(rate_limit, -phi_value)
+            lower = recovery_rate
+            upper = recovery_rate
+
+        alpha = 0.5 * (float(normalized_phi_dot) + 1.0)
+        return float(lower + alpha * (upper - lower))
 
     def _r_raw_at_gear_phi_dot(self, mask, gear, phi_dot_executed):
         return float(
@@ -216,8 +226,7 @@ class ArticulatedActionMask:
         duration = p.dt if dt is None else float(dt)
         deadband = float(getattr(config, "gear_deadband", 0.10))
 
-        phi_dot_raw = float(raw[1]) * p.phi_dot_max
-        phi_dot_exec = clip_phi_dot_to_limit(phi, phi_dot_raw, duration, p.phi_max)
+        phi_dot_exec = self._decode_phi_dot(raw[1], phi, duration)
 
         if abs(raw[0]) < deadband:
             if prev_motion_gear is None:
@@ -239,8 +248,6 @@ class ArticulatedActionMask:
             v_exec = 0.0
             r_raw = 0.0
             forced_stop = False
-            v_safe_max = 0.0
-            clip_ratio = 0.0
         else:
             gear_vmax = (
                 p.parking_v_forward_max if gear == FORWARD_GEAR
@@ -250,31 +257,12 @@ class ArticulatedActionMask:
             r_min = float(self.min_safe_ratio)
             forced_stop = (r_raw <= r_min)
             if forced_stop:
-                r_exec = 0.0
-                v_safe_max = 0.0
                 v_exec = 0.0
             else:
-                r_exec = r_raw
-                v_safe_max = r_exec * gear_vmax
+                v_safe_max = r_raw * gear_vmax
                 v_decoded = a0_sign * rho * v_safe_max
                 v_exec = float(v_decoded)
-            clip_ratio_check = (
-                abs(rho * gear_vmax) + 1e-7 if not forced_stop else 0.0
-            )
-
-        v_exec, phi_dot_exec, was_clipped = self.filter_and_clip_action_fallback(
-            v_exec, v_safe_max, phi_dot_exec, phi, dt
-        )
-
-        if gear != STOP_GEAR and not forced_stop:
-            if v_safe_max > 1e-7:
-                clip_ratio = abs(rho * v_safe_max - abs(v_exec)) / (abs(rho * v_safe_max) + 1e-6)
-            else:
-                clip_ratio = 0.0
-        else:
-            clip_ratio = 0.0
-        if was_clipped:
-            clip_ratio = max(clip_ratio, 0.01)
+        clip_ratio = 0.0
 
         r_max = self._r_max_overall(mask) if gear != STOP_GEAR else 0.0
         r_min = float(self.min_safe_ratio)
@@ -288,8 +276,7 @@ class ArticulatedActionMask:
             float(getattr(config, "mask_cost_rel_weight", 0.10))
             * max(0.0, r_max - r_raw - delta_rel)
         )
-        c_clip = float(getattr(config, "mask_cost_clip_weight", 0.05)) * clip_ratio
-        mask_cost = float(np.clip(c_stop + c_abs + c_rel + c_clip, 0.0, c_max))
+        mask_cost = float(np.clip(c_stop + c_abs + c_rel, 0.0, c_max))
 
         if abs(raw[0]) >= deadband:
             if raw[0] >= 0.0:
@@ -335,7 +322,7 @@ class ArticulatedActionMask:
             gear = REVERSE_GEAR
             v_decoded = float(raw[0]) * p.parking_v_reverse_max
             gear_vmax = p.parking_v_reverse_max
-        phi_dot_decoded = float(raw[1]) * p.phi_dot_max
+        phi_dot_decoded = self._decode_phi_dot(raw[1], phi, duration)
         safe_ratio = float(
             np.interp(
                 phi_dot_decoded,
@@ -350,20 +337,11 @@ class ArticulatedActionMask:
             safe_speed = safe_ratio * gear_vmax
             v_executed = math.copysign(min(abs(v_decoded), safe_speed), v_decoded)
 
-        phi_dot_executed = float(
-            np.clip(phi_dot_decoded, -p.phi_dot_max, p.phi_dot_max)
-        )
-        phi_dot_executed = clip_phi_dot_to_limit(
-            phi,
-            phi_dot_executed,
-            duration,
-            p.phi_max,
-        )
         speed_clipped = abs(v_executed) + 1e-7 < abs(v_decoded)
         return ActionExecution(
             raw_action=raw.copy(),
             decoded_action=np.asarray([v_decoded, phi_dot_decoded], dtype=np.float32),
-            executed_action=np.asarray([v_executed, phi_dot_executed], dtype=np.float32),
+            executed_action=np.asarray([v_executed, phi_dot_decoded], dtype=np.float32),
             safe_ratio=safe_ratio,
             invalid=bool(invalid),
             speed_clipped=bool(speed_clipped),

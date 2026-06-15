@@ -1,14 +1,13 @@
-import json
-
 import numpy as np
 
-from config import DEFAULT_VEHICLE_PARAMS
+from config import DEFAULT_ENV_CONFIG, DEFAULT_VEHICLE_PARAMS
 from env.articulated_action_mask import (
     ArticulatedActionMask,
     default_action_mask_path,
     generate_sweep_tables,
     save_sweep_tables,
 )
+from env.vehicle import ArticulatedState, ArticulatedVehicleModel
 
 
 def test_action_mask_npz_loads_required_arrays():
@@ -35,7 +34,7 @@ def test_online_mask_is_matrix_comparison(synthetic_action_mask):
     assert np.allclose(blocked_mask, 0.0)
 
 
-def test_filter_and_clip_action_ratios_and_articulation_limit(synthetic_action_mask):
+def test_filter_and_clip_action_ratios_and_articulation_mapping(synthetic_action_mask):
     p = DEFAULT_VEHICLE_PARAMS
     full = np.ones((2, 11), dtype=np.float32)
     half = np.full((2, 11), 0.5, dtype=np.float32)
@@ -53,9 +52,107 @@ def test_filter_and_clip_action_ratios_and_articulation_limit(synthetic_action_m
     assert invalid.executed_action[0] == 0.0
     assert invalid.invalid is True
 
-    limited = synthetic_action_mask.filter_and_clip_action(
-        [0.0, 1.0],
-        full,
-        p.phi_max - 0.01,
+    phi = p.phi_max - 0.01
+    expected_lower = -p.phi_dot_max
+    expected_upper = 0.01 / p.dt
+    for normalized, expected in (
+        (-1.0, expected_lower),
+        (0.0, 0.5 * (expected_lower + expected_upper)),
+        (1.0, expected_upper),
+    ):
+        mapped = synthetic_action_mask.filter_and_clip_action(
+            [0.0, normalized],
+            full,
+            phi,
+        )
+        assert np.isclose(mapped.decoded_action[1], expected)
+        assert np.isclose(mapped.executed_action[1], expected)
+        assert phi + mapped.executed_action[1] * p.dt <= p.phi_max + 1e-7
+
+
+def test_phi_dot_mapping_preserves_full_symmetric_range_away_from_limit(
+    synthetic_action_mask,
+):
+    p = DEFAULT_VEHICLE_PARAMS
+    full = np.ones((2, 11), dtype=np.float32)
+    for normalized in (-1.0, 0.0, 1.0):
+        decoded = synthetic_action_mask.filter_and_clip_action(
+            [0.0, normalized],
+            full,
+            0.0,
+        )
+        assert np.isclose(
+            decoded.executed_action[1],
+            normalized * p.phi_dot_max,
+        )
+
+
+def test_decode_uses_mapped_phi_dot_for_action_mask_lookup(synthetic_action_mask):
+    p = DEFAULT_VEHICLE_PARAMS
+    phi = p.phi_max - 0.01
+    expected_phi_dot = 0.5 * (-p.phi_dot_max + 0.01 / p.dt)
+    increasing_ratio = np.linspace(0.0, 1.0, 11, dtype=np.float32)
+    mask = np.stack([increasing_ratio, increasing_ratio])
+
+    decoded = synthetic_action_mask.decode_safe_speed_and_cost(
+        [1.0, 0.0],
+        mask,
+        phi,
+        dt=p.dt,
+        prev_motion_gear=None,
+        config=DEFAULT_ENV_CONFIG,
     )
-    assert p.phi_max - 0.01 + limited.executed_action[1] * p.dt <= p.phi_max + 1e-7
+
+    expected_ratio = np.interp(
+        expected_phi_dot,
+        synthetic_action_mask.phi_dot_bins,
+        increasing_ratio,
+    )
+    assert np.isclose(decoded["phi_dot_exec"], expected_phi_dot)
+    assert np.isclose(decoded["r_raw"], expected_ratio)
+    assert np.isclose(
+        decoded["v_exec"],
+        expected_ratio * p.parking_v_forward_max,
+    )
+
+
+def test_mapped_phi_dot_respects_articulated_vehicle_dynamics(synthetic_action_mask):
+    p = DEFAULT_VEHICLE_PARAMS
+    model = ArticulatedVehicleModel(p)
+    full = np.ones((2, 11), dtype=np.float32)
+
+    for phi in (-p.phi_max, -0.2, 0.0, 0.2, p.phi_max):
+        for normalized in (-1.0, -0.25, 0.0, 0.75, 1.0):
+            decoded = synthetic_action_mask.filter_and_clip_action(
+                [0.0, normalized],
+                full,
+                phi,
+            )
+            state = ArticulatedState(
+                x_front=0.0,
+                y_front=0.0,
+                theta_front=phi,
+                theta_rear=0.0,
+            )
+            next_state = model.step(state, decoded.executed_action)
+            expected_phi = phi + float(decoded.executed_action[1]) * p.dt
+
+            assert np.isclose(next_state.phi, expected_phi, atol=1e-6)
+            assert abs(next_state.phi) <= p.phi_max + 1e-7
+
+
+def test_invalid_articulation_maps_to_fastest_recovery_rate(synthetic_action_mask):
+    p = DEFAULT_VEHICLE_PARAMS
+    full = np.ones((2, 11), dtype=np.float32)
+
+    for phi, expected in (
+        (-np.pi, p.phi_dot_max),
+        (np.pi, -p.phi_dot_max),
+    ):
+        for normalized in (-1.0, 0.0, 1.0):
+            decoded = synthetic_action_mask.filter_and_clip_action(
+                [0.0, normalized],
+                full,
+                phi,
+            )
+            assert np.isclose(decoded.executed_action[1], expected)

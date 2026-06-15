@@ -337,6 +337,8 @@ class ContinuousPPOAgent:
                 stats["clip_fraction"].append(float(clip_fraction.item()))
                 stats["aux_mask_loss"].append(float(aux_mask_loss.item()))
 
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         return {key: float(np.mean(values)) for key, values in stats.items()}
 
     def save(self, path, extra=None):

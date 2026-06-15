@@ -104,6 +104,10 @@ class LocalParkingEnv:
                     goal_heading_tol_deg=config.planner_heading_tolerance_deg,
                     front_half_length=0.5 * vehicle_params.front_body_length,
                     front_half_width=0.5 * vehicle_params.front_body_width,
+                    rear_half_length=0.5 * vehicle_params.rear_body_length,
+                    rear_half_width=0.5 * vehicle_params.rear_body_width,
+                    front_center_to_hinge=vehicle_params.front_center_to_hinge,
+                    rear_center_to_hinge=vehicle_params.rear_center_to_hinge,
                 )
             rs_planner = RSPotentialPlanner(
                 collision_checker=collision_checker,
@@ -111,6 +115,7 @@ class LocalParkingEnv:
                 candidate_limit=config.rs_potential_k,
                 sample_step=float(getattr(collision_checker, "step_length", 1.0))
                 / float(getattr(collision_checker, "intermediate_checks", 2) + 1),
+                vehicle_params=vehicle_params,
             )
         self.rs_potential = RSPotentialOracle(
             planner=rs_planner,

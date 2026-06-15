@@ -528,6 +528,8 @@ def train(args):
             buffer = RolloutBuffer()
             rollout_infos = []
             rollout_completed = []
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if checkpoint_due:
             agent.save(
@@ -565,7 +567,7 @@ def train(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Train continuous PPO for local parking.")
-    parser.add_argument("--total-episodes", type=int, default=10_000)
+    parser.add_argument("--total-episodes", type=int, default=20_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)

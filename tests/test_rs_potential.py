@@ -310,3 +310,345 @@ def test_rs_candidates_include_extended_scs_family_and_directed_endpoint():
     endpoint = scs_paths[0].poses[-1]
     assert endpoint[:2] == pytest.approx(goal[:2], abs=1e-6)
     assert abs(wrap_to_pi(endpoint[2] - goal[2])) <= 1e-6
+
+
+def test_rs_candidate_sampling_limits_reject_singular_scs_paths():
+    goal = (0.0, 10.0, 1e-4)
+    paths = generate_reeds_shepp_paths(
+        start=(0.0, 0.0, 0.0),
+        goal=goal,
+        turning_radius=6.4,
+        sample_step=1.0 / 3.0,
+    )
+
+    assert paths
+    assert max(path.total_length for path in paths) <= 256.0 + 1e-6
+    assert max(len(path.poses) for path in paths) <= 8192
+    assert all(
+        path.segment_types not in (["S", "L", "S"], ["S", "R", "S"])
+        for path in paths
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for articulated collision-check tests
+# ---------------------------------------------------------------------------
+
+from config import ZL50GNVehicleParams
+from planning.passenger_hybrid_astar import PassengerHybridAStar
+from planning.reeds_shepp import ReedsSheppPath
+
+_VP = ZL50GNVehicleParams()
+_LF = float(_VP.front_center_to_hinge)    # 2.225
+_LR = float(_VP.rear_center_to_hinge)    # 1.8575
+_PHI_MAX = float(_VP.phi_max)            # 0.6109 rad
+
+
+class _ClearScene:
+    """Scene that reports every point as free."""
+    world_bounds = (-40, -40, 40, 40)
+    resolution = 0.1
+    @staticmethod
+    def is_occupied_world(x, y):
+        return False
+
+
+class _BoxScene:
+    """Scene that returns occupied=True inside a given world-box."""
+    world_bounds = (-40, -40, 40, 40)
+    resolution = 0.1
+    def __init__(self, xmin, ymin, xmax, ymax):
+        self._xmin = float(xmin)
+        self._ymin = float(ymin)
+        self._xmax = float(xmax)
+        self._ymax = float(ymax)
+    def is_occupied_world(self, x, y):
+        return self._xmin <= x <= self._xmax and self._ymin <= y <= self._ymax
+
+
+class _RecordingCollisionChecker:
+    intermediate_checks = 2
+
+    def __init__(self):
+        self.recorded = []
+
+    def _is_rectangle_occupied(self, scene, x, y, theta):
+        return False
+
+    def _check_two_bodies(self, scene, x_f, y_f, theta_f, x_r, y_r, theta_r):
+        self.recorded.append(
+            (
+                float(x_f),
+                float(y_f),
+                float(theta_f),
+                float(x_r),
+                float(y_r),
+                float(theta_r),
+            )
+        )
+        return False
+
+
+def _articulated_checker():
+    return PassengerHybridAStar(
+        front_half_length=0.5 * _VP.front_body_length,
+        front_half_width=0.5 * _VP.front_body_width,
+        rear_half_length=0.5 * _VP.rear_body_length,
+        rear_half_width=0.5 * _VP.rear_body_width,
+        front_center_to_hinge=_LF,
+        rear_center_to_hinge=_LR,
+        footprint_samples=3,
+        intermediate_checks=2,
+    )
+
+
+def _make_rs_path(lengths, seg_types, poses):
+    total = sum(abs(float(v)) for v in lengths)
+    n = len(poses)
+    static_dir = 1 if lengths[0] >= 0 else -1
+    return ReedsSheppPath(
+        lengths=[float(v) for v in lengths],
+        segment_types=list(seg_types),
+        total_length=float(total),
+        poses=np.asarray(poses, dtype=np.float64),
+        directions=np.full(n, static_dir, dtype=np.int8),
+    )
+
+
+def _make_planner(checker=None, vp=_VP):
+    if checker is None:
+        checker = _articulated_checker()
+    return RSPotentialPlanner(
+        collision_checker=checker,
+        turning_radius=float(_VP.minimum_turning_radius),
+        candidate_limit=2,
+        sample_step=0.3,
+        vehicle_params=vp,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Articulated collision-check tests
+# ---------------------------------------------------------------------------
+
+def test_no_rear_params_preserves_old_behavior():
+    """vehicle_params=None 时退化为单矩形旧行为."""
+    class FrontOnly:
+        def _is_rectangle_occupied(self, scene, x, y, theta):
+            return True
+    planner = RSPotentialPlanner(
+        collision_checker=FrontOnly(),
+        turning_radius=6.4,
+        candidate_limit=2,
+        sample_step=0.3,
+        vehicle_params=None,
+    )
+    path = _make_rs_path([5.0], ["S"], [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+    free, checks = planner._collision_free(None, path)
+    assert free is False
+    assert checks > 0
+
+
+def test_front_body_collision_rejects():
+    """前车体矩形占据 -> 拒绝."""
+    scene = _BoxScene(xmin=-1.0, ymin=-1.0, xmax=1.0, ymax=1.0)
+    # 起点 (0,0,0) 处前车体矩形覆盖 [-2.225, 2.225]x[-1.508,1.508] → 包含障碍 (0,0)
+    path = _make_rs_path([5.0], ["S"], [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free, checks = planner._collision_free(scene, path, initial_phi=0.0)
+    assert free is False
+    assert checks > 0
+
+
+def test_rear_body_collision_rejects():
+    """前车体 clear 但后车体占据 -> 拒绝."""
+    scene = _BoxScene(xmin=-5.0, ymin=-1.0, xmax=-2.5, ymax=1.0)
+    # 起点 (0,0,0) phi=0: 后车体矩形 [-5.94, -2.225]x[-1.508,1.508] → 包含 (-4,0)
+    path = _make_rs_path([5.0], ["S"], [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free, checks = planner._collision_free(scene, path, initial_phi=0.0)
+    assert free is False
+    assert checks > 0
+
+
+def test_intermediate_sweep_catches_tunneling():
+    """扫掠中间点（非原始 RS 采样点）检测障碍."""
+    # 钝角障碍仅被 sweep_ds=0.1m 采样点覆盖，不会被 0.3m 原始采样跳过
+    scene = _BoxScene(xmin=0.05, ymin=-1.0, xmax=0.25, ymax=1.0)
+    # 前向直行: 0→5m, 障碍在 x=0.05~0.25 区间
+    # sweep_ds ≈ 0.3/(2+1) = 0.1, 障碍宽度 0.2m = 2 个 sweep 步 → 可命中
+    path = _make_rs_path([5.0], ["S"], [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free, checks = planner._collision_free(scene, path, initial_phi=0.0)
+    assert free is False
+    assert checks > 0
+
+
+def test_phi_exceeds_max_articulation_rejects():
+    """phi 积分超过 phi_max → 拒绝.
+
+    倒车直行使用负 ds，使 phi 沿倒车距离增长；在 phi_max 处每倒车
+    1m 增长约 0.31rad，不到一个 sweep 步就超限."""
+    scene = _ClearScene()
+    path = _make_rs_path([-0.5], ["S"], [[0.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free, checks = planner._collision_free(scene, path, initial_phi=_PHI_MAX)
+    assert free is False
+    assert checks > 0
+
+
+def test_forward_straight_phi_converges_to_zero():
+    """前进直行: 非零 initial_phi → phi 衰减到 0, 不超限."""
+    scene = _ClearScene()
+    path = _make_rs_path([5.0], ["S"], [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free, checks = planner._collision_free(scene, path, initial_phi=0.5)
+    assert free is True
+    assert checks > 0
+
+
+def test_reverse_straight_phi_diverges():
+    """倒车直行: 非零 initial_phi → phi 发散, 超过 phi_max 后拒绝."""
+    scene = _ClearScene()
+    # 倒车直行 3m: dphi/ds=-sin(phi)/lr 且 ds<0，因此 phi 增长。
+    # 初始 0.3 → 约 0.8m 后超 phi_max
+    path = _make_rs_path([-3.0], ["S"], [[0.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free, checks = planner._collision_free(scene, path, initial_phi=0.3)
+    assert free is False
+    assert checks > 0
+
+
+def test_phi_continuous_at_direction_reversal():
+    """换向段: phi 不重置, 连续递推."""
+    scene = _ClearScene()
+    # 两段: 前进直行 1m, 倒车直行 1m. gear 从 +1 变 -1.
+    # phi 始终连续, 不重置为 0.
+    path = _make_rs_path([1.0, -1.0], ["S", "S"],
+                         [[0.0, 0.0, 0.0]])
+    planner = _make_planner()
+    # initial_phi=0.3 → 前进 1m phi 略降, 倒车 1m phi 又上升
+    # 整体应在 phi_max 内
+    free, checks = planner._collision_free(scene, path, initial_phi=0.3)
+    # 前进 1m: phi ≈ 0.3 - roughly 0.145 = 0.155
+    # 倒车 1m: phi ≈ 0.155 + roughly 0.155 = 0.31 (sin(0.155)≈0.154)
+    # 远小于 phi_max=0.611 → pass
+    assert free is True
+    assert checks > 0
+
+
+def test_segment_curvature_used_for_L_R_S():
+    """段级曲率 (L→+1/R, S→0) 作为主曲率来源, 影响 phi 递推.
+
+    通过 RecordingCollisionChecker 记录每次 _check_two_bodies 的 (theta_f, theta_r),
+    反推 phi = theta_f - theta_r. 验证 L 段后 phi > 0, S 段后 phi ≈ 0."""
+
+    class RecordingCollisionChecker:
+        def __init__(self):
+            self.inner = _articulated_checker()
+            self.recorded = []   # (theta_f, theta_r, phi)
+        def _is_rectangle_occupied(self, *a):
+            return self.inner._is_rectangle_occupied(*a)
+        def _check_two_bodies(self, scene, x_f, y_f, theta_f, x_r, y_r, theta_r):
+            phi = wrap_to_pi(theta_f - theta_r)
+            self.recorded.append((theta_f, theta_r, phi))
+            return self.inner._check_two_bodies(
+                scene, x_f, y_f, theta_f, x_r, y_r, theta_r
+            )
+
+    scene = _ClearScene()
+    path_L = _make_rs_path([2.0], ["L"], [[0.0, 0.0, 0.0]])
+    path_S = _make_rs_path([2.0], ["S"], [[0.0, 0.0, 0.0]])
+
+    rec_L = RecordingCollisionChecker()
+    planner_L = _make_planner(checker=rec_L)
+    planner_L._collision_free(scene, path_L, initial_phi=0.0)
+
+    rec_S = RecordingCollisionChecker()
+    planner_S = _make_planner(checker=rec_S)
+    planner_S._collision_free(scene, path_S, initial_phi=0.0)
+
+    _, _, phi_L = rec_L.recorded[-1] if rec_L.recorded else (0.0, 0.0, 0.0)
+    _, _, phi_S = rec_S.recorded[-1] if rec_S.recorded else (0.0, 0.0, 0.0)
+    assert phi_L > 0.1, f"L 段应产生正 phi, 实际 {phi_L:.4f}"
+    assert abs(phi_S) < 0.01, f"S 段应保持 phi≈0, 实际 {phi_S:.4f}"
+
+
+def test_reverse_direction_changes_phi_dynamics():
+    """同一有符号 ODE 下，倒车直行 phi 发散而前进直行收敛."""
+    scene = _ClearScene()
+    # 前进 3m, gear=+1, initial_phi=0.3 → phi 衰减 → 通过
+    path_fwd = _make_rs_path([3.0], ["S"], [[0.0, 0.0, 0.0]])
+    # 倒车 3m, gear=-1, initial_phi=0.3 → phi 增长 → 超限拒绝
+    path_rev = _make_rs_path([-3.0], ["S"], [[0.0, 0.0, 0.0]])
+    planner = _make_planner()
+    free_fwd, _ = planner._collision_free(scene, path_fwd, initial_phi=0.3)
+    free_rev, _ = planner._collision_free(scene, path_rev, initial_phi=0.3)
+    assert free_fwd is True
+    assert free_rev is False
+
+
+@pytest.mark.parametrize("seg_type", ["S", "L", "R"])
+def test_reverse_segment_reconstruction_matches_rs_endpoint(seg_type):
+    """负长度直线和圆弧必须按倒车方向重建前车终点."""
+    radius = float(_VP.minimum_turning_radius)
+    seg_len = -2.0
+    if seg_type == "S":
+        expected = (-2.0, 0.0, 0.0)
+    else:
+        kappa = (1.0 if seg_type == "L" else -1.0) / radius
+        dtheta = kappa * seg_len
+        expected = (
+            math.sin(dtheta) / kappa,
+            (1.0 - math.cos(dtheta)) / kappa,
+            dtheta,
+        )
+
+    path = _make_rs_path(
+        [seg_len],
+        [seg_type],
+        [[0.0, 0.0, 0.0], list(expected)],
+    )
+    checker = _RecordingCollisionChecker()
+    planner = _make_planner(
+        checker=checker,
+        vp=replace(_VP, phi_max=100.0),
+    )
+
+    free, _ = planner._collision_free(_ClearScene(), path, initial_phi=0.0)
+
+    assert free is True
+    assert checker.recorded
+    x_f, y_f, theta_f = checker.recorded[-1][:3]
+    assert (x_f, y_f) == pytest.approx(expected[:2], abs=1e-9)
+    assert wrap_to_pi(theta_f - expected[2]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_generated_reverse_candidates_reconstruct_their_sampled_endpoints():
+    """真实 RS 候选的碰撞扫掠终点必须与候选采样终点一致."""
+    paths = generate_reeds_shepp_paths(
+        start=(0.0, 0.0, 0.0),
+        goal=(4.0, -3.0, 1.1),
+        turning_radius=float(_VP.minimum_turning_radius),
+        sample_step=0.3,
+    )
+    reverse_paths = [
+        path for path in paths if any(length < 0.0 for length in path.lengths)
+    ][:5]
+    assert len(reverse_paths) == 5
+
+    unconstrained_vp = replace(_VP, phi_max=100.0)
+    for path in reverse_paths:
+        checker = _RecordingCollisionChecker()
+        planner = _make_planner(checker=checker, vp=unconstrained_vp)
+        free, _ = planner._collision_free(
+            _ClearScene(), path, initial_phi=0.0
+        )
+
+        assert free is True
+        endpoint = path.poses[-1]
+        x_f, y_f, theta_f = checker.recorded[-1][:3]
+        assert (x_f, y_f) == pytest.approx(endpoint[:2], abs=1e-8)
+        assert wrap_to_pi(theta_f - endpoint[2]) == pytest.approx(
+            0.0, abs=1e-8
+        )

@@ -35,6 +35,10 @@ class PassengerHybridAStar:
         front_half_width=1.508,
         footprint_samples=3,
         intermediate_checks=2,
+        rear_half_length=0.0,
+        rear_half_width=0.0,
+        front_center_to_hinge=0.0,
+        rear_center_to_hinge=0.0,
     ):
         self.wheelbase = float(wheelbase)
         self.step_length = float(step_length)
@@ -47,6 +51,10 @@ class PassengerHybridAStar:
         self.front_half_width = float(front_half_width)
         self.footprint_samples = max(1, int(footprint_samples))
         self.intermediate_checks = max(0, int(intermediate_checks))
+        self.rear_half_length = float(rear_half_length)
+        self.rear_half_width = float(rear_half_width)
+        self.front_center_to_hinge = float(front_center_to_hinge)
+        self.rear_center_to_hinge = float(rear_center_to_hinge)
 
     @staticmethod
     def _wrap_angle(angle, bins):
@@ -68,11 +76,11 @@ class PassengerHybridAStar:
     def _heading_error(state, slot):
         return abs(wrap_to_pi(state[2] - slot.theta_goal))
 
-    def _rectangle_sample_points(self, x, y, theta):
+    def _rectangle_sample_points(self, x, y, theta, half_length=None, half_width=None):
         c = math.cos(theta)
         s = math.sin(theta)
-        hl = self.front_half_length
-        hw = self.front_half_width
+        hl = half_length if half_length is not None else self.front_half_length
+        hw = half_width if half_width is not None else self.front_half_width
         points = []
         n = self.footprint_samples
         for i in range(n):
@@ -88,6 +96,20 @@ class PassengerHybridAStar:
         for px, py in self._rectangle_sample_points(x, y, theta):
             if scene.is_occupied_world(px, py):
                 return True
+        return False
+
+    def _check_two_bodies(self, scene, x_f, y_f, theta_f, x_r, y_r, theta_r):
+        for px, py in self._rectangle_sample_points(x_f, y_f, theta_f):
+            if scene.is_occupied_world(px, py):
+                return True
+        if self.rear_half_length > 0:
+            for px, py in self._rectangle_sample_points(
+                x_r, y_r, theta_r,
+                half_length=self.rear_half_length,
+                half_width=self.rear_half_width,
+            ):
+                if scene.is_occupied_world(px, py):
+                    return True
         return False
 
     def _motion_primitive_valid(self, scene, x0, y0, theta0, x1, y1, theta1):

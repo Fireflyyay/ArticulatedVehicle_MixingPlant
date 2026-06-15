@@ -113,12 +113,3 @@ class ArticulatedVehicleModel:
             v=v,
             phi_dot=phi_dot,
         )
-
-
-def clip_phi_dot_to_limit(phi, phi_dot, dt, phi_max):
-    phi = float(phi)
-    phi_dot = float(phi_dot)
-    dt = max(float(dt), 1e-8)
-    lower = (-float(phi_max) - phi) / dt
-    upper = (float(phi_max) - phi) / dt
-    return float(np.clip(phi_dot, lower, upper))

@@ -5,8 +5,9 @@ from typing import Optional
 
 import numpy as np
 
+from config import ZL50GNVehicleParams
 from env.geometry import wrap_to_pi
-from planning.reeds_shepp import generate_reeds_shepp_paths
+from planning.reeds_shepp import generate_reeds_shepp_paths, ReedsSheppPath
 
 
 @dataclass
@@ -34,6 +35,7 @@ class RSPotentialPlanner:
         candidate_limit=2,
         sample_step=0.3,
         endpoint_heading_tolerance=1e-3,
+        vehicle_params=None,
     ):
         if not hasattr(collision_checker, "_is_rectangle_occupied"):
             raise TypeError(
@@ -44,8 +46,9 @@ class RSPotentialPlanner:
         self.candidate_limit = max(1, int(candidate_limit))
         self.sample_step = float(sample_step)
         self.endpoint_heading_tolerance = float(endpoint_heading_tolerance)
+        self.vehicle_params = vehicle_params
 
-    def _collision_free(self, scene, path):
+    def _collision_free_legacy(self, scene, path):
         checks = 0
         for x, y, theta in path:
             checks += 1
@@ -53,6 +56,104 @@ class RSPotentialPlanner:
                 scene, float(x), float(y), float(theta)
             ):
                 return False, checks
+        return True, checks
+
+    def _collision_free(self, scene, candidate, initial_phi=0.0):
+        if isinstance(candidate, np.ndarray) or self.vehicle_params is None:
+            path = candidate if isinstance(candidate, np.ndarray) else candidate.poses
+            return self._collision_free_legacy(scene, path)
+
+        p = self.vehicle_params
+        lf = float(p.front_center_to_hinge)
+        lr = float(p.rear_center_to_hinge)
+        phi_max = float(p.phi_max)
+        R = self.turning_radius
+        has_articulated = hasattr(self.collision_checker, "_check_two_bodies")
+        sweep_ds = self.sample_step / max(
+            1, getattr(self.collision_checker, "intermediate_checks", 2) + 1
+        )
+        kappa_map = {"S": 0.0, "L": 1.0 / R, "R": -1.0 / R}
+
+        # Initialize from first pose
+        phi = float(initial_phi)
+        x_f = float(candidate.poses[0, 0])
+        y_f = float(candidate.poses[0, 1])
+        theta_f = float(candidate.poses[0, 2])
+        theta_r = wrap_to_pi(theta_f - phi)
+        checks = 0
+
+        # Check first pose
+        checks += 1
+        if has_articulated:
+            hinge_x = x_f - lf * math.cos(theta_f)
+            hinge_y = y_f - lf * math.sin(theta_f)
+            x_r = hinge_x - lr * math.cos(theta_r)
+            y_r = hinge_y - lr * math.sin(theta_r)
+            if self.collision_checker._check_two_bodies(
+                scene, x_f, y_f, theta_f, x_r, y_r, theta_r
+            ):
+                return False, checks
+        else:
+            if self.collision_checker._is_rectangle_occupied(
+                scene, x_f, y_f, theta_f
+            ):
+                return False, checks
+
+        # Integrate along each RS segment
+        for seg_len, seg_type in zip(candidate.lengths, candidate.segment_types):
+            kappa = kappa_map[seg_type]
+            gear = 1.0 if seg_len >= 0.0 else -1.0
+            arc = abs(float(seg_len))
+            if arc < 1e-9:
+                continue
+
+            n_steps = max(1, int(round(arc / sweep_ds)))
+            h = arc / n_steps
+            ds = gear * h
+
+            for _ in range(n_steps):
+                # RS segment lengths are signed distances along the front body.
+                if seg_type == "S":
+                    x_f += ds * math.cos(theta_f)
+                    y_f += ds * math.sin(theta_f)
+                else:  # "L" or "R"
+                    dtheta = kappa * ds
+                    local_dx = math.sin(dtheta) / kappa
+                    local_dy = (1.0 - math.cos(dtheta)) / kappa
+                    x_f += math.cos(theta_f) * local_dx - math.sin(theta_f) * local_dy
+                    y_f += math.sin(theta_f) * local_dx + math.cos(theta_f) * local_dy
+                    theta_f = wrap_to_pi(theta_f + dtheta)
+
+                # Integrate articulation with respect to signed path distance.
+                cos_phi = math.cos(phi)
+                sin_phi = math.sin(phi)
+                dphi_ds = (kappa * (lf * cos_phi + lr) - sin_phi) / lr
+                phi += dphi_ds * ds
+
+                # Check articulation bounds
+                if abs(phi) > phi_max:
+                    return False, checks
+                theta_r = wrap_to_pi(theta_f - phi)
+
+                # Compute rear body center via hinge
+                hinge_x = x_f - lf * math.cos(theta_f)
+                hinge_y = y_f - lf * math.sin(theta_f)
+                x_r = hinge_x - lr * math.cos(theta_r)
+                y_r = hinge_y - lr * math.sin(theta_r)
+
+                # Collision check
+                checks += 1
+                if has_articulated:
+                    if self.collision_checker._check_two_bodies(
+                        scene, x_f, y_f, theta_f, x_r, y_r, theta_r
+                    ):
+                        return False, checks
+                else:
+                    if self.collision_checker._is_rectangle_occupied(
+                        scene, x_f, y_f, theta_f
+                    ):
+                        return False, checks
+
         return True, checks
 
     def plan(self, scene, state, slot):
@@ -95,7 +196,9 @@ class RSPotentialPlanner:
             heading_valid_candidates += 1
             checked += 1
             collision_start = time.perf_counter()
-            collision_free, checks = self._collision_free(scene, candidate.poses)
+            collision_free, checks = self._collision_free(
+                scene, candidate, initial_phi=float(state.phi)
+            )
             collision_ms += (time.perf_counter() - collision_start) * 1000.0
             collision_checks += checks
             if collision_free:

@@ -24,6 +24,9 @@ SMDP here.
 - State reference is the front-body geometric center.
 - `phi = wrap(theta_front - theta_rear)` is always wrapped to `[-pi, pi]`.
 - Policy action is normalized continuous `[v_cmd_norm, phi_dot_cmd_norm]`.
+- Map `phi_dot_cmd_norm` linearly into the current executable `phi_dot`
+  interval given `phi`, `phi_max`, `phi_dot_max`, and `dt`; do not scale to
+  the symmetric rate limit and then clip against the articulation-angle limit.
 - PPO log probability is computed for the raw squashed policy action.
 - `LocalParkingEnv.step()` applies the action mask and advances the model with
   `executed_action`; both actions must remain in diagnostics and rollouts.
