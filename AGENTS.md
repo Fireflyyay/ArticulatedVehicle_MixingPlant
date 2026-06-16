@@ -28,6 +28,12 @@ SMDP here.
   interval given `phi`, `phi_max`, `phi_dot_max`, and `dt`; do not scale to
   the symmetric rate limit and then clip against the articulation-angle limit.
 - PPO log probability is computed for the raw squashed policy action.
+- The continuous actor outputs only the pre-tanh Gaussian mean. Exploration
+  uses one global learnable `log_std` vector, bounded by `PPOConfig`.
+- Rollouts store both `pre_tanh_action` and `raw_action`; PPO likelihood
+  recomputation must use those saved policy samples, never `executed_action`.
+- PPO updates use epoch-level target-KL early stopping and task-family actor
+  loss weights. Family best checkpoints use fixed deterministic evaluation.
 - `LocalParkingEnv.step()` applies the action mask and advances the model with
   `executed_action`; both actions must remain in diagnostics and rollouts.
 - Observation order and slices are defined by

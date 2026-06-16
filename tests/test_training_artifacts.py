@@ -8,6 +8,7 @@ from train.train_local_parking import (
     REPO_ROOT,
     _resolve_output_dir,
     _update_reward_plot,
+    _weighted_checkpoint_score,
     _write_config_snapshot,
 )
 
@@ -56,3 +57,28 @@ def test_reward_plot_is_written_from_episode_rewards(tmp_path):
     _update_reward_plot(str(path), [float(index) for index in range(1, 11)])
     assert path.is_file()
     assert path.stat().st_size > 0
+
+
+def test_weighted_checkpoint_score_prioritizes_parallel_reverse():
+    score = _weighted_checkpoint_score(
+        {
+            "head_in": 1.0,
+            "parallel_fwd": 0.5,
+            "parallel_rev": 0.25,
+        },
+        DEFAULT_PPO_CONFIG,
+    )
+    assert score == (1.0 + 2.0 * 0.5 + 4.0 * 0.25) / 7.0
+
+
+def test_default_ppo_stability_configuration():
+    assert DEFAULT_PPO_CONFIG.log_std_init == -0.7
+    assert DEFAULT_PPO_CONFIG.log_std_min == -2.5
+    assert DEFAULT_PPO_CONFIG.log_std_max == -0.3
+    assert DEFAULT_PPO_CONFIG.target_kl == 0.03
+    assert DEFAULT_PPO_CONFIG.ppo_epochs == 4
+    assert DEFAULT_PPO_CONFIG.clip_range == 0.15
+    assert DEFAULT_PPO_CONFIG.actor_lr == 1e-4
+    assert DEFAULT_PPO_CONFIG.critic_lr == 3e-4
+    assert DEFAULT_PPO_CONFIG.entropy_coef == 0.0
+    assert DEFAULT_PPO_CONFIG.policy_loss_weight_parallel_rev == 0.2

@@ -82,10 +82,10 @@ class MixingPlantSceneConfig:
     main_corridor_length: float = 72.0
     branch_corridor_length: float = 56.0
     corridor_width_by_stage: Tuple[float, float, float, float] = (
+        16.0,
         14.0,
         12.0,
-        10.0,
-        8.0,
+        12.0,
     )
     branch_width_ratio: float = 0.85
     head_in_bay_width: float = 8.0
@@ -190,12 +190,23 @@ class PPOConfig:
     clip_range: float = 0.2
     actor_lr: float = 3e-4
     critic_lr: float = 1e-3
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.0
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     rollout_steps: int = 2048
     ppo_epochs: int = 8
     batch_size: int = 128
+    target_kl: float = 0.03
+    kl_early_stop_multiplier: float = 1.5
+    log_std_init: float = -0.7
+    log_std_min: float = -2.5
+    log_std_max: float = -0.3
+    policy_loss_weight_head_in: float = 1.0
+    policy_loss_weight_parallel_fwd: float = 1.0
+    policy_loss_weight_parallel_rev: float = 0.2
+    checkpoint_score_weight_head_in: float = 1.0
+    checkpoint_score_weight_parallel_fwd: float = 2.0
+    checkpoint_score_weight_parallel_rev: float = 4.0
 
 
 DEFAULT_VEHICLE_PARAMS = ZL50GNVehicleParams()

@@ -4,6 +4,8 @@ from dataclasses import dataclass, replace
 import os
 import sys
 
+os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib"))
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -25,10 +27,17 @@ from model.continuous_ppo import ContinuousPPOAgent  # noqa: E402
 @dataclass
 class PathRollout:
     seed: int
+    scene: object
+    slot: object
     reset_info: dict
     states: list
     final_info: dict
     total_reward: float
+    rs_guide_path: object = None
+    rs_guide_step: int = -1
+    rs_guide_state: object = None
+    rs_guide_info: object = None
+    rs_guide_source: str = ""
 
 
 def _plot_polygon(ax, polygon, facecolor, edgecolor, alpha=1.0, linewidth=1.0, **kwargs):
@@ -98,12 +107,100 @@ def _load_agent(checkpoint_path, device):
     return agent, extra
 
 
-def _rollout_path(env, agent, seed, deterministic):
+def _rs_path_length(path):
+    array = np.asarray(path, dtype=np.float64)
+    if array.ndim != 2 or array.shape[0] < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(array[:, :2], axis=0), axis=1)))
+
+
+def _fixed_rs_guide_info(path, source, step, reason="success", extra=None):
+    info = {
+        "source": str(source),
+        "step": int(step),
+        "reason": str(reason),
+        "valid": path is not None,
+        "sample_count": 0,
+        "total_length": 0.0,
+    }
+    if path is not None:
+        array = np.asarray(path, dtype=np.float64)
+        info["sample_count"] = int(array.shape[0])
+        info["total_length"] = _rs_path_length(array)
+    if extra:
+        info.update(extra)
+    return info
+
+
+def _plan_fixed_rs_guide(env, state, step):
+    planner = getattr(env.rs_potential, "planner", None)
+    if planner is None:
+        return None, _fixed_rs_guide_info(
+            None,
+            "manual",
+            step,
+            reason="rs_planner_disabled",
+        )
+    try:
+        result = planner.plan(env.scene, state, env.slot)
+    except Exception as exc:
+        return None, _fixed_rs_guide_info(
+            None,
+            "manual",
+            step,
+            reason="planner_exception: {}".format(type(exc).__name__),
+        )
+    extra = {
+        "candidate_count": int(getattr(result, "candidate_count", 0)),
+        "checked_candidates": int(getattr(result, "checked_candidates", 0)),
+        "collision_checks": int(getattr(result, "collision_checks", 0)),
+        "generation_time_ms": float(getattr(result, "generation_time_ms", 0.0)),
+        "collision_time_ms": float(getattr(result, "collision_time_ms", 0.0)),
+        "plan_time_ms": float(getattr(result, "total_time_ms", 0.0)),
+    }
+    if not bool(getattr(result, "valid", False)) or getattr(result, "path", None) is None:
+        return None, _fixed_rs_guide_info(
+            None,
+            "manual",
+            step,
+            reason=str(getattr(result, "reason", "invalid")),
+            extra=extra,
+        )
+    path = np.asarray(result.path, dtype=np.float64).copy()
+    return path, _fixed_rs_guide_info(
+        path,
+        "manual",
+        step,
+        reason=str(getattr(result, "reason", "success")),
+        extra=extra,
+    )
+
+
+def _rollout_path(env, agent, seed, deterministic, rs_guide_step=None):
     observation, reset_info = env.reset(seed=seed)
     states = [env.state]
+    scene = env.scene
+    slot = env.slot
     total_reward = 0.0
     final_info = dict(reset_info)
     done = False
+    rs_guide_path = None
+    rs_guide_step_found = -1
+    rs_guide_state = None
+    rs_guide_info = None
+    rs_guide_source = "manual" if rs_guide_step is not None else "latch"
+    if rs_guide_step is not None:
+        requested_step = int(rs_guide_step)
+        if requested_step < 0:
+            raise ValueError("--rs-guide-step must be non-negative")
+        if requested_step == 0:
+            rs_guide_path, rs_guide_info = _plan_fixed_rs_guide(
+                env,
+                env.state,
+                requested_step,
+            )
+            rs_guide_step_found = requested_step
+            rs_guide_state = replace(env.state)
     while not done:
         raw_action, _, _ = agent.act(observation, deterministic=deterministic)
         observation, reward, terminated, truncated, info = env.step(raw_action)
@@ -111,12 +208,66 @@ def _rollout_path(env, agent, seed, deterministic):
         total_reward += float(reward)
         final_info = info
         done = bool(terminated or truncated)
+        if (
+            rs_guide_step is not None
+            and rs_guide_info is None
+            and env.step_count == int(rs_guide_step)
+        ):
+            rs_guide_path, rs_guide_info = _plan_fixed_rs_guide(
+                env,
+                env.state,
+                int(rs_guide_step),
+            )
+            rs_guide_step_found = int(rs_guide_step)
+            rs_guide_state = replace(env.state)
+        elif (
+            rs_guide_step is None
+            and rs_guide_path is None
+            and getattr(env.rs_potential, "rs_latched", False)
+            and getattr(env.rs_potential, "rs_path", None) is not None
+        ):
+            rs_guide_path = np.asarray(env.rs_potential.rs_path, dtype=np.float64).copy()
+            rs_guide_step_found = int(env.step_count)
+            rs_guide_state = replace(env.state)
+            rs_guide_info = _fixed_rs_guide_info(
+                rs_guide_path,
+                "latch",
+                rs_guide_step_found,
+                extra={
+                    "candidate_count": int(info.get("rs_candidate_count", 0)),
+                    "checked_candidates": int(info.get("rs_checked_candidates", 0)),
+                    "collision_checks": int(info.get("rs_collision_checks", 0)),
+                    "plan_time_ms": float(info.get("rs_plan_time_ms_mean", 0.0)),
+                },
+            )
+    if rs_guide_info is None:
+        if rs_guide_step is None:
+            rs_guide_info = _fixed_rs_guide_info(
+                None,
+                "latch",
+                -1,
+                reason=str(final_info.get("rs_fail_reason", "not_latched")),
+            )
+        else:
+            rs_guide_info = _fixed_rs_guide_info(
+                None,
+                "manual",
+                int(rs_guide_step),
+                reason="step_not_reached",
+            )
     return PathRollout(
         seed=int(seed),
+        scene=scene,
+        slot=slot,
         reset_info=dict(reset_info),
         states=states,
         final_info=dict(final_info),
         total_reward=float(total_reward),
+        rs_guide_path=rs_guide_path,
+        rs_guide_step=int(rs_guide_step_found),
+        rs_guide_state=rs_guide_state,
+        rs_guide_info=rs_guide_info,
+        rs_guide_source=rs_guide_source,
     )
 
 
@@ -221,6 +372,65 @@ def _plot_rollout(ax, env, rollout, color, index):
     _plot_polygon_outline(ax, end_front, color, alpha=0.9, linewidth=1.8, linestyle="--")
 
 
+def _plot_fixed_rs_guide(ax, vehicle_model, rollout):
+    if rollout.rs_guide_path is None:
+        return False
+    path = np.asarray(rollout.rs_guide_path, dtype=np.float64)
+    if path.ndim != 2 or path.shape[0] < 2 or path.shape[1] < 2:
+        return False
+    color = "#d00000"
+    ax.plot(
+        path[:, 0],
+        path[:, 1],
+        color=color,
+        linewidth=2.8,
+        linestyle="-.",
+        alpha=0.95,
+        label="fixed RS guide step {}".format(int(rollout.rs_guide_step)),
+        zorder=9,
+    )
+    ax.scatter(
+        [path[0, 0]],
+        [path[0, 1]],
+        color=color,
+        marker="D",
+        s=56,
+        edgecolors="black",
+        linewidths=0.6,
+        zorder=10,
+    )
+    ax.scatter(
+        [path[-1, 0]],
+        [path[-1, 1]],
+        color=color,
+        marker="*",
+        s=96,
+        edgecolors="black",
+        linewidths=0.5,
+        zorder=10,
+    )
+    _plot_direction_arrow(ax, path[:, :2], color)
+    if rollout.rs_guide_state is not None:
+        start_front, start_rear = vehicle_model.body_boxes(rollout.rs_guide_state)
+        _plot_polygon_outline(
+            ax,
+            start_rear,
+            color,
+            alpha=0.7,
+            linewidth=1.4,
+            linestyle="-.",
+        )
+        _plot_polygon_outline(
+            ax,
+            start_front,
+            color,
+            alpha=0.95,
+            linewidth=1.8,
+            linestyle="-.",
+        )
+    return True
+
+
 def _plot_scene_and_path(
     env,
     rollout,
@@ -232,16 +442,18 @@ def _plot_scene_and_path(
     total_paths,
 ):
     fig, ax = plt.subplots(figsize=(10, 10))
-    for obstacle in env.scene.obstacle_polygons:
+    scene = rollout.scene
+    slot = rollout.slot
+    for obstacle in scene.obstacle_polygons:
         _plot_polygon(ax, obstacle, "#777777", "#555555", alpha=0.95, zorder=1)
-    for bay in env.scene.parking_bays:
+    for bay in scene.parking_bays:
         _plot_bay(ax, bay)
 
-    target_front = env.slot.front_box()
+    target_front = slot.front_box()
     target_rear = env.vehicle_model.target_rear_box(
-        env.slot.x_goal,
-        env.slot.y_goal,
-        env.slot.theta_goal,
+        slot.x_goal,
+        slot.y_goal,
+        slot.theta_goal,
     )
     _plot_polygon(
         ax,
@@ -264,8 +476,9 @@ def _plot_scene_and_path(
 
     cmap = plt.get_cmap("tab20", max(1, total_paths))
     _plot_rollout(ax, env, rollout, cmap(path_index), path_index)
+    _plot_fixed_rs_guide(ax, env.vehicle_model, rollout)
 
-    xmin, ymin, xmax, ymax = env.scene.world_bounds
+    xmin, ymin, xmax, ymax = scene.world_bounds
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     ax.set_aspect("equal")
@@ -287,6 +500,7 @@ def _plot_scene_and_path(
     )
 
     info = rollout.final_info
+    rs_info = rollout.rs_guide_info or {}
     summary_lines = [
         "checkpoint: {}".format(checkpoint_name),
         "path={} seed={} {} steps={} overlap={:.2f} reward={:.2f}".format(
@@ -298,6 +512,22 @@ def _plot_scene_and_path(
             rollout.total_reward,
         )
     ]
+    if bool(rs_info.get("valid", False)):
+        summary_lines.append(
+            "rs_guide: {} step={} len={:.1f} samples={}".format(
+                rs_info.get("source", rollout.rs_guide_source),
+                int(rs_info.get("step", rollout.rs_guide_step)),
+                float(rs_info.get("total_length", 0.0)),
+                int(rs_info.get("sample_count", 0)),
+            )
+        )
+    elif rs_info:
+        summary_lines.append(
+            "rs_guide: {} unavailable ({})".format(
+                rs_info.get("source", rollout.rs_guide_source),
+                rs_info.get("reason", "unknown"),
+            )
+        )
     ax.text(
         0.01,
         0.01,
@@ -365,10 +595,21 @@ def main():
         action="store_true",
         help="Run even when checkpoint stage differs from --stage",
     )
+    parser.add_argument(
+        "--rs-guide-step",
+        type=int,
+        default=None,
+        help=(
+            "Plan and render one fixed RS guide from this rollout step; "
+            "omit to render the actual RS potential latch when it occurs"
+        ),
+    )
     args = parser.parse_args()
 
     if args.num_paths <= 0:
         raise ValueError("--num-paths must be positive")
+    if args.rs_guide_step is not None and int(args.rs_guide_step) < 0:
+        raise ValueError("--rs-guide-step must be non-negative")
     checkpoint_path = os.path.abspath(args.checkpoint)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(checkpoint_path)
@@ -403,15 +644,35 @@ def main():
     rollouts = []
     for index in range(int(args.num_paths)):
         rollout_seed = int(args.seed) + index
-        rollout = _rollout_path(env, agent, rollout_seed, deterministic)
+        rollout = _rollout_path(
+            env,
+            agent,
+            rollout_seed,
+            deterministic,
+            rs_guide_step=args.rs_guide_step,
+        )
         rollouts.append(rollout)
+        rs_info = rollout.rs_guide_info or {}
+        if bool(rs_info.get("valid", False)):
+            rs_text = "rs_guide={} step={} len={:.2f} samples={}".format(
+                rs_info.get("source", rollout.rs_guide_source),
+                int(rs_info.get("step", rollout.rs_guide_step)),
+                float(rs_info.get("total_length", 0.0)),
+                int(rs_info.get("sample_count", 0)),
+            )
+        else:
+            rs_text = "rs_guide={} unavailable reason={}".format(
+                rs_info.get("source", rollout.rs_guide_source),
+                rs_info.get("reason", "unknown"),
+            )
         print(
-            "path={} seed={} status={} steps={} reward={:.3f}".format(
+            "path={} seed={} status={} steps={} reward={:.3f} {}".format(
                 index + 1,
                 rollout_seed,
                 _status_label(rollout.final_info),
                 max(0, len(rollout.states) - 1),
                 rollout.total_reward,
+                rs_text,
             )
         )
 

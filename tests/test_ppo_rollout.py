@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from config import DEFAULT_ENV_CONFIG
+from config import DEFAULT_PPO_CONFIG
 from env.local_parking_env import LocalParkingEnv
 from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
 
@@ -16,7 +17,7 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
     )
     obs, _ = env.reset()
     agent = ContinuousPPOAgent(device="cpu")
-    raw_action, log_prob, value = agent.act(obs)
+    raw_action, pre_tanh_action, log_prob, value = agent.act_with_pre_tanh(obs)
     next_obs, reward, terminated, truncated, info = env.step(raw_action)
 
     assert obs.shape == (149,)
@@ -33,15 +34,24 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
         reward,
         terminated or truncated,
         value,
+        pre_tanh_action=pre_tanh_action,
+        task_family="parallel_rev",
     )
-    assert buffer.log_prob_action_source == "raw_action"
+    assert buffer.log_prob_action_source == "pre_tanh_action_and_raw_action"
+    assert np.allclose(buffer.pre_tanh_actions[0], pre_tanh_action)
     assert np.allclose(buffer.raw_actions[0], raw_action)
     assert np.allclose(buffer.executed_actions[0], info["executed_action"])
+    assert buffer.task_families == ["parallel_rev"]
 
     obs_t = torch.as_tensor(obs).unsqueeze(0)
+    pre_tanh_t = torch.as_tensor(pre_tanh_action).unsqueeze(0)
     raw_t = torch.as_tensor(raw_action).unsqueeze(0)
     with torch.no_grad():
-        recomputed, _, _ = agent.network.evaluate_raw_actions(obs_t, raw_t)
+        recomputed, _, _ = agent.network.evaluate_actions(
+            obs_t,
+            pre_tanh_t,
+            raw_t,
+        )
     assert np.isclose(log_prob, float(recomputed.item()), atol=1e-4)
 
 
@@ -64,3 +74,87 @@ def test_env_step_advances_with_executed_action(synthetic_action_mask):
     assert info["raw_action"][0] == 1.0
     assert info["executed_action"][0] == 0.0
     assert seen["action"][0] == 0.0
+
+
+def test_actor_uses_bounded_global_log_std():
+    agent = ContinuousPPOAgent(device="cpu")
+    observations = torch.randn(4, 149)
+    distribution = agent.network.distribution(observations)
+
+    assert tuple(agent.network.actor_log_std.shape) == (2,)
+    assert np.allclose(
+        agent.global_log_std(),
+        np.asarray([-0.7, -0.7], dtype=np.float32),
+    )
+    assert torch.allclose(
+        distribution.stddev[0],
+        distribution.stddev[1],
+    )
+
+    with torch.no_grad():
+        agent.network.actor_log_std.fill_(1.0)
+    agent.network.project_log_std()
+    assert np.allclose(
+        agent.global_log_std(),
+        np.asarray([-0.3, -0.3], dtype=np.float32),
+    )
+
+
+def test_ppo_early_stops_after_epoch_when_target_kl_is_exceeded():
+    config = replace(
+        DEFAULT_PPO_CONFIG,
+        actor_lr=5e-2,
+        critic_lr=3e-4,
+        batch_size=32,
+        ppo_epochs=4,
+        target_kl=1e-8,
+    )
+    agent = ContinuousPPOAgent(config=config, device="cpu")
+    buffer = RolloutBuffer()
+    rng = np.random.default_rng(12)
+    for index in range(32):
+        observation = rng.normal(size=149).astype(np.float32)
+        raw_action, pre_tanh_action, log_prob, value = agent.act_with_pre_tanh(
+            observation
+        )
+        buffer.add(
+            observation=observation,
+            raw_action=raw_action,
+            executed_action=np.zeros(2, dtype=np.float32),
+            log_prob=log_prob,
+            reward=float(index % 5),
+            done=index == 31,
+            value=value,
+            pre_tanh_action=pre_tanh_action,
+            task_family=(
+                "parallel_rev" if index % 3 == 0 else "head_in"
+            ),
+        )
+
+    stats = agent.update(
+        buffer,
+        last_observation=np.zeros(149, dtype=np.float32),
+        last_done=True,
+    )
+
+    assert stats["kl_early_stopped"] is True
+    assert stats["ppo_epochs_completed"] == 1
+    assert stats["approx_kl_max"] > config.target_kl
+    assert agent._policy_loss_weight("parallel_rev") == 0.2
+
+
+def test_checkpoint_preserves_log_std_bounds_and_ppo_config(tmp_path):
+    config = replace(
+        DEFAULT_PPO_CONFIG,
+        log_std_max=0.0,
+    )
+    agent = ContinuousPPOAgent(config=config, device="cpu")
+    path = tmp_path / "checkpoint.pt"
+    agent.save(str(path))
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    restored = ContinuousPPOAgent(device="cpu")
+    restored.network.load_state_dict(payload["network"])
+
+    assert payload["ppo_config"]["log_std_max"] == 0.0
+    assert float(restored.network.actor_log_std_max.item()) == 0.0

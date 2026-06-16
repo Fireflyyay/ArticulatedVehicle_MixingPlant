@@ -31,10 +31,35 @@ except Exception:
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TASK_FAMILIES = ("head_in", "parallel_fwd", "parallel_rev")
 
 
 def _safe_mean(values):
     return float(np.mean(values)) if values else 0.0
+
+
+def _task_family(reset_info, scene_metadata):
+    mode = str(reset_info.get("goal_orientation_mode", ""))
+    if mode == "head_in":
+        return "head_in"
+    if mode != "parallel":
+        raise ValueError("unsupported goal orientation mode: {}".format(mode))
+    if bool(scene_metadata.get("parallel_reverse", False)):
+        return "parallel_rev"
+    return "parallel_fwd"
+
+
+def _success_by_family(completed):
+    result = {}
+    for family in TASK_FAMILIES:
+        selected = [
+            float(item["success"])
+            for item in completed
+            if str(item.get("task_family", "")) == family
+        ]
+        result[family] = _safe_mean(selected)
+        result["{}_count".format(family)] = len(selected)
+    return result
 
 
 def _write_jsonl(path, record):
@@ -137,9 +162,14 @@ def _build_update_record(
     episode_index,
     update_index,
     start_time,
+    global_log_std,
+    gear_deadband,
+    latest_evaluation,
 ):
+    pre_tanh_actions = np.asarray(buffer.pre_tanh_actions)
     raw_actions = np.asarray(buffer.raw_actions)
     executed_actions = np.asarray(buffer.executed_actions)
+    family_success = _success_by_family(completed)
     return {
         "global_step": global_step,
         "episode": episode_index,
@@ -147,6 +177,30 @@ def _build_update_record(
         "rollout_size": len(buffer),
         "steps_per_second": global_step / max(time.perf_counter() - start_time, 1e-6),
         **update_stats,
+        "success/head_in": family_success["head_in"],
+        "success/parallel_fwd": family_success["parallel_fwd"],
+        "success/parallel_rev": family_success["parallel_rev"],
+        "episodes/head_in": family_success["head_in_count"],
+        "episodes/parallel_fwd": family_success["parallel_fwd_count"],
+        "episodes/parallel_rev": family_success["parallel_rev_count"],
+        "global_log_std": np.asarray(global_log_std, dtype=np.float32).tolist(),
+        "pre_tanh_abs_mean": float(np.mean(np.abs(pre_tanh_actions))),
+        "raw_action_saturation_rate": float(
+            np.mean(np.abs(raw_actions) > 0.95)
+        ),
+        "speed_deadband_rate": float(
+            np.mean(np.abs(raw_actions[:, 0]) < float(gear_deadband))
+        ),
+        "gear_switch_count": int(
+            sum(int(item.get("gear_switch_count", 0)) for item in completed)
+        ),
+        "deterministic_eval_success_by_family": dict(
+            latest_evaluation.get("deterministic", {})
+        ),
+        "stochastic_eval_success_by_family": dict(
+            latest_evaluation.get("stochastic", {})
+        ),
+        "weighted_score": float(latest_evaluation.get("weighted_score", 0.0)),
         "raw_action_mean": raw_actions.mean(axis=0).tolist(),
         "raw_action_std": raw_actions.std(axis=0).tolist(),
         "executed_action_mean": executed_actions.mean(axis=0).tolist(),
@@ -264,10 +318,10 @@ def _build_update_record(
         "mask_cost_mean": _safe_mean(
             [float(item.get("mask_cost", 0.0)) for item in infos]
         ),
-        "gear_switch_rate": _safe_mean([
-            float(i > 0 and infos[i].get("gear", 0) != infos[i - 1].get("gear", 0))
-            for i in range(1, len(infos))
-        ]) if len(infos) > 1 else 0.0,
+        "gear_switch_rate": float(
+            sum(int(item.get("gear_switch_count", 0)) for item in completed)
+            / max(len(infos), 1)
+        ),
         "mask_loss_ratio_abs": float(
             abs(update_stats.get("aux_mask_loss", 0.0))
             / max(abs(update_stats.get("policy_loss", 0.0)), 1e-8)
@@ -283,6 +337,7 @@ def _write_tensorboard_update(writer, record):
         if isinstance(value, (int, float)):
             writer.add_scalar("update/{}".format(key), value, episode)
     for field in (
+        "global_log_std",
         "raw_action_mean",
         "raw_action_std",
         "executed_action_mean",
@@ -294,6 +349,126 @@ def _write_tensorboard_update(writer, record):
                 value,
                 episode,
             )
+    for mode in ("deterministic", "stochastic"):
+        field = "{}_eval_success_by_family".format(mode)
+        for family, value in record.get(field, {}).items():
+            writer.add_scalar(
+                "eval/{}/{}".format(mode, family),
+                value,
+                episode,
+            )
+
+
+def _weighted_checkpoint_score(success_by_family, ppo_config):
+    weights = {
+        "head_in": float(ppo_config.checkpoint_score_weight_head_in),
+        "parallel_fwd": float(ppo_config.checkpoint_score_weight_parallel_fwd),
+        "parallel_rev": float(ppo_config.checkpoint_score_weight_parallel_rev),
+    }
+    denominator = sum(weights.values())
+    if denominator <= 0.0:
+        raise ValueError("checkpoint score weights must sum to a positive value")
+    return float(
+        sum(
+            weights[family] * float(success_by_family[family])
+            for family in TASK_FAMILIES
+        )
+        / denominator
+    )
+
+
+def _evaluate_policy_by_family(
+    agent,
+    env_config,
+    stage,
+    seed,
+    episodes_per_family,
+):
+    episodes_per_family = int(episodes_per_family)
+    if episodes_per_family <= 0:
+        raise ValueError("episodes_per_family must be positive")
+    eval_config = replace(
+        env_config,
+        curriculum_stage=int(stage),
+        use_hybrid_astar=False,
+        rs_potential_enabled=False,
+    )
+    base_seed = ((int(seed) + 100_000) // 16) * 16
+    results = {}
+    cuda_devices = []
+    if agent.device.type == "cuda":
+        cuda_devices = [
+            agent.device.index
+            if agent.device.index is not None
+            else torch.cuda.current_device()
+        ]
+
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(base_seed + 7)
+        if agent.device.type == "cuda":
+            torch.cuda.manual_seed_all(base_seed + 7)
+        for deterministic in (True, False):
+            env = LocalParkingEnv(
+                config=eval_config,
+                seed=base_seed,
+            )
+            successes = dict((family, []) for family in TASK_FAMILIES)
+            while min(len(values) for values in successes.values()) < episodes_per_family:
+                observation, reset_info = env.reset()
+                family = _task_family(reset_info, env.scene.metadata)
+                if len(successes[family]) >= episodes_per_family:
+                    continue
+                done = False
+                final_info = None
+                while not done:
+                    raw_action, _, _ = agent.act(
+                        observation,
+                        deterministic=deterministic,
+                    )
+                    observation, _, terminated, truncated, final_info = env.step(
+                        raw_action
+                    )
+                    done = terminated or truncated
+                successes[family].append(float(final_info["success"]))
+            mode = "deterministic" if deterministic else "stochastic"
+            results[mode] = dict(
+                (family, _safe_mean(successes[family]))
+                for family in TASK_FAMILIES
+            )
+    results["weighted_score"] = _weighted_checkpoint_score(
+        results["deterministic"],
+        agent.config,
+    )
+    results["stage"] = int(stage)
+    results["episodes_per_family"] = episodes_per_family
+    return results
+
+
+def _save_best_checkpoints(
+    agent,
+    output_dir,
+    evaluation,
+    best_scores,
+    checkpoint_extra,
+):
+    metrics = dict(evaluation["deterministic"])
+    metrics["weighted_score"] = float(evaluation["weighted_score"])
+    for name, score in metrics.items():
+        if float(score) <= float(best_scores[name]):
+            continue
+        best_scores[name] = float(score)
+        extra = dict(checkpoint_extra)
+        extra.update(
+            {
+                "best_metric": name,
+                "best_score": float(score),
+                "evaluation": dict(evaluation),
+            }
+        )
+        agent.save(
+            os.path.join(output_dir, "checkpoint_best_{}.pt".format(name)),
+            extra=extra,
+        )
 
 
 def train(args):
@@ -305,6 +480,25 @@ def train(args):
         raise ValueError("--batch-size must be positive")
     if args.checkpoint_interval <= 0:
         raise ValueError("--checkpoint-interval must be positive")
+    if args.eval_interval <= 0:
+        raise ValueError("--eval-interval must be positive")
+    if args.eval_episodes_per_family <= 0:
+        raise ValueError("--eval-episodes-per-family must be positive")
+    if args.ppo_epochs <= 0:
+        raise ValueError("--ppo-epochs must be positive")
+    if not 0.0 < args.clip_range < 1.0:
+        raise ValueError("--clip-range must be inside (0, 1)")
+    if args.actor_lr <= 0.0 or args.critic_lr <= 0.0:
+        raise ValueError("actor and critic learning rates must be positive")
+    if args.max_grad_norm <= 0.0:
+        raise ValueError("--max-grad-norm must be positive")
+    policy_weights = (
+        args.policy_loss_weight_head_in,
+        args.policy_loss_weight_parallel_fwd,
+        args.policy_loss_weight_parallel_rev,
+    )
+    if any(float(weight) < 0.0 for weight in policy_weights):
+        raise ValueError("policy loss weights must be non-negative")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env_config = replace(
@@ -319,6 +513,22 @@ def train(args):
         DEFAULT_PPO_CONFIG,
         rollout_steps=args.rollout_steps,
         batch_size=min(args.batch_size, args.rollout_steps),
+        clip_range=args.clip_range,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        max_grad_norm=args.max_grad_norm,
+        ppo_epochs=args.ppo_epochs,
+        target_kl=args.target_kl,
+        kl_early_stop_multiplier=args.kl_early_stop_multiplier,
+        log_std_init=args.log_std_init,
+        log_std_min=args.log_std_min,
+        log_std_max=args.log_std_max,
+        policy_loss_weight_head_in=args.policy_loss_weight_head_in,
+        policy_loss_weight_parallel_fwd=args.policy_loss_weight_parallel_fwd,
+        policy_loss_weight_parallel_rev=args.policy_loss_weight_parallel_rev,
+        checkpoint_score_weight_head_in=args.checkpoint_score_weight_head_in,
+        checkpoint_score_weight_parallel_fwd=args.checkpoint_score_weight_parallel_fwd,
+        checkpoint_score_weight_parallel_rev=args.checkpoint_score_weight_parallel_rev,
     )
     output_dir = _resolve_output_dir(args.output_dir, args.seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -363,6 +573,7 @@ def train(args):
 
     update_jsonl_path = os.path.join(output_dir, "training_metrics.jsonl")
     episode_jsonl_path = os.path.join(output_dir, "episode_metrics.jsonl")
+    evaluation_jsonl_path = os.path.join(output_dir, "evaluation_metrics.jsonl")
     reward_plot_path = os.path.join(output_dir, "reward_curve.png")
     writer = (
         SummaryWriter(os.path.join(output_dir, "tensorboard"))
@@ -379,6 +590,9 @@ def train(args):
     buffer = RolloutBuffer()
     rollout_infos = []
     rollout_completed = []
+    latest_evaluation = {}
+    best_scores = dict((name, -float("inf")) for name in TASK_FAMILIES)
+    best_scores["weighted_score"] = -float("inf")
     start_time = time.perf_counter()
 
     while episode_index < args.total_episodes:
@@ -393,12 +607,26 @@ def train(args):
 
         episode_reward = 0.0
         episode_steps = 0
+        episode_gear_switch_count = 0
+        previous_motion_gear = None
         final_info = None
         done = False
+        task_family = _task_family(reset_info, env.scene.metadata)
         while not done:
-            raw_action, log_prob, value = agent.act(observation)
+            raw_action, pre_tanh_action, log_prob, value = agent.act_with_pre_tanh(
+                observation
+            )
             next_observation, reward, terminated, truncated, info = env.step(raw_action)
             done = terminated or truncated
+            current_gear = int(info.get("gear", -1))
+            if (
+                previous_motion_gear in (0, 1)
+                and current_gear in (0, 1)
+                and current_gear != previous_motion_gear
+            ):
+                episode_gear_switch_count += 1
+            if current_gear in (0, 1):
+                previous_motion_gear = current_gear
             buffer.add(
                 observation=observation,
                 raw_action=raw_action,
@@ -407,8 +635,11 @@ def train(args):
                 reward=reward,
                 done=done,
                 value=value,
+                pre_tanh_action=pre_tanh_action,
                 mask_cost=float(info.get("mask_cost", 0.0)),
+                task_family=task_family,
             )
+            info["task_family"] = task_family
             rollout_infos.append(info)
             observation = next_observation
             global_step += 1
@@ -419,6 +650,8 @@ def train(args):
 
         episode_index += 1
         episode_rewards.append(episode_reward)
+        final_info["task_family"] = task_family
+        final_info["gear_switch_count"] = int(episode_gear_switch_count)
         rollout_completed.append(final_info)
         episode_record = {
             "episode": episode_index,
@@ -435,6 +668,7 @@ def train(args):
             "scenario_type": reset_info.get("scenario_type", ""),
             "scene_seed": int(reset_info.get("scene_seed", -1)),
             "goal_orientation_mode": str(reset_info.get("goal_orientation_mode", "")),
+            "task_family": task_family,
             "fallback_used": bool(reset_info.get("fallback_used", False)),
             "initial_collision": bool(reset_info.get("initial_collision", False)),
             "hybrid_astar_valid_rate": float(
@@ -468,6 +702,7 @@ def train(args):
             "forced_stop": int(final_info.get("forced_stop", False)),
             "raw_safe_ratio_final": float(final_info.get("raw_safe_ratio", 0.0)),
             "mask_coef": float(current_mask_coef),
+            "gear_switch_count": int(episode_gear_switch_count),
         }
         _write_jsonl(episode_jsonl_path, episode_record)
         if writer is not None:
@@ -496,13 +731,56 @@ def train(args):
         )
 
         checkpoint_due = episode_index % args.checkpoint_interval == 0
+        evaluation_due = (
+            episode_index % args.eval_interval == 0
+            or episode_index == args.total_episodes
+        )
         should_update = (
             len(buffer) >= ppo_config.rollout_steps
             or episode_index == args.total_episodes
         )
+        update_stats = None
         if should_update:
             update_stats = agent.update(buffer, observation, last_done, mask_coef=current_mask_coef)
             update_index += 1
+
+        if evaluation_due:
+            latest_evaluation = _evaluate_policy_by_family(
+                agent=agent,
+                env_config=env_config,
+                stage=args.stage,
+                seed=args.seed,
+                episodes_per_family=args.eval_episodes_per_family,
+            )
+            evaluation_record = {
+                "episode": episode_index,
+                "global_step": global_step,
+                **latest_evaluation,
+            }
+            _write_jsonl(evaluation_jsonl_path, evaluation_record)
+            checkpoint_extra = {
+                "global_step": global_step,
+                "episode": episode_index,
+                "stage": args.stage,
+            }
+            _save_best_checkpoints(
+                agent=agent,
+                output_dir=output_dir,
+                evaluation=latest_evaluation,
+                best_scores=best_scores,
+                checkpoint_extra=checkpoint_extra,
+            )
+            print(
+                "evaluation episode={episode} det={det} stochastic={stochastic} "
+                "weighted_score={score:.3f}".format(
+                    episode=episode_index,
+                    det=latest_evaluation["deterministic"],
+                    stochastic=latest_evaluation["stochastic"],
+                    score=latest_evaluation["weighted_score"],
+                )
+            )
+
+        if should_update:
             record = _build_update_record(
                 buffer=buffer,
                 infos=rollout_infos,
@@ -512,17 +790,23 @@ def train(args):
                 episode_index=episode_index,
                 update_index=update_index,
                 start_time=start_time,
+                global_log_std=agent.global_log_std(),
+                gear_deadband=env_config.gear_deadband,
+                latest_evaluation=latest_evaluation,
             )
             _write_jsonl(update_jsonl_path, record)
             _write_tensorboard_update(writer, record)
             print(
                 "ppo_update={update} episode={episode} rollout={rollout} "
-                "success_rate={success:.3f} kl={kl:.5f}".format(
+                "success_rate={success:.3f} kl_mean={kl_mean:.5f} "
+                "kl_max={kl_max:.5f} epochs={epochs}".format(
                     update=update_index,
                     episode=episode_index,
                     rollout=record["rollout_size"],
                     success=record["success_rate"],
-                    kl=record["approx_kl"],
+                    kl_mean=record["approx_kl_mean"],
+                    kl_max=record["approx_kl_max"],
+                    epochs=record["ppo_epochs_completed"],
                 )
             )
             buffer = RolloutBuffer()
@@ -541,6 +825,8 @@ def train(args):
                     "global_step": global_step,
                     "episode": episode_index,
                     "stage": args.stage,
+                    "latest_evaluation": dict(latest_evaluation),
+                    "best_scores": dict(best_scores),
                 },
             )
         if curriculum:
@@ -557,6 +843,8 @@ def train(args):
             "global_step": global_step,
             "episode": episode_index,
             "stage": args.stage,
+            "latest_evaluation": dict(latest_evaluation),
+            "best_scores": dict(best_scores),
         },
     )
     if writer is not None:
@@ -570,6 +858,86 @@ def main():
     parser.add_argument("--total-episodes", type=int, default=20_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--ppo-epochs",
+        type=int,
+        default=DEFAULT_PPO_CONFIG.ppo_epochs,
+    )
+    parser.add_argument(
+        "--clip-range",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.clip_range,
+    )
+    parser.add_argument(
+        "--actor-lr",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.actor_lr,
+    )
+    parser.add_argument(
+        "--critic-lr",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.critic_lr,
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.max_grad_norm,
+    )
+    parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.target_kl,
+    )
+    parser.add_argument(
+        "--kl-early-stop-multiplier",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.kl_early_stop_multiplier,
+    )
+    parser.add_argument(
+        "--log-std-init",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.log_std_init,
+    )
+    parser.add_argument(
+        "--log-std-min",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.log_std_min,
+    )
+    parser.add_argument(
+        "--log-std-max",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.log_std_max,
+    )
+    parser.add_argument(
+        "--policy-loss-weight-head-in",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.policy_loss_weight_head_in,
+    )
+    parser.add_argument(
+        "--policy-loss-weight-parallel-fwd",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.policy_loss_weight_parallel_fwd,
+    )
+    parser.add_argument(
+        "--policy-loss-weight-parallel-rev",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.policy_loss_weight_parallel_rev,
+    )
+    parser.add_argument(
+        "--checkpoint-score-weight-head-in",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_head_in,
+    )
+    parser.add_argument(
+        "--checkpoint-score-weight-parallel-fwd",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_parallel_fwd,
+    )
+    parser.add_argument(
+        "--checkpoint-score-weight-parallel-rev",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_parallel_rev,
+    )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument("--use-hybrid-astar", action="store_true")
     parser.add_argument(
@@ -580,6 +948,18 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=500,
+        help="Run fixed-family deterministic and stochastic evaluation every N episodes",
+    )
+    parser.add_argument(
+        "--eval-episodes-per-family",
+        type=int,
+        default=4,
+        help="Evaluation episodes for each task family and policy mode",
+    )
     parser.add_argument(
         "--output-dir",
         default=None,
