@@ -73,6 +73,11 @@ def main():
     parser = argparse.ArgumentParser(description="Render a cached local parking scene.")
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--task-family",
+        choices=["head_in", "parallel_fwd", "parallel_rev"],
+        default="head_in",
+    )
     parser.add_argument("--output", default=None)
     parser.add_argument("--show-lidar", action="store_true")
     args = parser.parse_args()
@@ -81,11 +86,20 @@ def main():
         REPO_ROOT,
         "outputs",
         "scenes",
-        "local_parking_stage{}_seed{}.png".format(args.stage, args.seed),
+        "local_parking_stage{}_{}_seed{}.png".format(
+            args.stage,
+            args.task_family,
+            args.seed,
+        ),
     )
     os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
     env = LocalParkingEnv(
-        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=args.stage),
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=args.stage,
+            scene_pool_size=1,
+            scene_family_schedule=(args.task_family,),
+        ),
         seed=args.seed,
     )
     _, info = env.reset(seed=args.seed)

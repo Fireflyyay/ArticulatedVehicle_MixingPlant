@@ -14,7 +14,7 @@ import numpy as np
 
 from config import DEFAULT_VEHICLE_PARAMS
 from env.geometry import wrap_to_pi
-from env.mixing_plant_scene import generate_cached_mixing_plant_scene
+from env.mixing_plant_scene import TASK_FAMILIES, generate_cached_mixing_plant_scene
 from env.rs_potential import RSPotentialPlanner
 from env.vehicle import ArticulatedState
 from planning.passenger_hybrid_astar import PassengerHybridAStar
@@ -114,9 +114,11 @@ def main():
     reasons = Counter()
 
     for index in range(args.samples):
+        task_family = TASK_FAMILIES[index % len(TASK_FAMILIES)]
         scene = generate_cached_mixing_plant_scene(
             stage=args.stage,
             seed=int(args.seed + index),
+            task_family=task_family,
         )
         state = _sample_state(scene, checker, rng)
         result = planner.plan(scene, state, scene.slot)

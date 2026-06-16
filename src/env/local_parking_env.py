@@ -14,7 +14,7 @@ from env.articulated_action_mask import ArticulatedActionMask
 from env.geometry import overlap_ratio, wrap_to_pi
 from env.hybrid_astar_reward import OptionalHybridAStarReward
 from env.lidar import DualBodyLidar
-from env.mixing_plant_scene import CachedScenePool
+from env.mixing_plant_scene import CachedScenePool, TASK_FAMILIES
 from env.reward import LocalParkingReward
 from env.rs_potential import RSPotentialOracle, RSPotentialPlanner
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
@@ -79,6 +79,7 @@ class LocalParkingEnv:
                 pool_size=config.scene_pool_size,
                 base_seed=int(seed),
                 scene_config=scene_config,
+                family_schedule=config.scene_family_schedule,
             )
         self.hybrid_reward = OptionalHybridAStarReward(
             planner=hybrid_planner if config.use_hybrid_astar else None,
@@ -144,6 +145,7 @@ class LocalParkingEnv:
         self.prev_motion_gear = None
         self.prev_gear_in_obs = 0.0
         self.scenario_type = ""
+        self.initial_sampling_diagnostics = {}
 
     def set_active_stage(self, stage):
         stage = int(np.clip(stage, 1, 4))
@@ -178,6 +180,79 @@ class LocalParkingEnv:
         return min(float(np.min(front_lidar)), float(np.min(rear_lidar))) <= float(
             self.config.recovery_max_lidar_distance
         )
+
+    def _task_family_from_scene(self):
+        task_family = str(self.scene.metadata.get("task_family", ""))
+        if task_family in TASK_FAMILIES:
+            return task_family
+        goal_orientation_mode = self.scene.metadata.get(
+            "goal_orientation_mode",
+            "head_in",
+        )
+        if goal_orientation_mode == "head_in":
+            return "head_in"
+        if bool(self.scene.metadata.get("parallel_reverse", False)):
+            return "parallel_rev"
+        return "parallel_fwd"
+
+    @staticmethod
+    def _lerp(value_a, value_b, t):
+        return float(value_a) + (float(value_b) - float(value_a)) * float(t)
+
+    def _parallel_rev_curriculum_ranges(
+        self,
+        stage,
+        distance_range,
+        lateral_range,
+        heading_range,
+        phi_range,
+        task_family,
+    ):
+        diagnostics = {
+            "initial_task_family": str(task_family),
+            "parallel_rev_curriculum_active": False,
+            "parallel_rev_curriculum_progress": 1.0,
+        }
+        if task_family != "parallel_rev" or int(stage) != 1:
+            return distance_range, lateral_range, heading_range, phi_range, diagnostics
+
+        total = int(max(0, self.config.parallel_rev_curriculum_episodes))
+        if total <= 0:
+            return distance_range, lateral_range, heading_range, phi_range, diagnostics
+
+        episode_progress_index = max(0, int(self.episode_index) - 1)
+        progress = min(1.0, float(episode_progress_index) / float(total))
+        warm_distance = self.config.parallel_rev_warmup_distance_range
+        distance_range = (
+            self._lerp(warm_distance[0], distance_range[0], progress),
+            self._lerp(warm_distance[1], distance_range[1], progress),
+        )
+        lateral_range = self._lerp(
+            self.config.parallel_rev_warmup_lateral_range,
+            lateral_range,
+            progress,
+        )
+        heading_range = math.radians(
+            self._lerp(
+                self.config.parallel_rev_warmup_heading_range_deg,
+                math.degrees(heading_range),
+                progress,
+            )
+        )
+        phi_range = math.radians(
+            self._lerp(
+                self.config.parallel_rev_warmup_phi_range_deg,
+                math.degrees(phi_range),
+                progress,
+            )
+        )
+        diagnostics.update(
+            {
+                "parallel_rev_curriculum_active": progress < 1.0,
+                "parallel_rev_curriculum_progress": float(progress),
+            }
+        )
+        return distance_range, lateral_range, heading_range, phi_range, diagnostics
 
     def _structured_recovery_state(self, goal, axis, normal):
         """Search a small Bay-mouth boundary band after random sampling fails."""
@@ -218,12 +293,33 @@ class LocalParkingEnv:
         lateral_range = float(self.config.stage_lateral_ranges[index])
         heading_range = math.radians(self.config.stage_heading_ranges_deg[index])
         phi_range = math.radians(self.config.stage_phi_ranges_deg[index])
+        task_family = self._task_family_from_scene()
+        (
+            distance_range,
+            lateral_range,
+            heading_range,
+            phi_range,
+            sampling_diagnostics,
+        ) = self._parallel_rev_curriculum_ranges(
+            stage=stage,
+            distance_range=distance_range,
+            lateral_range=lateral_range,
+            heading_range=heading_range,
+            phi_range=phi_range,
+            task_family=task_family,
+        )
         scenario = {
             1: "near_goal",
             2: "near_goal_obstacles",
             3: "poor_terminal_pose",
             4: "recovery",
         }[stage]
+        if (
+            task_family == "parallel_rev"
+            and stage == 1
+            and bool(sampling_diagnostics["parallel_rev_curriculum_active"])
+        ):
+            scenario = "parallel_rev_warmup"
 
         goal_orientation_mode = self.scene.metadata.get("goal_orientation_mode", "head_in")
         if goal_orientation_mode == "parallel":
@@ -246,6 +342,17 @@ class LocalParkingEnv:
             normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
             ref_center = np.asarray(goal.center)
             effective_lateral_range = lateral_range
+
+        sampling_diagnostics.update(
+            {
+                "initial_distance_min": float(distance_range[0]),
+                "initial_distance_max": float(distance_range[1]),
+                "initial_lateral_range": float(effective_lateral_range),
+                "initial_heading_range_deg": float(math.degrees(heading_range)),
+                "initial_phi_range_deg": float(math.degrees(phi_range)),
+            }
+        )
+        self.initial_sampling_diagnostics = dict(sampling_diagnostics)
 
         fallback_used = False
         for _ in range(max(1, int(self.config.initial_sampling_attempts))):
@@ -464,6 +571,23 @@ class LocalParkingEnv:
         )
         info["fallback_used"] = bool(fallback_used)
         info["initial_collision"] = self._state_collides(self.state)
+        info["task_family"] = self._task_family_from_scene()
+        info.update(self.initial_sampling_diagnostics)
+        for key in (
+            "clearance_bucket",
+            "approach_side_bucket",
+            "reverse_required_bucket",
+            "difficulty_label",
+            "nominal_target_collision",
+            "nominal_target_front_in_bay",
+            "nominal_target_rear_in_bay",
+            "nominal_target_clearance_m",
+            "success_neighborhood_sample_count",
+            "success_neighborhood_collision_free_count",
+            "success_neighborhood_feasible_count",
+        ):
+            if key in self.scene.metadata:
+                info[key] = self.scene.metadata[key]
         return obs, info
 
     def _out_of_bounds(self, front_box, rear_box):
@@ -492,6 +616,7 @@ class LocalParkingEnv:
             "planner_fallback_used": self.hybrid_reward._fallback_used,
             "planner_fail_reason": str(self.hybrid_reward.fail_reason),
             "scene_seed": int(self.scene.metadata["seed"]),
+            "task_family": self._task_family_from_scene(),
             "goal_orientation_mode": str(
                 self.scene.metadata.get("goal_orientation_mode", "")
             ),

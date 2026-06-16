@@ -4,11 +4,18 @@ from env.mixing_plant_scene import CachedScenePool
 
 
 class MultiStageScenePool:
-    def __init__(self, pool_size=16, base_seed=0, scene_config=None):
+    def __init__(
+        self,
+        pool_size=16,
+        base_seed=0,
+        scene_config=None,
+        family_schedule=None,
+    ):
         self._pools = {}
         self._pool_size = int(pool_size)
         self._base_seed = int(base_seed)
         self._scene_config = scene_config
+        self._family_schedule = family_schedule
 
     def pool_for(self, stage):
         stage = int(stage)
@@ -18,6 +25,7 @@ class MultiStageScenePool:
                 pool_size=self._pool_size,
                 base_seed=self._base_seed,
                 scene_config=self._scene_config,
+                family_schedule=self._family_schedule,
             )
         return self._pools[stage]
 

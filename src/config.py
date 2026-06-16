@@ -114,6 +114,11 @@ class LocalParkingEnvConfig:
     success_heading_error: float = math.radians(15.0)
     curriculum_stage: int = 1
     scene_pool_size: int = 16
+    scene_family_schedule: Tuple[str, ...] = (
+        "head_in",
+        "parallel_fwd",
+        "parallel_rev",
+    )
     use_hybrid_astar: bool = False
     initial_sampling_attempts: int = 128
     stage_distance_ranges: Tuple[Tuple[float, float], ...] = (
@@ -131,6 +136,11 @@ class LocalParkingEnvConfig:
     recovery_min_abs_phi_deg: float = 18.0
     recovery_max_body_clearance: float = 0.80
     recovery_max_lidar_distance: float = 2.20
+    parallel_rev_curriculum_episodes: int = 2000
+    parallel_rev_warmup_distance_range: Tuple[float, float] = (4.0, 8.0)
+    parallel_rev_warmup_lateral_range: float = 1.25
+    parallel_rev_warmup_heading_range_deg: float = 20.0
+    parallel_rev_warmup_phi_range_deg: float = 8.0
 
     success_reward: float = 5.0
     failure_reward: float = -5.0

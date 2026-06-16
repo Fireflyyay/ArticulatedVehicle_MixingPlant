@@ -14,7 +14,7 @@ import numpy as np
 
 from config import DEFAULT_SCENE_CONFIG
 from env.geometry import wrap_to_pi
-from env.mixing_plant_scene import generate_cached_mixing_plant_scene
+from env.mixing_plant_scene import TASK_FAMILIES, generate_cached_mixing_plant_scene
 from env.vehicle import ArticulatedState
 from planning.passenger_hybrid_astar import PassengerHybridAStar
 
@@ -131,8 +131,11 @@ def main():
 
         for seed_idx in range(SEEDS_PER_STAGE):
             seed_id = seed_idx + (stage - 1) * SEEDS_PER_STAGE
+            task_family = TASK_FAMILIES[seed_idx % len(TASK_FAMILIES)]
             scene = generate_cached_mixing_plant_scene(
-                stage=stage, seed=seed_id,
+                stage=stage,
+                seed=seed_id,
+                task_family=task_family,
             )
             slot = scene.slot
             seed_times = []

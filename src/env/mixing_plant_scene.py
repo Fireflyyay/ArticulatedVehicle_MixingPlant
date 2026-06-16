@@ -9,7 +9,12 @@ from shapely.ops import unary_union
 from shapely.prepared import prep
 
 from config import DEFAULT_SCENE_CONFIG, DEFAULT_VEHICLE_PARAMS, MixingPlantSceneConfig
-from env.geometry import DirectedParkingSlot, wrap_to_pi
+from env.geometry import DirectedParkingSlot, overlap_ratio, wrap_to_pi
+from env.vehicle import ArticulatedState, ArticulatedVehicleModel
+
+
+TASK_FAMILIES = ("head_in", "parallel_fwd", "parallel_rev")
+_TASK_FAMILY_TO_INDEX = dict((family, index) for index, family in enumerate(TASK_FAMILIES))
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,7 @@ class MixingPlantScene:
 class _SceneLayout:
     corridor_heading: float
     corridor_origin: Tuple[float, float]
+    task_family: str
     target_mode: str
     target_side: float
     target_along: float
@@ -65,19 +71,78 @@ def _quantize(value, resolution):
     return float(round(float(value) / float(resolution)) * float(resolution))
 
 
-def _sample_layout(seed, scene_config):
+def normalize_task_family(task_family):
+    task_family = str(task_family)
+    if task_family not in _TASK_FAMILY_TO_INDEX:
+        raise ValueError(
+            "unsupported task family '{}'; expected one of {}".format(
+                task_family,
+                TASK_FAMILIES,
+            )
+        )
+    return task_family
+
+
+def normalize_family_schedule(family_schedule):
+    if family_schedule is None:
+        family_schedule = TASK_FAMILIES
+    if isinstance(family_schedule, str):
+        family_schedule = tuple(
+            part.strip() for part in family_schedule.split(",") if part.strip()
+        )
+    else:
+        family_schedule = tuple(family_schedule)
+    if not family_schedule:
+        raise ValueError("scene family schedule must not be empty")
+    return tuple(normalize_task_family(family) for family in family_schedule)
+
+
+def family_to_goal_mode(task_family):
+    task_family = normalize_task_family(task_family)
+    if task_family == "head_in":
+        return "head_in", False
+    if task_family == "parallel_fwd":
+        return "parallel", False
+    return "parallel", True
+
+
+def derive_scene_seed(base_seed, pool_index, task_family, stage):
+    task_family = normalize_task_family(task_family)
+    seed_items = [
+        int(base_seed) & 0xFFFFFFFF,
+        int(stage) & 0xFFFFFFFF,
+        int(pool_index) & 0xFFFFFFFF,
+        _TASK_FAMILY_TO_INDEX[task_family],
+    ]
+    seed_sequence = np.random.SeedSequence(seed_items)
+    return int(seed_sequence.generate_state(1, dtype=np.uint32)[0])
+
+
+def _bucket_clearance(clearance_m):
+    clearance_m = float(clearance_m)
+    if clearance_m < 0.50:
+        return "tight"
+    if clearance_m < 1.00:
+        return "narrow"
+    if clearance_m < 2.00:
+        return "normal"
+    return "open"
+
+
+def _sample_layout(seed, scene_config, task_family):
     """Map every seed to a reproducible constructive layout."""
     seed = int(seed)
+    task_family = normalize_task_family(task_family)
+    target_mode, parallel_reverse = family_to_goal_mode(task_family)
     rng = np.random.default_rng(np.random.SeedSequence(seed & 0xFFFFFFFF))
     resolution = float(scene_config.resolution)
-    corridor_heading = 0.0 if (seed // 2) % 2 == 0 else 0.5 * math.pi
+    corridor_heading = float(rng.choice((0.0, 0.5 * math.pi)))
     axis, normal = _cardinal_frame(corridor_heading)
     jitter = float(scene_config.main_origin_jitter)
     along_shift = _quantize(rng.uniform(-jitter, jitter), resolution)
     normal_shift = _quantize(rng.uniform(-jitter, jitter), resolution)
     origin = axis * along_shift + normal * normal_shift
-    target_mode = "head_in" if seed % 2 == 0 else "parallel"
-    target_side = 1.0 if (seed // 4) % 2 == 0 else -1.0
+    target_side = float(rng.choice((-1.0, 1.0)))
 
     def sample_range(bounds):
         return _quantize(rng.uniform(float(bounds[0]), float(bounds[1])), resolution)
@@ -112,10 +177,11 @@ def _sample_layout(seed, scene_config):
     return _SceneLayout(
         corridor_heading=float(corridor_heading),
         corridor_origin=(float(origin[0]), float(origin[1])),
+        task_family=task_family,
         target_mode=target_mode,
         target_side=target_side,
         target_along=target_along,
-        parallel_reverse=bool((seed // 8) % 2),
+        parallel_reverse=bool(parallel_reverse),
         first_branch_along=float(branch_positions[0]),
         second_branch_along=float(branch_positions[1]),
         branch_bay_along=sample_range(scene_config.branch_bay_along_range),
@@ -279,6 +345,105 @@ def _goal_center_in_bay(bay, scene_config):
     return center + goal_axis * (target_projection - center_projection)
 
 
+def _target_feasibility_audit(target_bay, slot, obstacle_union, prepared_obstacles):
+    params = DEFAULT_VEHICLE_PARAMS
+    model = ArticulatedVehicleModel(params)
+    target_state = ArticulatedState(
+        x_front=float(slot.x_goal),
+        y_front=float(slot.y_goal),
+        theta_front=float(slot.theta_goal),
+        theta_rear=float(slot.theta_goal),
+    )
+    target_front, target_rear = model.body_boxes(target_state)
+    nominal_target_collision = bool(
+        prepared_obstacles.intersects(target_front)
+        or prepared_obstacles.intersects(target_rear)
+    )
+    target_front_in_bay = bool(target_bay.polygon.covers(target_front))
+    target_rear_in_bay = bool(target_bay.polygon.covers(target_rear))
+    nominal_clearance = float(
+        min(target_front.distance(obstacle_union), target_rear.distance(obstacle_union))
+    )
+
+    axis = np.asarray(
+        [math.cos(float(slot.theta_goal)), math.sin(float(slot.theta_goal))],
+        dtype=np.float64,
+    )
+    normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+    center = np.asarray(slot.center, dtype=np.float64)
+    heading_threshold = math.radians(15.0)
+    success_overlap_threshold = 0.80
+    longitudinal_offsets = np.linspace(-0.40, 0.40, 5)
+    lateral_offsets = np.linspace(-0.30, 0.30, 5)
+    heading_offsets = np.linspace(-heading_threshold, heading_threshold, 5)
+    sample_count = 0
+    collision_free_count = 0
+    feasible_count = 0
+    for longitudinal in longitudinal_offsets:
+        for lateral in lateral_offsets:
+            for heading_error in heading_offsets:
+                sample_count += 1
+                sample_center = center + axis * longitudinal + normal * lateral
+                theta = wrap_to_pi(float(slot.theta_goal) + float(heading_error))
+                sample_state = ArticulatedState(
+                    x_front=float(sample_center[0]),
+                    y_front=float(sample_center[1]),
+                    theta_front=float(theta),
+                    theta_rear=float(theta),
+                )
+                front_box, rear_box = model.body_boxes(sample_state)
+                collision = bool(
+                    prepared_obstacles.intersects(front_box)
+                    or prepared_obstacles.intersects(rear_box)
+                )
+                if not collision:
+                    collision_free_count += 1
+                if (
+                    not collision
+                    and overlap_ratio(front_box, slot.front_box())
+                    >= success_overlap_threshold
+                    and abs(float(heading_error)) <= heading_threshold
+                ):
+                    feasible_count += 1
+
+    return {
+        "nominal_target_collision": nominal_target_collision,
+        "nominal_target_front_in_bay": target_front_in_bay,
+        "nominal_target_rear_in_bay": target_rear_in_bay,
+        "nominal_target_clearance_m": nominal_clearance,
+        "success_neighborhood_sample_count": int(sample_count),
+        "success_neighborhood_collision_free_count": int(collision_free_count),
+        "success_neighborhood_feasible_count": int(feasible_count),
+        "success_neighborhood_overlap_threshold": float(success_overlap_threshold),
+        "success_neighborhood_heading_threshold_deg": float(
+            math.degrees(heading_threshold)
+        ),
+    }
+
+
+def _difficulty_metadata(layout, target_bay, audit):
+    clearance_bucket = _bucket_clearance(audit["nominal_target_clearance_m"])
+    approach_side_bucket = "left_bay" if float(layout.target_side) > 0.0 else "right_bay"
+    reverse_required_bucket = (
+        "required" if layout.task_family == "parallel_rev" else "not_required"
+    )
+    return {
+        "clearance_bucket": clearance_bucket,
+        "approach_side_bucket": approach_side_bucket,
+        "reverse_required_bucket": reverse_required_bucket,
+        "difficulty_label": "{}|{}|{}".format(
+            clearance_bucket,
+            approach_side_bucket,
+            reverse_required_bucket,
+        ),
+        "bay_goal_alignment_deg": float(
+            math.degrees(
+                abs(wrap_to_pi(target_bay.goal_heading - target_bay.inward_heading))
+            )
+        ),
+    }
+
+
 def _corridor_polygons(stage, layout, scene_config):
     corridor_width = scene_config.corridor_width(stage)
     branch_width = max(
@@ -338,16 +503,18 @@ def _corridor_polygons(stage, layout, scene_config):
     return polygons, corridor_heading, corridor_width, branch_width, branch_specs
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def generate_cached_mixing_plant_scene(
     stage=1,
     seed=0,
     scene_config=DEFAULT_SCENE_CONFIG,
+    task_family="head_in",
 ):
     """Build a cached 80 m mixing plant with explicit corridors and bays."""
     stage = int(np.clip(stage, 1, 4))
-    config = scene_config
-    layout = _sample_layout(seed, config)
+    config = DEFAULT_SCENE_CONFIG if scene_config is None else scene_config
+    task_family = normalize_task_family(task_family)
+    layout = _sample_layout(seed, config, task_family)
     half_extent = float(config.world_half_extent)
     resolution = float(config.resolution)
     grid_size = int(round(2.0 * half_extent / resolution))
@@ -422,6 +589,7 @@ def generate_cached_mixing_plant_scene(
         resolution,
     )
     obstacle_union = unary_union(obstacle_polygons)
+    prepared_obstacles = prep(obstacle_union)
     goal_center = _goal_center_in_bay(target_bay, config)
     slot = DirectedParkingSlot(
         x_goal=float(goal_center[0]),
@@ -430,12 +598,20 @@ def generate_cached_mixing_plant_scene(
         front_body_length=DEFAULT_VEHICLE_PARAMS.front_body_length,
         front_body_width=DEFAULT_VEHICLE_PARAMS.front_body_width,
     )
+    audit = _target_feasibility_audit(
+        target_bay=target_bay,
+        slot=slot,
+        obstacle_union=obstacle_union,
+        prepared_obstacles=prepared_obstacles,
+    )
     free_ratio = float(np.mean(occupancy == 0))
     metadata = {
         "scene_type": "cached_rule_carved_mixing_plant",
         "stage": stage,
         "seed": int(seed),
+        "task_family": task_family,
         "generation_mode": "blocked_grid_then_constructive_corridor_and_bay_carve",
+        "family_sampling_mode": "explicit_family_then_derived_scene_seed",
         "world_bounds": (-half_extent, -half_extent, half_extent, half_extent),
         "grid_width": grid_size,
         "grid_height": grid_size,
@@ -455,6 +631,8 @@ def generate_cached_mixing_plant_scene(
         "free_ratio": free_ratio,
         "obstacle_count": len(obstacle_polygons),
     }
+    metadata.update(audit)
+    metadata.update(_difficulty_metadata(layout, target_bay, audit))
     return MixingPlantScene(
         occupancy_grid=occupancy,
         obstacle_polygons=obstacle_polygons,
@@ -466,7 +644,7 @@ def generate_cached_mixing_plant_scene(
         resolution=resolution,
         metadata=metadata,
         obstacle_union=obstacle_union,
-        prepared_obstacles=prep(obstacle_union),
+        prepared_obstacles=prepared_obstacles,
     )
 
 
@@ -477,19 +655,46 @@ class CachedScenePool:
         pool_size=16,
         base_seed=0,
         scene_config=DEFAULT_SCENE_CONFIG,
+        family_schedule=TASK_FAMILIES,
+        validate_scene_audit=True,
     ):
         self.stage = int(stage)
         self.pool_size = max(1, int(pool_size))
         self.base_seed = int(base_seed)
-        self.scene_config = scene_config
-        self._scenes = [
-            generate_cached_mixing_plant_scene(
-                self.stage,
-                self.base_seed + index,
-                self.scene_config,
+        self.scene_config = DEFAULT_SCENE_CONFIG if scene_config is None else scene_config
+        self.family_schedule = normalize_family_schedule(family_schedule)
+        self.validate_scene_audit = bool(validate_scene_audit)
+        self._scenes = []
+        for index in range(self.pool_size):
+            task_family = self.family_schedule[index % len(self.family_schedule)]
+            scene_seed = derive_scene_seed(
+                base_seed=self.base_seed,
+                pool_index=index,
+                task_family=task_family,
+                stage=self.stage,
             )
-            for index in range(self.pool_size)
-        ]
+            scene = generate_cached_mixing_plant_scene(
+                stage=self.stage,
+                seed=scene_seed,
+                scene_config=self.scene_config,
+                task_family=task_family,
+            )
+            if self.validate_scene_audit:
+                if bool(scene.metadata.get("nominal_target_collision", True)):
+                    raise RuntimeError(
+                        "scene audit failed: target collision for seed {} family {}".format(
+                            scene_seed,
+                            task_family,
+                        )
+                    )
+                if int(scene.metadata.get("success_neighborhood_feasible_count", 0)) <= 0:
+                    raise RuntimeError(
+                        "scene audit failed: empty success neighborhood for seed {} family {}".format(
+                            scene_seed,
+                            task_family,
+                        )
+                    )
+            self._scenes.append(scene)
 
     def get(self, episode_index):
         return self._scenes[int(episode_index) % len(self._scenes)]

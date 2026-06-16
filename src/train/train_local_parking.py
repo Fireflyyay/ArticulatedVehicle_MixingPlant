@@ -20,6 +20,10 @@ from config import (
     DEFAULT_VEHICLE_PARAMS,
 )
 from env.local_parking_env import LocalParkingEnv
+from env.mixing_plant_scene import (
+    TASK_FAMILIES as SCENE_TASK_FAMILIES,
+    normalize_family_schedule,
+)
 from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
 from planning.passenger_hybrid_astar import PassengerHybridAStar
 from train.curriculum import CurriculumStageSelector, MultiStageScenePool
@@ -31,7 +35,7 @@ except Exception:
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TASK_FAMILIES = ("head_in", "parallel_fwd", "parallel_rev")
+TASK_FAMILIES = SCENE_TASK_FAMILIES
 
 
 def _safe_mean(values):
@@ -39,6 +43,9 @@ def _safe_mean(values):
 
 
 def _task_family(reset_info, scene_metadata):
+    task_family = str(reset_info.get("task_family", ""))
+    if task_family in TASK_FAMILIES:
+        return task_family
     mode = str(reset_info.get("goal_orientation_mode", ""))
     if mode == "head_in":
         return "head_in"
@@ -47,6 +54,10 @@ def _task_family(reset_info, scene_metadata):
     if bool(scene_metadata.get("parallel_reverse", False)):
         return "parallel_rev"
     return "parallel_fwd"
+
+
+def _parse_family_schedule(value):
+    return normalize_family_schedule(value)
 
 
 def _success_by_family(completed):
@@ -392,6 +403,8 @@ def _evaluate_policy_by_family(
         curriculum_stage=int(stage),
         use_hybrid_astar=False,
         rs_potential_enabled=False,
+        scene_family_schedule=TASK_FAMILIES,
+        parallel_rev_curriculum_episodes=0,
     )
     base_seed = ((int(seed) + 100_000) // 16) * 16
     results = {}
@@ -499,15 +512,39 @@ def train(args):
     )
     if any(float(weight) < 0.0 for weight in policy_weights):
         raise ValueError("policy loss weights must be non-negative")
+    family_schedule = _parse_family_schedule(args.scene_family_schedule)
+    if args.parallel_rev_curriculum_episodes < 0:
+        raise ValueError("--parallel-rev-curriculum-episodes must be non-negative")
+    if args.parallel_rev_warmup_distance_min <= 0.0:
+        raise ValueError("--parallel-rev-warmup-distance-min must be positive")
+    if args.parallel_rev_warmup_distance_max < args.parallel_rev_warmup_distance_min:
+        raise ValueError(
+            "--parallel-rev-warmup-distance-max must be >= --parallel-rev-warmup-distance-min"
+        )
+    if args.parallel_rev_warmup_lateral < 0.0:
+        raise ValueError("--parallel-rev-warmup-lateral must be non-negative")
+    if args.parallel_rev_warmup_heading_deg < 0.0:
+        raise ValueError("--parallel-rev-warmup-heading-deg must be non-negative")
+    if args.parallel_rev_warmup_phi_deg < 0.0:
+        raise ValueError("--parallel-rev-warmup-phi-deg must be non-negative")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env_config = replace(
         DEFAULT_ENV_CONFIG,
         curriculum_stage=args.stage,
+        scene_family_schedule=family_schedule,
         use_hybrid_astar=bool(args.use_hybrid_astar),
         rs_potential_enabled=not bool(
             getattr(args, "disable_rs_potential", False)
         ),
+        parallel_rev_curriculum_episodes=args.parallel_rev_curriculum_episodes,
+        parallel_rev_warmup_distance_range=(
+            args.parallel_rev_warmup_distance_min,
+            args.parallel_rev_warmup_distance_max,
+        ),
+        parallel_rev_warmup_lateral_range=args.parallel_rev_warmup_lateral,
+        parallel_rev_warmup_heading_range_deg=args.parallel_rev_warmup_heading_deg,
+        parallel_rev_warmup_phi_range_deg=args.parallel_rev_warmup_phi_deg,
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -548,6 +585,7 @@ def train(args):
             pool_size=env_config.scene_pool_size,
             base_seed=args.seed,
             scene_config=DEFAULT_SCENE_CONFIG,
+            family_schedule=env_config.scene_family_schedule,
         )
         stage_selector = CurriculumStageSelector(
             target_success_rate=float(args.curriculum_target_success),
@@ -669,6 +707,39 @@ def train(args):
             "scene_seed": int(reset_info.get("scene_seed", -1)),
             "goal_orientation_mode": str(reset_info.get("goal_orientation_mode", "")),
             "task_family": task_family,
+            "clearance_bucket": str(reset_info.get("clearance_bucket", "")),
+            "approach_side_bucket": str(reset_info.get("approach_side_bucket", "")),
+            "reverse_required_bucket": str(
+                reset_info.get("reverse_required_bucket", "")
+            ),
+            "difficulty_label": str(reset_info.get("difficulty_label", "")),
+            "nominal_target_collision": bool(
+                reset_info.get("nominal_target_collision", False)
+            ),
+            "nominal_target_clearance_m": float(
+                reset_info.get("nominal_target_clearance_m", 0.0)
+            ),
+            "success_neighborhood_feasible_count": int(
+                reset_info.get("success_neighborhood_feasible_count", 0)
+            ),
+            "initial_distance_min": float(
+                reset_info.get("initial_distance_min", 0.0)
+            ),
+            "initial_distance_max": float(
+                reset_info.get("initial_distance_max", 0.0)
+            ),
+            "initial_lateral_range": float(
+                reset_info.get("initial_lateral_range", 0.0)
+            ),
+            "initial_heading_range_deg": float(
+                reset_info.get("initial_heading_range_deg", 0.0)
+            ),
+            "initial_phi_range_deg": float(
+                reset_info.get("initial_phi_range_deg", 0.0)
+            ),
+            "parallel_rev_curriculum_progress": float(
+                reset_info.get("parallel_rev_curriculum_progress", 1.0)
+            ),
             "fallback_used": bool(reset_info.get("fallback_used", False)),
             "initial_collision": bool(reset_info.get("initial_collision", False)),
             "hybrid_astar_valid_rate": float(
@@ -939,6 +1010,45 @@ def main():
         default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_parallel_rev,
     )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
+    parser.add_argument(
+        "--scene-family-schedule",
+        default=",".join(DEFAULT_ENV_CONFIG.scene_family_schedule),
+        help=(
+            "Comma-separated family schedule for cached scenes; repeat a family "
+            "to oversample it, e.g. head_in,parallel_fwd,parallel_rev,parallel_rev"
+        ),
+    )
+    parser.add_argument(
+        "--parallel-rev-curriculum-episodes",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.parallel_rev_curriculum_episodes,
+        help="Episodes over which stage-1 parallel_rev starts expand to full ranges",
+    )
+    parser.add_argument(
+        "--parallel-rev-warmup-distance-min",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_distance_range[0],
+    )
+    parser.add_argument(
+        "--parallel-rev-warmup-distance-max",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_distance_range[1],
+    )
+    parser.add_argument(
+        "--parallel-rev-warmup-lateral",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_lateral_range,
+    )
+    parser.add_argument(
+        "--parallel-rev-warmup-heading-deg",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_heading_range_deg,
+    )
+    parser.add_argument(
+        "--parallel-rev-warmup-phi-deg",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_phi_range_deg,
+    )
     parser.add_argument("--use-hybrid-astar", action="store_true")
     parser.add_argument(
         "--disable-rs-potential",

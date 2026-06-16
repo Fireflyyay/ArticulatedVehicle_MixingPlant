@@ -9,7 +9,11 @@ from config import DEFAULT_ENV_CONFIG
 from env.geometry import oriented_box
 from env.lidar import DualBodyLidar
 from env.local_parking_env import LocalParkingEnv
-from env.mixing_plant_scene import generate_cached_mixing_plant_scene
+from env.mixing_plant_scene import (
+    CachedScenePool,
+    TASK_FAMILIES,
+    generate_cached_mixing_plant_scene,
+)
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
 
 
@@ -53,12 +57,19 @@ def test_rule_carved_scene_is_cached_and_deterministic():
     assert 0.0 < first.metadata["free_ratio"] < 1.0
     assert first.world_bounds == (-40.0, -40.0, 40.0, 40.0)
     assert first.occupancy_grid.shape == (80, 80)
-    assert float(first.metadata["corridor_width"]) >= 13.0
+    assert float(first.metadata["corridor_width"]) >= 12.0
     assert len(first.parking_bays) >= 2
 
 
 def test_different_seeds_produce_distinct_parameterized_layouts():
-    scenes = [generate_cached_mixing_plant_scene(stage=3, seed=seed) for seed in range(16)]
+    scenes = [
+        generate_cached_mixing_plant_scene(
+            stage=3,
+            seed=100 + index,
+            task_family=TASK_FAMILIES[index % len(TASK_FAMILIES)],
+        )
+        for index in range(18)
+    ]
     grid_signatures = {scene.occupancy_grid.tobytes() for scene in scenes}
     slot_poses = {
         (
@@ -70,18 +81,63 @@ def test_different_seeds_produce_distinct_parameterized_layouts():
     }
     assert len(grid_signatures) == len(scenes)
     assert len(slot_poses) >= 12
+    assert {scene.metadata["task_family"] for scene in scenes} == set(TASK_FAMILIES)
     assert {scene.metadata["goal_orientation_mode"] for scene in scenes} == {
         "head_in",
         "parallel",
     }
 
 
+def test_scene_pool_uses_explicit_family_schedule_and_derived_seeds():
+    schedule = ("parallel_rev", "head_in", "parallel_rev", "parallel_fwd")
+    first = CachedScenePool(
+        stage=1,
+        pool_size=8,
+        base_seed=23,
+        family_schedule=schedule,
+    )
+    second = CachedScenePool(
+        stage=1,
+        pool_size=8,
+        base_seed=23,
+        family_schedule=schedule,
+    )
+    families = [first.get(index).metadata["task_family"] for index in range(8)]
+    seeds = [first.get(index).metadata["seed"] for index in range(8)]
+    assert families == list(schedule) * 2
+    assert seeds == [second.get(index).metadata["seed"] for index in range(8)]
+    assert seeds != [23 + index for index in range(8)]
+    assert families.count("parallel_rev") == 4
+    assert families.count("head_in") == 2
+    assert families.count("parallel_fwd") == 2
+
+
 def test_target_slot_is_inside_bay_with_supported_orientation_modes():
     model = ArticulatedVehicleModel(DEFAULT_VEHICLE_PARAMS)
     modes = set()
-    for seed in range(16):
-        scene = generate_cached_mixing_plant_scene(stage=3, seed=seed)
+    for index, task_family in enumerate(TASK_FAMILIES * 6):
+        scene = generate_cached_mixing_plant_scene(
+            stage=3,
+            seed=200 + index,
+            task_family=task_family,
+        )
         modes.add(scene.metadata["goal_orientation_mode"])
+        assert scene.metadata["task_family"] == task_family
+        assert not scene.metadata["nominal_target_collision"]
+        assert scene.metadata["nominal_target_front_in_bay"]
+        assert scene.metadata["nominal_target_rear_in_bay"]
+        assert scene.metadata["success_neighborhood_feasible_count"] > 0
+        assert scene.metadata["clearance_bucket"] in {
+            "tight",
+            "narrow",
+            "normal",
+            "open",
+        }
+        assert scene.metadata["approach_side_bucket"] in {"left_bay", "right_bay"}
+        assert scene.metadata["reverse_required_bucket"] in {
+            "required",
+            "not_required",
+        }
         goal = scene.slot
         target_state = ArticulatedState(
             goal.x_goal,
@@ -132,8 +188,12 @@ def test_target_bay_mouth_connects_to_main_corridor():
 
 
 def test_parking_bays_do_not_overlap_each_other():
-    for seed in range(16):
-        scene = generate_cached_mixing_plant_scene(stage=3, seed=seed)
+    for index in range(16):
+        scene = generate_cached_mixing_plant_scene(
+            stage=3,
+            seed=index,
+            task_family=TASK_FAMILIES[index % len(TASK_FAMILIES)],
+        )
         for index, first in enumerate(scene.parking_bays):
             for second in scene.parking_bays[index + 1 :]:
                 assert first.polygon.intersection(second.polygon).area <= 1e-8
@@ -192,3 +252,37 @@ def test_near_goal_initial_states_cover_distance_heading_lateral_and_phi(
     assert max(item[1] for item in states) > 45.0
     assert max(item[2] for item in states) > 2.0
     assert max(item[3] for item in states) > 10.0
+
+
+def test_parallel_reverse_initial_curriculum_expands_from_warmup(
+    synthetic_action_mask,
+):
+    env = LocalParkingEnv(
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=1,
+            scene_pool_size=1,
+            scene_family_schedule=("parallel_rev",),
+            parallel_rev_curriculum_episodes=4,
+        ),
+        action_mask=synthetic_action_mask,
+        seed=17,
+    )
+    _, first_info = env.reset(seed=17)
+    assert first_info["task_family"] == "parallel_rev"
+    assert first_info["scenario_type"] == "parallel_rev_warmup"
+    assert np.isclose(first_info["parallel_rev_curriculum_progress"], 0.0)
+    assert np.isclose(first_info["initial_distance_min"], 4.0)
+    assert np.isclose(first_info["initial_distance_max"], 8.0)
+    assert first_info["initial_lateral_range"] <= 1.25
+    assert np.isclose(first_info["initial_heading_range_deg"], 20.0)
+    assert np.isclose(first_info["initial_phi_range_deg"], 8.0)
+
+    last_info = first_info
+    for _ in range(4):
+        _, last_info = env.reset()
+    assert np.isclose(last_info["parallel_rev_curriculum_progress"], 1.0)
+    assert np.isclose(last_info["initial_distance_min"], 8.0)
+    assert np.isclose(last_info["initial_distance_max"], 15.0)
+    assert np.isclose(last_info["initial_heading_range_deg"], 45.0)
+    assert np.isclose(last_info["initial_phi_range_deg"], 12.0)

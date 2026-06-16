@@ -554,10 +554,11 @@ def _path_output_path(base_output, path_index, total_paths):
     return "{}_path{:03d}{}".format(stem, path_index + 1, extension)
 
 
-def _default_output_path(stage, seed, checkpoint_path):
+def _default_output_path(stage, task_family, seed, checkpoint_path):
     checkpoint_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    filename = "local_parking_paths_stage{}_seed{}_{}.png".format(
+    filename = "local_parking_paths_stage{}_{}_seed{}_{}.png".format(
         int(stage),
+        str(task_family),
         int(seed),
         checkpoint_stem,
     )
@@ -569,6 +570,11 @@ def main():
         description="Roll out a PPO checkpoint and render local parking paths."
     )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=3)
+    parser.add_argument(
+        "--task-family",
+        choices=["head_in", "parallel_fwd", "parallel_rev"],
+        default="head_in",
+    )
     parser.add_argument("--checkpoint", required=True, help="Path to a PPO checkpoint .pt file")
     parser.add_argument(
         "--num-paths",
@@ -614,7 +620,12 @@ def main():
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(checkpoint_path)
 
-    output = args.output or _default_output_path(args.stage, args.seed, checkpoint_path)
+    output = args.output or _default_output_path(
+        args.stage,
+        args.task_family,
+        args.seed,
+        checkpoint_path,
+    )
     os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
 
     np.random.seed(int(args.seed))
@@ -636,6 +647,7 @@ def main():
         DEFAULT_ENV_CONFIG,
         curriculum_stage=int(args.stage),
         scene_pool_size=1,
+        scene_family_schedule=(args.task_family,),
         use_hybrid_astar=False,
     )
     env = LocalParkingEnv(config=env_config, seed=int(args.seed))
