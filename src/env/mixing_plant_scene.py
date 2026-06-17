@@ -659,42 +659,84 @@ class CachedScenePool:
         validate_scene_audit=True,
     ):
         self.stage = int(stage)
-        self.pool_size = max(1, int(pool_size))
+        requested_pool_size = max(1, int(pool_size))
         self.base_seed = int(base_seed)
         self.scene_config = DEFAULT_SCENE_CONFIG if scene_config is None else scene_config
         self.family_schedule = normalize_family_schedule(family_schedule)
+        if len(self.family_schedule) > 1:
+            remainder = requested_pool_size % len(self.family_schedule)
+            if remainder:
+                requested_pool_size += len(self.family_schedule) - remainder
+        self.pool_size = requested_pool_size
         self.validate_scene_audit = bool(validate_scene_audit)
         self._scenes = []
+        self._next_replacement_index = self.pool_size
         for index in range(self.pool_size):
-            task_family = self.family_schedule[index % len(self.family_schedule)]
-            scene_seed = derive_scene_seed(
-                base_seed=self.base_seed,
-                pool_index=index,
-                task_family=task_family,
-                stage=self.stage,
-            )
-            scene = generate_cached_mixing_plant_scene(
-                stage=self.stage,
-                seed=scene_seed,
-                scene_config=self.scene_config,
-                task_family=task_family,
-            )
-            if self.validate_scene_audit:
-                if bool(scene.metadata.get("nominal_target_collision", True)):
-                    raise RuntimeError(
-                        "scene audit failed: target collision for seed {} family {}".format(
-                            scene_seed,
-                            task_family,
-                        )
+            self._scenes.append(self._generate_scene(index))
+
+    def __len__(self):
+        return len(self._scenes)
+
+    def _generate_scene(self, pool_index, task_family=None):
+        pool_index = int(pool_index)
+        if task_family is None:
+            task_family = self.family_schedule[pool_index % len(self.family_schedule)]
+        task_family = normalize_task_family(task_family)
+        scene_seed = derive_scene_seed(
+            base_seed=self.base_seed,
+            pool_index=pool_index,
+            task_family=task_family,
+            stage=self.stage,
+        )
+        scene = generate_cached_mixing_plant_scene(
+            stage=self.stage,
+            seed=scene_seed,
+            scene_config=self.scene_config,
+            task_family=task_family,
+        )
+        if self.validate_scene_audit:
+            if bool(scene.metadata.get("nominal_target_collision", True)):
+                raise RuntimeError(
+                    "scene audit failed: target collision for seed {} family {}".format(
+                        scene_seed,
+                        task_family,
                     )
-                if int(scene.metadata.get("success_neighborhood_feasible_count", 0)) <= 0:
-                    raise RuntimeError(
-                        "scene audit failed: empty success neighborhood for seed {} family {}".format(
-                            scene_seed,
-                            task_family,
-                        )
+                )
+            if int(scene.metadata.get("success_neighborhood_feasible_count", 0)) <= 0:
+                raise RuntimeError(
+                    "scene audit failed: empty success neighborhood for seed {} family {}".format(
+                        scene_seed,
+                        task_family,
                     )
-            self._scenes.append(scene)
+                )
+        return scene
 
     def get(self, episode_index):
         return self._scenes[int(episode_index) % len(self._scenes)]
+
+    def replace(self, episode_index, task_family=None, max_attempts=16):
+        scene_slot = int(episode_index) % len(self._scenes)
+        if task_family is None:
+            task_family = self._scenes[scene_slot].metadata.get("task_family")
+        last_error = None
+        for _ in range(max(1, int(max_attempts))):
+            replacement_index = self._next_replacement_index
+            self._next_replacement_index += 1
+            try:
+                scene = self._generate_scene(
+                    replacement_index,
+                    task_family=task_family,
+                )
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            self._scenes[scene_slot] = scene
+            return scene
+        raise RuntimeError(
+            "failed to replace scene slot {} family {} after {} attempts: {}".format(
+                scene_slot,
+                task_family,
+                max(1, int(max_attempts)),
+                last_error,
+            )
+        )

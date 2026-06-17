@@ -36,6 +36,7 @@ except Exception:
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TASK_FAMILIES = SCENE_TASK_FAMILIES
+MIN_EVAL_EPISODES_PER_FAMILY = 20
 
 
 def _safe_mean(values):
@@ -71,6 +72,26 @@ def _success_by_family(completed):
         result[family] = _safe_mean(selected)
         result["{}_count".format(family)] = len(selected)
     return result
+
+
+def _eval_family_value(evaluation, eval_mode, policy_mode, family):
+    mode_block = evaluation.get(eval_mode, {})
+    if isinstance(mode_block, dict):
+        policy_block = mode_block.get(policy_mode, {})
+        if isinstance(policy_block, dict) and family in policy_block:
+            return float(policy_block[family])
+    policy_block = evaluation.get(policy_mode, {})
+    if isinstance(policy_block, dict) and family in policy_block:
+        return float(policy_block[family])
+    return 0.0
+
+
+def _eval_mode_success_mean(evaluation, eval_mode, policy_mode="deterministic"):
+    values = [
+        _eval_family_value(evaluation, eval_mode, policy_mode, family)
+        for family in TASK_FAMILIES
+    ]
+    return _safe_mean(values)
 
 
 def _write_jsonl(path, record):
@@ -181,6 +202,14 @@ def _build_update_record(
     raw_actions = np.asarray(buffer.raw_actions)
     executed_actions = np.asarray(buffer.executed_actions)
     family_success = _success_by_family(completed)
+    no_guide_success = _eval_mode_success_mean(latest_evaluation, "no_guide")
+    guided_success = _eval_mode_success_mean(latest_evaluation, "guided")
+    parallel_rev_no_guide = _eval_family_value(
+        latest_evaluation,
+        "no_guide",
+        "deterministic",
+        "parallel_rev",
+    )
     return {
         "global_step": global_step,
         "episode": episode_index,
@@ -243,6 +272,10 @@ def _build_update_record(
             min(item["min_lidar_distance"] for item in infos)
         ),
         "success_rate": _safe_mean([float(item["success"]) for item in completed]),
+        "guided_success_rate": guided_success,
+        "no_guide_success_rate": no_guide_success,
+        "success_gap_guided_minus_noguide": guided_success - no_guide_success,
+        "parallel_rev_no_guide_success": parallel_rev_no_guide,
         "collision_rate": _safe_mean(
             [float(item["collision"]) for item in completed]
         ),
@@ -337,6 +370,80 @@ def _build_update_record(
             abs(update_stats.get("aux_mask_loss", 0.0))
             / max(abs(update_stats.get("policy_loss", 0.0)), 1e-8)
         ),
+        "hope_teacher_enabled": _safe_mean(
+            [float(item.get("hope_teacher_enabled", False)) for item in completed]
+        ),
+        "hope_teacher_available": _safe_mean(
+            [float(item.get("hope_teacher_available", False)) for item in completed]
+        ),
+        "hope_plan_success": _safe_mean(
+            [float(item.get("hope_plan_success", False)) for item in completed]
+        ),
+        "hope_cache_hit_rate": _safe_mean(
+            [float(item.get("hope_cache_hit", False)) for item in completed]
+        ),
+        "hope_path_length": _safe_mean(
+            [float(item.get("hope_path_length", 0.0)) for item in completed]
+        ),
+        "hope_path_valid_after_articulated_check": _safe_mean(
+            [
+                float(item.get("hope_path_valid_after_articulated_check", False))
+                for item in completed
+            ]
+        ),
+        "hope_plan_fail_reasons": dict(
+            (reason, sum(
+                1
+                for item in completed
+                if str(item.get("hope_plan_fail_reason", "")) == reason
+            ))
+            for reason in sorted(
+                set(str(item.get("hope_plan_fail_reason", "")) for item in completed)
+            )
+            if reason
+        ),
+        "guide_weight_current": _safe_mean(
+            [float(item.get("guide_weight_current", 0.0)) for item in completed]
+        ),
+        "guide_dropout_rate": _safe_mean(
+            [float(item.get("guide_dropout_rate", 0.0)) for item in completed]
+        ),
+        "guide_reward_mean": _safe_mean(
+            [float(item.get("guide_reward", 0.0)) for item in infos]
+        ),
+        "guide_progress_reward_mean": _safe_mean(
+            [float(item.get("guide_progress_reward", 0.0)) for item in infos]
+        ),
+        "guide_lateral_error_mean": _safe_mean(
+            [float(item.get("guide_lateral_error", 0.0)) for item in infos]
+        ),
+        "guide_heading_error_mean": _safe_mean(
+            [float(item.get("guide_heading_error", 0.0)) for item in infos]
+        ),
+        "guide_anchor_error_mean": _safe_mean(
+            [float(item.get("guide_anchor_error", 0.0)) for item in infos]
+        ),
+        "guide_gear_agreement_rate": _safe_mean(
+            [float(item.get("guide_gear_agreement", 0.0)) for item in infos]
+        ),
+        "large_heading_error_rate": _safe_mean(
+            [
+                float(float(item.get("heading_error_deg", 0.0)) >= 45.0)
+                for item in completed
+            ]
+        ),
+        "large_articulation_error_rate": _safe_mean(
+            [
+                float(abs(float(item.get("phi", 0.0))) >= np.deg2rad(20.0))
+                for item in completed
+            ]
+        ),
+        "reverse_entry_episode_rate": _safe_mean(
+            [
+                float(str(item.get("task_family", "")) == "parallel_rev")
+                for item in completed
+            ]
+        ),
     }
 
 
@@ -394,20 +501,23 @@ def _evaluate_policy_by_family(
     stage,
     seed,
     episodes_per_family,
+    eval_modes=("no_guide",),
 ):
     episodes_per_family = int(episodes_per_family)
-    if episodes_per_family <= 0:
-        raise ValueError("episodes_per_family must be positive")
-    eval_config = replace(
-        env_config,
-        curriculum_stage=int(stage),
-        use_hybrid_astar=False,
-        rs_potential_enabled=False,
-        scene_family_schedule=TASK_FAMILIES,
-        parallel_rev_curriculum_episodes=0,
-    )
-    base_seed = ((int(seed) + 100_000) // 16) * 16
-    results = {}
+    if episodes_per_family < MIN_EVAL_EPISODES_PER_FAMILY:
+        raise ValueError(
+            "episodes_per_family must be at least {}".format(
+                MIN_EVAL_EPISODES_PER_FAMILY
+            )
+        )
+    eval_modes = tuple(eval_modes or ("no_guide",))
+    eval_pool_size = max(1, int(env_config.scene_pool_size))
+    schedule_size = max(1, len(tuple(env_config.scene_family_schedule)))
+    if schedule_size > 1:
+        remainder = eval_pool_size % schedule_size
+        if remainder:
+            eval_pool_size += schedule_size - remainder
+    base_seed = ((int(seed) + 100_000) // eval_pool_size) * eval_pool_size
     cuda_devices = []
     if agent.device.type == "cuda":
         cuda_devices = [
@@ -416,10 +526,25 @@ def _evaluate_policy_by_family(
             else torch.cuda.current_device()
         ]
 
-    with torch.random.fork_rng(devices=cuda_devices):
-        torch.manual_seed(base_seed + 7)
-        if agent.device.type == "cuda":
-            torch.cuda.manual_seed_all(base_seed + 7)
+    def make_eval_config(eval_mode):
+        enable_teacher = eval_mode == "guided" and bool(env_config.enable_hope_teacher)
+        use_teacher_reward = enable_teacher and bool(env_config.use_teacher_reward)
+        return replace(
+            env_config,
+            curriculum_stage=int(stage),
+            use_hybrid_astar=False,
+            rs_potential_enabled=False,
+            scene_family_schedule=TASK_FAMILIES,
+            parallel_rev_curriculum_episodes=0,
+            enable_hope_teacher=enable_teacher,
+            use_teacher_reward=use_teacher_reward,
+            enable_offpath_reset=False,
+            enable_failure_aggregation=False,
+        )
+
+    def run_mode(eval_mode):
+        eval_config = make_eval_config(eval_mode)
+        mode_results = {}
         for deterministic in (True, False):
             env = LocalParkingEnv(
                 config=eval_config,
@@ -444,16 +569,41 @@ def _evaluate_policy_by_family(
                     done = terminated or truncated
                 successes[family].append(float(final_info["success"]))
             mode = "deterministic" if deterministic else "stochastic"
-            results[mode] = dict(
+            mode_results[mode] = dict(
                 (family, _safe_mean(successes[family]))
                 for family in TASK_FAMILIES
             )
+        return mode_results
+
+    grouped_results = {}
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(base_seed + 7)
+        if agent.device.type == "cuda":
+            torch.cuda.manual_seed_all(base_seed + 7)
+        for eval_mode in eval_modes:
+            grouped_results[eval_mode] = run_mode(eval_mode)
+
+    primary_mode = "no_guide" if "no_guide" in grouped_results else eval_modes[0]
+    results = dict(grouped_results[primary_mode])
+    results.update(grouped_results)
     results["weighted_score"] = _weighted_checkpoint_score(
         results["deterministic"],
         agent.config,
     )
+    results["guided_success_rate"] = _eval_mode_success_mean(results, "guided")
+    results["no_guide_success_rate"] = _eval_mode_success_mean(results, "no_guide")
+    results["success_gap_guided_minus_noguide"] = (
+        results["guided_success_rate"] - results["no_guide_success_rate"]
+    )
+    results["parallel_rev_no_guide_success"] = _eval_family_value(
+        results,
+        "no_guide",
+        "deterministic",
+        "parallel_rev",
+    )
     results["stage"] = int(stage)
     results["episodes_per_family"] = episodes_per_family
+    results["eval_modes"] = list(eval_modes)
     return results
 
 
@@ -495,8 +645,12 @@ def train(args):
         raise ValueError("--checkpoint-interval must be positive")
     if args.eval_interval <= 0:
         raise ValueError("--eval-interval must be positive")
-    if args.eval_episodes_per_family <= 0:
-        raise ValueError("--eval-episodes-per-family must be positive")
+    if args.eval_episodes_per_family < MIN_EVAL_EPISODES_PER_FAMILY:
+        raise ValueError(
+            "--eval-episodes-per-family must be at least {}".format(
+                MIN_EVAL_EPISODES_PER_FAMILY
+            )
+        )
     if args.ppo_epochs <= 0:
         raise ValueError("--ppo-epochs must be positive")
     if not 0.0 < args.clip_range < 1.0:
@@ -527,6 +681,18 @@ def train(args):
         raise ValueError("--parallel-rev-warmup-heading-deg must be non-negative")
     if args.parallel_rev_warmup_phi_deg < 0.0:
         raise ValueError("--parallel-rev-warmup-phi-deg must be non-negative")
+    if args.guide_anneal_end_episode < args.guide_anneal_start_episode:
+        raise ValueError("--guide-anneal-end-episode must be >= start episode")
+    if not 0.0 <= args.guide_dropout_initial <= 1.0:
+        raise ValueError("--guide-dropout-initial must be inside [0, 1]")
+    if not 0.0 <= args.guide_dropout_final <= 1.0:
+        raise ValueError("--guide-dropout-final must be inside [0, 1]")
+    if args.teacher_corridor_width <= 0.0:
+        raise ValueError("--teacher-corridor-width must be positive")
+    if args.teacher_reward_clip <= 0.0:
+        raise ValueError("--teacher-reward-clip must be positive")
+    if args.no_guide_eval_interval < 0:
+        raise ValueError("--no-guide-eval-interval must be non-negative")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env_config = replace(
@@ -545,6 +711,26 @@ def train(args):
         parallel_rev_warmup_lateral_range=args.parallel_rev_warmup_lateral,
         parallel_rev_warmup_heading_range_deg=args.parallel_rev_warmup_heading_deg,
         parallel_rev_warmup_phi_range_deg=args.parallel_rev_warmup_phi_deg,
+        enable_hope_teacher=bool(args.enable_hope_teacher),
+        hope_code_dir=args.hope_code_dir,
+        hope_weight_path=args.hope_weight_path,
+        hope_cache_dir=args.hope_cache_dir,
+        use_teacher_reward=bool(args.use_teacher_reward),
+        guide_weight_initial=args.guide_weight_initial,
+        guide_weight_final=args.guide_weight_final,
+        guide_anneal_start_episode=args.guide_anneal_start_episode,
+        guide_anneal_end_episode=args.guide_anneal_end_episode,
+        guide_dropout_initial=args.guide_dropout_initial,
+        guide_dropout_final=args.guide_dropout_final,
+        teacher_corridor_width=args.teacher_corridor_width,
+        teacher_anchor_weight=args.teacher_anchor_weight,
+        teacher_heading_weight=args.teacher_heading_weight,
+        teacher_progress_weight=args.teacher_progress_weight,
+        teacher_gear_weight=args.teacher_gear_weight,
+        teacher_reward_clip=args.teacher_reward_clip,
+        enable_offpath_reset=bool(args.enable_offpath_reset),
+        enable_failure_aggregation=bool(args.enable_failure_aggregation),
+        no_guide_eval_interval=args.no_guide_eval_interval,
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -740,6 +926,39 @@ def train(args):
             "parallel_rev_curriculum_progress": float(
                 reset_info.get("parallel_rev_curriculum_progress", 1.0)
             ),
+            "parallel_rev_curriculum_sample_count": int(
+                reset_info.get("parallel_rev_curriculum_sample_count", 0)
+            ),
+            "parallel_rev_curriculum_sample_count_after": int(
+                reset_info.get("parallel_rev_curriculum_sample_count_after", 0)
+            ),
+            "reset_initial_mask_max": float(
+                reset_info.get("reset_initial_mask_max", 0.0)
+            ),
+            "reset_initial_mask_required": float(
+                reset_info.get("reset_initial_mask_required", 0.0)
+            ),
+            "reset_initial_body_clearance_m": float(
+                reset_info.get("reset_initial_body_clearance_m", 0.0)
+            ),
+            "reset_candidate_reject_mask_count": int(
+                reset_info.get("reset_candidate_reject_mask_count", 0)
+            ),
+            "reset_candidate_reject_collision_count": int(
+                reset_info.get("reset_candidate_reject_collision_count", 0)
+            ),
+            "reset_scene_retry_count": int(
+                reset_info.get("reset_scene_retry_count", 0)
+            ),
+            "reset_scene_last_failed_seed": int(
+                reset_info.get("reset_scene_last_failed_seed", -1)
+            ),
+            "reset_scene_success_seed": int(
+                reset_info.get(
+                    "reset_scene_success_seed",
+                    reset_info.get("scene_seed", -1),
+                )
+            ),
             "fallback_used": bool(reset_info.get("fallback_used", False)),
             "initial_collision": bool(reset_info.get("initial_collision", False)),
             "hybrid_astar_valid_rate": float(
@@ -769,6 +988,52 @@ def train(args):
             ),
             "rs_heading_error": float(final_info.get("rs_heading_error", 0.0)),
             "rs_fail_reason": str(final_info.get("rs_fail_reason", "")),
+            "hope_teacher_enabled": bool(
+                final_info.get("hope_teacher_enabled", False)
+            ),
+            "hope_teacher_available": bool(
+                final_info.get("hope_teacher_available", False)
+            ),
+            "hope_plan_success": bool(final_info.get("hope_plan_success", False)),
+            "hope_plan_fail_reason": str(
+                final_info.get("hope_plan_fail_reason", "")
+            ),
+            "hope_cache_hit": bool(final_info.get("hope_cache_hit", False)),
+            "hope_path_length": float(final_info.get("hope_path_length", 0.0)),
+            "hope_path_valid_after_articulated_check": bool(
+                final_info.get("hope_path_valid_after_articulated_check", False)
+            ),
+            "hope_collision_margin": float(
+                final_info.get("hope_collision_margin", 0.0)
+            ),
+            "hope_terminal_heading_error": float(
+                final_info.get("hope_terminal_heading_error", 0.0)
+            ),
+            "hope_reward_mode": str(final_info.get("hope_reward_mode", "")),
+            "guide_weight_current": float(
+                final_info.get("guide_weight_current", 0.0)
+            ),
+            "guide_dropout_rate": float(final_info.get("guide_dropout_rate", 0.0)),
+            "guide_dropped": bool(final_info.get("guide_dropped", True)),
+            "guide_reward": float(final_info.get("guide_reward", 0.0)),
+            "guide_progress_reward": float(
+                final_info.get("guide_progress_reward", 0.0)
+            ),
+            "guide_lateral_error": float(final_info.get("guide_lateral_error", 0.0)),
+            "guide_heading_error": float(final_info.get("guide_heading_error", 0.0)),
+            "guide_anchor_error": float(final_info.get("guide_anchor_error", 0.0)),
+            "guide_gear_agreement": float(
+                final_info.get("guide_gear_agreement", 0.0)
+            ),
+            "hope_failure_aggregation_recorded": bool(
+                final_info.get("hope_failure_aggregation_recorded", False)
+            ),
+            "large_heading_error": bool(
+                float(final_info.get("heading_error_deg", 0.0)) >= 45.0
+            ),
+            "large_articulation_error": bool(
+                abs(float(final_info.get("phi", 0.0))) >= np.deg2rad(20.0)
+            ),
             "mask_cost": float(final_info.get("mask_cost", 0.0)),
             "forced_stop": int(final_info.get("forced_stop", False)),
             "raw_safe_ratio_final": float(final_info.get("raw_safe_ratio", 0.0)),
@@ -806,6 +1071,11 @@ def train(args):
             episode_index % args.eval_interval == 0
             or episode_index == args.total_episodes
         )
+        if (
+            env_config.no_guide_eval_interval > 0
+            and episode_index % env_config.no_guide_eval_interval == 0
+        ):
+            evaluation_due = True
         should_update = (
             len(buffer) >= ppo_config.rollout_steps
             or episode_index == args.total_episodes
@@ -816,12 +1086,16 @@ def train(args):
             update_index += 1
 
         if evaluation_due:
+            eval_modes = ("no_guide",)
+            if bool(env_config.enable_hope_teacher):
+                eval_modes = ("guided", "no_guide")
             latest_evaluation = _evaluate_policy_by_family(
                 agent=agent,
                 env_config=env_config,
                 stage=args.stage,
                 seed=args.seed,
                 episodes_per_family=args.eval_episodes_per_family,
+                eval_modes=eval_modes,
             )
             evaluation_record = {
                 "episode": episode_index,
@@ -901,7 +1175,11 @@ def train(args):
                 },
             )
         if curriculum:
-            stage_selector.record(actual_stage, bool(final_info["success"]))
+            stage_selector.record(
+                actual_stage,
+                bool(final_info["success"]),
+                task_family=task_family,
+            )
             actual_stage = stage_selector.select_stage(episode_index)
             env.set_active_stage(actual_stage)
 
@@ -1055,6 +1333,107 @@ def main():
         action="store_true",
         help="Disable near-goal Reeds-Shepp potential shaping",
     )
+    parser.add_argument(
+        "--enable-hope-teacher",
+        action="store_true",
+        help="Enable training-only HOPE teacher planning and diagnostics",
+    )
+    parser.add_argument(
+        "--hope-code-dir",
+        default=DEFAULT_ENV_CONFIG.hope_code_dir,
+        help="Path to the HOPE repository directory",
+    )
+    parser.add_argument(
+        "--hope-weight-path",
+        default=DEFAULT_ENV_CONFIG.hope_weight_path,
+        help="Path to the HOPE checkpoint used to verify teacher availability",
+    )
+    parser.add_argument(
+        "--hope-cache-dir",
+        default=DEFAULT_ENV_CONFIG.hope_cache_dir,
+        help="Directory for per-episode HOPE teacher cache records",
+    )
+    parser.add_argument(
+        "--use-teacher-reward",
+        action="store_true",
+        help="Add annealed HOPE guidance reward during training",
+    )
+    parser.add_argument(
+        "--guide-weight-initial",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.guide_weight_initial,
+    )
+    parser.add_argument(
+        "--guide-weight-final",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.guide_weight_final,
+    )
+    parser.add_argument(
+        "--guide-anneal-start-episode",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.guide_anneal_start_episode,
+    )
+    parser.add_argument(
+        "--guide-anneal-end-episode",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.guide_anneal_end_episode,
+    )
+    parser.add_argument(
+        "--guide-dropout-initial",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.guide_dropout_initial,
+    )
+    parser.add_argument(
+        "--guide-dropout-final",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.guide_dropout_final,
+    )
+    parser.add_argument(
+        "--teacher-corridor-width",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.teacher_corridor_width,
+    )
+    parser.add_argument(
+        "--teacher-anchor-weight",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.teacher_anchor_weight,
+    )
+    parser.add_argument(
+        "--teacher-heading-weight",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.teacher_heading_weight,
+    )
+    parser.add_argument(
+        "--teacher-progress-weight",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.teacher_progress_weight,
+    )
+    parser.add_argument(
+        "--teacher-gear-weight",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.teacher_gear_weight,
+    )
+    parser.add_argument(
+        "--teacher-reward-clip",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.teacher_reward_clip,
+    )
+    parser.add_argument(
+        "--enable-offpath-reset",
+        action="store_true",
+        help="Sample some resets from perturbed states near the HOPE corridor",
+    )
+    parser.add_argument(
+        "--enable-failure-aggregation",
+        action="store_true",
+        help="Record failed rollout states for later teacher/failure curriculum use",
+    )
+    parser.add_argument(
+        "--no-guide-eval-interval",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.no_guide_eval_interval,
+        help="Optional extra no-guide evaluation interval; 0 disables the extra trigger",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=100)
@@ -1067,8 +1446,8 @@ def main():
     parser.add_argument(
         "--eval-episodes-per-family",
         type=int,
-        default=4,
-        help="Evaluation episodes for each task family and policy mode",
+        default=MIN_EVAL_EPISODES_PER_FAMILY,
+        help="Evaluation episodes for each task family and policy mode; minimum 20",
     )
     parser.add_argument(
         "--output-dir",

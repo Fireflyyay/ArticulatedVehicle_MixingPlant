@@ -40,7 +40,7 @@ class ZL50GNVehicleParams:
     parking_v_reverse_max: float = 1.2
     phi_max: float = math.radians(35.0)
     phi_dot_max: float = 0.5
-    dt: float = 0.2
+    dt: float = 0.5
     integration_substeps: int = 8
 
     lidar_beams: int = 54
@@ -82,10 +82,10 @@ class MixingPlantSceneConfig:
     main_corridor_length: float = 72.0
     branch_corridor_length: float = 56.0
     corridor_width_by_stage: Tuple[float, float, float, float] = (
-        16.0,
         14.0,
         12.0,
-        12.0,
+        9.0,
+        11.0,
     )
     branch_width_ratio: float = 0.85
     head_in_bay_width: float = 8.0
@@ -113,7 +113,7 @@ class LocalParkingEnvConfig:
     success_overlap: float = 0.80
     success_heading_error: float = math.radians(15.0)
     curriculum_stage: int = 1
-    scene_pool_size: int = 16
+    scene_pool_size: int = 18
     scene_family_schedule: Tuple[str, ...] = (
         "head_in",
         "parallel_fwd",
@@ -121,6 +121,10 @@ class LocalParkingEnvConfig:
     )
     use_hybrid_astar: bool = False
     initial_sampling_attempts: int = 128
+    reset_scene_retry_count: int = 18
+    reset_min_mask_safe_ratio: float = 1e-3
+    stage4_reset_min_mask_safe_ratio: float = 0.125
+    stage4_reset_min_body_clearance: float = 0.02
     stage_distance_ranges: Tuple[Tuple[float, float], ...] = (
         (8.0, 15.0),
         (10.0, 18.0),
@@ -192,6 +196,28 @@ class LocalParkingEnvConfig:
     mask_cost_max: float = 3.0
     mask_cost_coef_final: float = 0.8
 
+    # --- Training-only HOPE teacher guidance ---
+    enable_hope_teacher: bool = False
+    hope_code_dir: str = "../HOPE"
+    hope_weight_path: str = "../HOPE/src/model/ckpt/HOPE_PPO.pt"
+    hope_cache_dir: str = "runs/hope_teacher_cache"
+    use_teacher_reward: bool = False
+    guide_weight_initial: float = 0.5
+    guide_weight_final: float = 0.0
+    guide_anneal_start_episode: int = 0
+    guide_anneal_end_episode: int = 10_000
+    guide_dropout_initial: float = 0.0
+    guide_dropout_final: float = 0.8
+    teacher_corridor_width: float = 2.5
+    teacher_anchor_weight: float = 0.4
+    teacher_heading_weight: float = 0.2
+    teacher_progress_weight: float = 1.0
+    teacher_gear_weight: float = 0.15
+    teacher_reward_clip: float = 1.0
+    enable_offpath_reset: bool = False
+    enable_failure_aggregation: bool = False
+    no_guide_eval_interval: int = 0
+
 
 @dataclass(frozen=True)
 class PPOConfig:
@@ -203,9 +229,9 @@ class PPOConfig:
     entropy_coef: float = 0.0
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    rollout_steps: int = 2048
-    ppo_epochs: int = 8
-    batch_size: int = 128
+    rollout_steps: int = 4096
+    ppo_epochs: int = 6
+    batch_size: int = 256
     target_kl: float = 0.03
     kl_early_stop_multiplier: float = 1.5
     log_std_init: float = -0.7
@@ -213,7 +239,7 @@ class PPOConfig:
     log_std_max: float = -0.3
     policy_loss_weight_head_in: float = 1.0
     policy_loss_weight_parallel_fwd: float = 1.0
-    policy_loss_weight_parallel_rev: float = 0.2
+    policy_loss_weight_parallel_rev: float = 0.8
     checkpoint_score_weight_head_in: float = 1.0
     checkpoint_score_weight_parallel_fwd: float = 2.0
     checkpoint_score_weight_parallel_rev: float = 4.0

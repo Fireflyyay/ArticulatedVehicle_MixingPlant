@@ -18,6 +18,7 @@ from env.mixing_plant_scene import CachedScenePool, TASK_FAMILIES
 from env.reward import LocalParkingReward
 from env.rs_potential import RSPotentialOracle, RSPotentialPlanner
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
+from teachers.hope_adapter import HopeTeacherAdapter
 
 
 class BoxSpace:
@@ -30,6 +31,10 @@ class BoxSpace:
     def sample(self, rng=None):
         generator = np.random.default_rng() if rng is None else rng
         return generator.uniform(self.low, self.high, size=self.shape).astype(self.dtype)
+
+
+class ResetInitialStateError(RuntimeError):
+    pass
 
 
 class LocalParkingEnv:
@@ -53,6 +58,7 @@ class LocalParkingEnv:
         action_mask_path=None,
         hybrid_planner=None,
         rs_planner=None,
+        hope_teacher=None,
         scene_config=DEFAULT_SCENE_CONFIG,
         seed=0,
         multi_stage_pool=None,
@@ -131,6 +137,13 @@ class LocalParkingEnv:
             heading_weight=config.planner_goal_heading_weight,
             lateral_clip=config.planner_lateral_clip,
         )
+        self.hope_teacher = hope_teacher
+        if self.hope_teacher is None and bool(config.enable_hope_teacher):
+            self.hope_teacher = HopeTeacherAdapter(
+                config=config,
+                vehicle_params=vehicle_params,
+                rng=self.rng,
+            )
         self.reward_model = LocalParkingReward(config)
         self.observation_space = BoxSpace(-np.inf, np.inf, (self.OBS_DIM,))
         self.action_space = BoxSpace(-1.0, 1.0, (2,))
@@ -146,6 +159,13 @@ class LocalParkingEnv:
         self.prev_gear_in_obs = 0.0
         self.scenario_type = ""
         self.initial_sampling_diagnostics = {}
+        self.hope_teacher_trajectory = None
+        self.hope_teacher_info = HopeTeacherAdapter.disabled_diagnostics()
+        self.guide_step_info = self._zero_guide_step_info()
+        self.guide_weight_current = 0.0
+        self.guide_dropout_rate = 1.0
+        self.guide_dropped = True
+        self._parallel_rev_stage1_sample_count = 0
 
     def set_active_stage(self, stage):
         stage = int(np.clip(stage, 1, 4))
@@ -161,25 +181,127 @@ class LocalParkingEnv:
             or self.scene.prepared_obstacles.intersects(rear_box)
         )
 
-    def _valid_recovery_state(self, state):
-        if self._state_collides(state):
-            return False
+    def _body_clearance(self, state):
         front_box, rear_box = self.vehicle_model.body_boxes(state)
-        clearance = min(
-            front_box.distance(self.scene.obstacle_union),
-            rear_box.distance(self.scene.obstacle_union),
+        return float(
+            min(
+                front_box.distance(self.scene.obstacle_union),
+                rear_box.distance(self.scene.obstacle_union),
+            )
         )
-        if clearance > float(self.config.recovery_max_body_clearance):
-            return False
+
+    def _reset_mask_threshold(self, stage):
+        action_min = float(getattr(self.action_mask, "min_safe_ratio", 1e-3))
+        threshold = max(
+            action_min,
+            float(getattr(self.config, "reset_min_mask_safe_ratio", action_min)),
+        )
+        if int(stage) == 4:
+            threshold = max(
+                threshold,
+                float(
+                    getattr(
+                        self.config,
+                        "stage4_reset_min_mask_safe_ratio",
+                        threshold,
+                    )
+                ),
+            )
+        return float(threshold)
+
+    def _reset_candidate_metrics(self, state, stage):
         front_lidar, rear_lidar = self.lidar.observe(
             state,
             self.vehicle_model,
             self.scene,
             normalize=False,
         )
-        return min(float(np.min(front_lidar)), float(np.min(rear_lidar))) <= float(
-            self.config.recovery_max_lidar_distance
+        mask = self.action_mask.compute_mask(
+            state.phi,
+            front_lidar,
+            rear_lidar,
         )
+        return {
+            "body_clearance": self._body_clearance(state),
+            "min_lidar": float(min(np.min(front_lidar), np.min(rear_lidar))),
+            "mask_max": float(np.max(mask)),
+            "mask_required": self._reset_mask_threshold(stage),
+        }
+
+    def _reset_candidate_viability(self, state, stage):
+        if self._state_collides(state):
+            return False, "collision", {}
+
+        metrics = self._reset_candidate_metrics(state, stage)
+        if float(metrics["mask_max"]) <= float(metrics["mask_required"]):
+            return False, "mask", metrics
+
+        if int(stage) == 4:
+            min_clearance = float(
+                getattr(self.config, "stage4_reset_min_body_clearance", 0.0)
+            )
+            metrics["stage4_min_body_clearance"] = min_clearance
+            if min_clearance > 0.0 and float(metrics["body_clearance"]) < min_clearance:
+                return False, "clearance", metrics
+            if float(metrics["body_clearance"]) > float(
+                self.config.recovery_max_body_clearance
+            ):
+                return False, "recovery_clearance", metrics
+            if float(metrics["min_lidar"]) > float(self.config.recovery_max_lidar_distance):
+                return False, "recovery_lidar", metrics
+
+        return True, "", metrics
+
+    def _finalize_reset_candidate(
+        self,
+        state,
+        scenario,
+        fallback_used,
+        stage,
+        task_family,
+        metrics,
+        reject_counts,
+    ):
+        self.initial_sampling_diagnostics.update(
+            {
+                "reset_candidate_reject_collision_count": int(
+                    reject_counts.get("collision", 0)
+                ),
+                "reset_candidate_reject_mask_count": int(
+                    reject_counts.get("mask", 0)
+                ),
+                "reset_candidate_reject_clearance_count": int(
+                    reject_counts.get("clearance", 0)
+                ),
+                "reset_candidate_reject_recovery_clearance_count": int(
+                    reject_counts.get("recovery_clearance", 0)
+                ),
+                "reset_candidate_reject_recovery_lidar_count": int(
+                    reject_counts.get("recovery_lidar", 0)
+                ),
+                "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
+                "reset_initial_mask_required": float(
+                    metrics.get("mask_required", self._reset_mask_threshold(stage))
+                ),
+                "reset_initial_body_clearance_m": float(
+                    metrics.get("body_clearance", 0.0)
+                ),
+                "reset_initial_min_lidar_m": float(metrics.get("min_lidar", 0.0)),
+                "parallel_rev_curriculum_sample_count": int(
+                    self._parallel_rev_stage1_sample_count
+                ),
+            }
+        )
+        if int(stage) == 1 and task_family == "parallel_rev":
+            self._parallel_rev_stage1_sample_count += 1
+        self.initial_sampling_diagnostics[
+            "parallel_rev_curriculum_sample_count_after"
+        ] = int(self._parallel_rev_stage1_sample_count)
+        return state, scenario, fallback_used
+
+    def _valid_recovery_state(self, state):
+        valid, _, _ = self._reset_candidate_viability(state, stage=4)
+        return bool(valid)
 
     def _task_family_from_scene(self):
         task_family = str(self.scene.metadata.get("task_family", ""))
@@ -198,6 +320,133 @@ class LocalParkingEnv:
     @staticmethod
     def _lerp(value_a, value_b, t):
         return float(value_a) + (float(value_b) - float(value_a)) * float(t)
+
+    @staticmethod
+    def _zero_guide_step_info():
+        return {
+            "guide_reward": 0.0,
+            "guide_progress_reward": 0.0,
+            "guide_lateral_error": 0.0,
+            "guide_heading_error": 0.0,
+            "guide_anchor_error": 0.0,
+            "guide_gear_agreement": 0.0,
+            "guide_corridor_penalty": 0.0,
+            "guide_tangent_reward": 0.0,
+            "guide_anchor_reward": 0.0,
+            "guide_gear_reward": 0.0,
+        }
+
+    def _episode_schedule_value(self, initial, final, start_episode, end_episode):
+        episode = max(0, int(self.episode_index) - 1)
+        start_episode = int(start_episode)
+        end_episode = int(end_episode)
+        if end_episode <= start_episode:
+            progress = 1.0 if episode >= end_episode else 0.0
+        elif episode <= start_episode:
+            progress = 0.0
+        elif episode >= end_episode:
+            progress = 1.0
+        else:
+            progress = (episode - start_episode) / float(end_episode - start_episode)
+        return self._lerp(initial, final, progress), float(progress)
+
+    def _reset_hope_teacher(self):
+        self.hope_teacher_trajectory = None
+        self.guide_step_info = self._zero_guide_step_info()
+        self.guide_weight_current = 0.0
+        self.guide_dropout_rate = 1.0
+        self.guide_dropped = True
+        self.hope_teacher_info = HopeTeacherAdapter.disabled_diagnostics()
+        if self.hope_teacher is None or not bool(self.config.enable_hope_teacher):
+            return
+
+        base_weight, anneal_progress = self._episode_schedule_value(
+            self.config.guide_weight_initial,
+            self.config.guide_weight_final,
+            self.config.guide_anneal_start_episode,
+            self.config.guide_anneal_end_episode,
+        )
+        dropout_rate, _ = self._episode_schedule_value(
+            self.config.guide_dropout_initial,
+            self.config.guide_dropout_final,
+            self.config.guide_anneal_start_episode,
+            self.config.guide_anneal_end_episode,
+        )
+        dropout_rate = float(np.clip(dropout_rate, 0.0, 1.0))
+        dropped = bool(self.rng.random() < dropout_rate)
+        trajectory = self.hope_teacher.plan_episode(
+            self.scene,
+            self.state,
+            self.slot,
+            self.vehicle_model,
+        )
+        if bool(self.config.enable_offpath_reset) and trajectory.reward_available:
+            offpath_state, offpath_reason = self.hope_teacher.sample_offpath_state(
+                trajectory,
+                self.rng,
+                anneal_progress,
+                self.scene,
+                self.vehicle_model,
+            )
+            self.initial_sampling_diagnostics["hope_offpath_reset_attempted"] = True
+            self.initial_sampling_diagnostics["hope_offpath_reset_reason"] = str(
+                offpath_reason
+            )
+            if offpath_state is not None:
+                valid, reject_reason, metrics = self._reset_candidate_viability(
+                    offpath_state,
+                    stage=self._active_stage,
+                )
+                self.initial_sampling_diagnostics["hope_offpath_reset_viable"] = bool(
+                    valid
+                )
+                self.initial_sampling_diagnostics[
+                    "hope_offpath_reset_reject_reason"
+                ] = str(reject_reason)
+            else:
+                valid = False
+                metrics = {}
+                self.initial_sampling_diagnostics["hope_offpath_reset_viable"] = False
+                self.initial_sampling_diagnostics[
+                    "hope_offpath_reset_reject_reason"
+                ] = ""
+            if offpath_state is not None and valid:
+                self.state = offpath_state
+                self.scenario_type = "{}_hope_offpath".format(self.scenario_type)
+                self.initial_sampling_diagnostics["hope_offpath_reset_used"] = True
+                self.initial_sampling_diagnostics["reset_initial_mask_max"] = float(
+                    metrics.get("mask_max", 0.0)
+                )
+                self.initial_sampling_diagnostics[
+                    "reset_initial_body_clearance_m"
+                ] = float(metrics.get("body_clearance", 0.0))
+                self.initial_sampling_diagnostics["reset_initial_min_lidar_m"] = float(
+                    metrics.get("min_lidar", 0.0)
+                )
+            else:
+                self.initial_sampling_diagnostics["hope_offpath_reset_used"] = False
+        else:
+            self.initial_sampling_diagnostics["hope_offpath_reset_attempted"] = False
+            self.initial_sampling_diagnostics["hope_offpath_reset_used"] = False
+            self.initial_sampling_diagnostics["hope_offpath_reset_reason"] = ""
+
+        effective_weight = 0.0
+        if (
+            bool(self.config.use_teacher_reward)
+            and not dropped
+            and trajectory.reward_available
+        ):
+            effective_weight = float(base_weight)
+        self.hope_teacher_trajectory = trajectory
+        self.guide_weight_current = float(effective_weight)
+        self.guide_dropout_rate = float(dropout_rate)
+        self.guide_dropped = bool(dropped)
+        self.hope_teacher_info = self.hope_teacher.diagnostics(
+            trajectory,
+            guide_weight=effective_weight,
+            dropout_rate=dropout_rate,
+            dropped=dropped,
+        )
 
     def _parallel_rev_curriculum_ranges(
         self,
@@ -220,8 +469,8 @@ class LocalParkingEnv:
         if total <= 0:
             return distance_range, lateral_range, heading_range, phi_range, diagnostics
 
-        episode_progress_index = max(0, int(self.episode_index) - 1)
-        progress = min(1.0, float(episode_progress_index) / float(total))
+        sample_progress_index = max(0, int(self._parallel_rev_stage1_sample_count))
+        progress = min(1.0, float(sample_progress_index) / float(total))
         warm_distance = self.config.parallel_rev_warmup_distance_range
         distance_range = (
             self._lerp(warm_distance[0], distance_range[0], progress),
@@ -250,6 +499,7 @@ class LocalParkingEnv:
             {
                 "parallel_rev_curriculum_active": progress < 1.0,
                 "parallel_rev_curriculum_progress": float(progress),
+                "parallel_rev_curriculum_sample_count": int(sample_progress_index),
             }
         )
         return distance_range, lateral_range, heading_range, phi_range, diagnostics
@@ -355,6 +605,13 @@ class LocalParkingEnv:
         self.initial_sampling_diagnostics = dict(sampling_diagnostics)
 
         fallback_used = False
+        reject_counts = {
+            "collision": 0,
+            "mask": 0,
+            "clearance": 0,
+            "recovery_clearance": 0,
+            "recovery_lidar": 0,
+        }
         for _ in range(max(1, int(self.config.initial_sampling_attempts))):
             distance = self.rng.uniform(*distance_range)
             lateral = self.rng.uniform(-effective_lateral_range, effective_lateral_range)
@@ -407,23 +664,51 @@ class LocalParkingEnv:
                 theta_front=float(theta_front),
                 theta_rear=float(wrap_to_pi(theta_front - phi)),
             )
-            if stage == 4:
-                if not self._valid_recovery_state(state):
-                    continue
-                return state, scenario, fallback_used
-            if self._state_collides(state):
+            valid, reject_reason, metrics = self._reset_candidate_viability(
+                state,
+                stage=stage,
+            )
+            if not valid:
+                reject_counts[reject_reason] = reject_counts.get(reject_reason, 0) + 1
                 continue
-            return state, scenario, fallback_used
+            return self._finalize_reset_candidate(
+                state,
+                scenario,
+                fallback_used,
+                stage,
+                task_family,
+                metrics,
+                reject_counts,
+            )
 
         if stage == 4:
             state = self._structured_recovery_state(goal, axis, normal)
             if state is None:
-                raise RuntimeError(
-                    "no collision-free near-obstacle recovery state for scene seed {}".format(
+                raise ResetInitialStateError(
+                    "no reset-viable near-obstacle recovery state for scene seed {}".format(
                         self.scene.metadata["seed"]
                     )
                 )
-            return state, "recovery", fallback_used
+            valid, reject_reason, metrics = self._reset_candidate_viability(
+                state,
+                stage=stage,
+            )
+            if not valid:
+                raise ResetInitialStateError(
+                    "structured recovery state failed reset viability for scene seed {} reason {}".format(
+                        self.scene.metadata["seed"],
+                        reject_reason,
+                    )
+                )
+            return self._finalize_reset_candidate(
+                state,
+                "recovery",
+                fallback_used,
+                stage,
+                task_family,
+                metrics,
+                reject_counts,
+            )
 
         fallback_used = True
         center = ref_center - 6.0 * axis
@@ -433,15 +718,28 @@ class LocalParkingEnv:
             theta_front=float(goal.theta_goal),
             theta_rear=float(goal.theta_goal),
         )
-        if self._state_collides(state):
-            raise RuntimeError(
-                "fallback initial state collides for scene seed {} mode {} stage {}".format(
+        valid, reject_reason, metrics = self._reset_candidate_viability(
+            state,
+            stage=stage,
+        )
+        if not valid:
+            raise ResetInitialStateError(
+                "fallback initial state failed reset viability for scene seed {} mode {} stage {} reason {}".format(
                     self.scene.metadata["seed"],
                     goal_orientation_mode,
                     stage,
+                    reject_reason,
                 )
             )
-        return state, scenario + "_fallback", fallback_used
+        return self._finalize_reset_candidate(
+            state,
+            scenario + "_fallback",
+            fallback_used,
+            stage,
+            task_family,
+            metrics,
+            reject_counts,
+        )
 
     def _boxes_and_metrics(self):
         front_box, rear_box = self.vehicle_model.body_boxes(self.state)
@@ -545,14 +843,86 @@ class LocalParkingEnv:
     def reset(self, seed=None):
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
-        self.scene = self.scene_pool.get(self.episode_index)
-        self.episode_index += 1
-        self.slot = self.scene.slot
-        self.step_count = 0
-        self.state, scenario_type, fallback_used = self._sample_initial_state()
+        max_scene_attempts = max(
+            1,
+            int(getattr(self.config, "reset_scene_retry_count", 1)),
+        )
+        start_episode_index = int(self.episode_index)
+        scene_failures = []
+        last_error = None
+        for _ in range(max_scene_attempts):
+            scene_episode_index = int(self.episode_index)
+            self.scene = self.scene_pool.get(scene_episode_index)
+            self.slot = self.scene.slot
+            self.step_count = 0
+            try:
+                self.state, scenario_type, fallback_used = self._sample_initial_state()
+            except ResetInitialStateError as exc:
+                last_error = exc
+                failed_seed = int(self.scene.metadata["seed"])
+                failed_family = self._task_family_from_scene()
+                scene_failures.append(
+                    {
+                        "seed": failed_seed,
+                        "task_family": failed_family,
+                        "reason": str(exc),
+                    }
+                )
+                replace_scene = getattr(self.scene_pool, "replace", None)
+                if replace_scene is None:
+                    self.episode_index = scene_episode_index + 1
+                    continue
+                try:
+                    replace_scene(
+                        scene_episode_index,
+                        task_family=failed_family,
+                    )
+                except RuntimeError as replace_exc:
+                    last_error = replace_exc
+                    self.episode_index = scene_episode_index + 1
+                continue
+            self.episode_index = scene_episode_index + 1
+            break
+        else:
+            failed_seeds = ",".join(
+                str(item["seed"]) for item in scene_failures[-5:]
+            )
+            raise RuntimeError(
+                "reset viability failed after {} scene seeds from episode index {}; "
+                "recent failed seeds [{}]; last failure: {}".format(
+                    len(scene_failures),
+                    start_episode_index,
+                    failed_seeds,
+                    last_error,
+                )
+            )
+        if scene_failures:
+            last_failure = scene_failures[-1]
+            self.initial_sampling_diagnostics.update(
+                {
+                    "reset_scene_retry_count": int(len(scene_failures)),
+                    "reset_scene_last_failed_seed": int(last_failure["seed"]),
+                    "reset_scene_last_failed_family": str(
+                        last_failure["task_family"]
+                    ),
+                    "reset_scene_last_failure": str(last_failure["reason"]),
+                    "reset_scene_success_seed": int(self.scene.metadata["seed"]),
+                }
+            )
+        else:
+            self.initial_sampling_diagnostics.update(
+                {
+                    "reset_scene_retry_count": 0,
+                    "reset_scene_last_failed_seed": -1,
+                    "reset_scene_last_failed_family": "",
+                    "reset_scene_last_failure": "",
+                    "reset_scene_success_seed": int(self.scene.metadata["seed"]),
+                }
+            )
         self.scenario_type = str(scenario_type)
         self.prev_motion_gear = None
         self.prev_gear_in_obs = 0.0
+        self._reset_hope_teacher()
         metrics = self._boxes_and_metrics()
         self.reward_model.reset(
             initial_distance=metrics["distance_to_goal"],
@@ -564,7 +934,7 @@ class LocalParkingEnv:
         self._update_sensors_and_mask()
         obs = self._observation(metrics)
         info = self._base_info(metrics)
-        info["scenario_type"] = scenario_type
+        info["scenario_type"] = str(self.scenario_type)
         info["scene_seed"] = int(self.scene.metadata["seed"])
         info["goal_orientation_mode"] = str(
             self.scene.metadata.get("goal_orientation_mode", "")
@@ -636,6 +1006,9 @@ class LocalParkingEnv:
                 if not key.startswith("planner_")
             }
         )
+        info.update(self.hope_teacher_info)
+        info.update(self.guide_step_info)
+        info["hope_failure_aggregation_recorded"] = False
         return info
 
     def step(self, raw_action):
@@ -730,12 +1103,27 @@ class LocalParkingEnv:
             failure=failure,
             hybrid_reward=planner_value,
         )
+        task_reward = float(reward)
+        guide_value = 0.0
+        self.guide_step_info = self._zero_guide_step_info()
+        if self.hope_teacher is not None:
+            guide_value, self.guide_step_info = self.hope_teacher.compute_guidance(
+                self.hope_teacher_trajectory,
+                previous_state,
+                self.state,
+                decoded["gear"],
+                self.guide_weight_current,
+            )
+            reward = task_reward + float(guide_value)
         reward_components["hybrid_astar"] = float(hybrid_value)
         reward_components["rs_potential"] = (
             float(rs_value) if self.rs_potential.rs_latched else 0.0
         )
         reward_components["planner"] = float(planner_value)
         reward_components["planner_source"] = planner_source
+        reward_components["task"] = float(task_reward)
+        reward_components["hope_teacher"] = float(guide_value)
+        reward_components["total"] = float(reward)
         self._update_sensors_and_mask()
         obs = self._observation(metrics)
         info = self._base_info(metrics)
@@ -778,4 +1166,18 @@ class LocalParkingEnv:
                 "planner_source": planner_source,
             }
         )
+        if (
+            bool(self.config.enable_failure_aggregation)
+            and self.hope_teacher is not None
+            and (terminated or truncated)
+            and not success
+        ):
+            info["hope_failure_aggregation_recorded"] = bool(
+                self.hope_teacher.record_failure(
+                    self.scene,
+                    self.state,
+                    self.slot,
+                    info,
+                )
+            )
         return obs, reward, terminated, truncated, info

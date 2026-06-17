@@ -2,19 +2,31 @@ from types import SimpleNamespace
 import math
 
 import numpy as np
+import pytest
 
 from config import DEFAULT_VEHICLE_PARAMS
 from dataclasses import replace
 from config import DEFAULT_ENV_CONFIG
 from env.geometry import oriented_box
 from env.lidar import DualBodyLidar
-from env.local_parking_env import LocalParkingEnv
+from env.local_parking_env import LocalParkingEnv, ResetInitialStateError
 from env.mixing_plant_scene import (
     CachedScenePool,
     TASK_FAMILIES,
     generate_cached_mixing_plant_scene,
 )
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
+
+
+class _ConstantActionMask:
+    feature_dim = 22
+    min_safe_ratio = 1e-3
+
+    def __init__(self, value):
+        self.value = float(value)
+
+    def compute_mask(self, phi, front_lidar_m, rear_lidar_m):
+        return np.full((2, 11), self.value, dtype=np.float32)
 
 
 def _edges(polygons):
@@ -110,6 +122,20 @@ def test_scene_pool_uses_explicit_family_schedule_and_derived_seeds():
     assert families.count("parallel_rev") == 4
     assert families.count("head_in") == 2
     assert families.count("parallel_fwd") == 2
+
+
+def test_scene_pool_expands_default_schedule_to_balanced_family_counts():
+    pool = CachedScenePool(
+        stage=1,
+        pool_size=16,
+        base_seed=31,
+        family_schedule=TASK_FAMILIES,
+    )
+    families = [pool.get(index).metadata["task_family"] for index in range(pool.pool_size)]
+    assert pool.pool_size == 18
+    assert families.count("head_in") == 6
+    assert families.count("parallel_fwd") == 6
+    assert families.count("parallel_rev") == 6
 
 
 def test_target_slot_is_inside_bay_with_supported_orientation_modes():
@@ -286,3 +312,85 @@ def test_parallel_reverse_initial_curriculum_expands_from_warmup(
     assert np.isclose(last_info["initial_distance_max"], 15.0)
     assert np.isclose(last_info["initial_heading_range_deg"], 45.0)
     assert np.isclose(last_info["initial_phi_range_deg"], 12.0)
+
+
+def test_parallel_reverse_curriculum_counts_actual_reverse_samples(
+    synthetic_action_mask,
+):
+    env = LocalParkingEnv(
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=1,
+            scene_pool_size=2,
+            scene_family_schedule=("head_in", "parallel_rev"),
+            parallel_rev_curriculum_episodes=4,
+        ),
+        action_mask=synthetic_action_mask,
+        seed=23,
+    )
+    _, head_info = env.reset(seed=23)
+    assert head_info["task_family"] == "head_in"
+
+    _, rev_info = env.reset()
+    assert rev_info["task_family"] == "parallel_rev"
+    assert np.isclose(rev_info["parallel_rev_curriculum_progress"], 0.0)
+    assert rev_info["parallel_rev_curriculum_sample_count"] == 0
+    assert rev_info["parallel_rev_curriculum_sample_count_after"] == 1
+
+
+def test_reset_rejects_collision_free_state_without_executable_mask():
+    env = LocalParkingEnv(
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=1,
+            scene_pool_size=1,
+            scene_family_schedule=("head_in",),
+            initial_sampling_attempts=2,
+            reset_scene_retry_count=2,
+        ),
+        action_mask=_ConstantActionMask(0.0),
+        seed=29,
+    )
+    with pytest.raises(RuntimeError, match="reset viability"):
+        env.reset(seed=29)
+
+
+def test_reset_replaces_scene_seed_after_recovery_sampling_failure(
+    synthetic_action_mask,
+    monkeypatch,
+):
+    env = LocalParkingEnv(
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=4,
+            scene_pool_size=1,
+            scene_family_schedule=("parallel_rev",),
+            reset_scene_retry_count=3,
+        ),
+        action_mask=synthetic_action_mask,
+        seed=37,
+    )
+    failed_seed = int(env.scene_pool.get(0).metadata["seed"])
+    original_sample_initial_state = env._sample_initial_state
+    calls = {"count": 0}
+
+    def fail_once_then_sample():
+        if calls["count"] == 0:
+            calls["count"] += 1
+            raise ResetInitialStateError(
+                "no reset-viable near-obstacle recovery state for scene seed {}".format(
+                    env.scene.metadata["seed"]
+                )
+            )
+        return original_sample_initial_state()
+
+    monkeypatch.setattr(env, "_sample_initial_state", fail_once_then_sample)
+
+    _, info = env.reset(seed=37)
+
+    assert calls["count"] == 1
+    assert info["task_family"] == "parallel_rev"
+    assert info["reset_scene_retry_count"] == 1
+    assert info["reset_scene_last_failed_seed"] == failed_seed
+    assert info["scene_seed"] != failed_seed
+    assert info["reset_scene_success_seed"] == info["scene_seed"]
