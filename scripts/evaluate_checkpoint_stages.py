@@ -18,7 +18,7 @@ from model.continuous_ppo import ContinuousPPOAgent
 from train.curriculum import MultiStageScenePool
 
 
-TASK_FAMILIES = ("head_in", "parallel_fwd", "parallel_rev")
+TASK_FAMILIES = ("head_in",)
 
 
 def _pad(val, width):
@@ -44,19 +44,20 @@ def _eval_config_for_mode(
         use_teacher_reward=bool(use_teacher_reward and enable_teacher),
         enable_offpath_reset=False,
         enable_failure_aggregation=False,
-        parallel_rev_curriculum_episodes=0,
     )
 
 
 def _task_family(reset_info, scene):
     task_family = str(reset_info.get("task_family", ""))
-    if task_family in ("head_in", "parallel_fwd", "parallel_rev"):
+    if task_family in TASK_FAMILIES:
         return task_family
     if str(reset_info.get("goal_orientation_mode", "")) == "head_in":
         return "head_in"
-    if bool(scene.metadata.get("parallel_reverse", False)):
-        return "parallel_rev"
-    return "parallel_fwd"
+    raise ValueError(
+        "unsupported goal orientation mode: {}".format(
+            reset_info.get("goal_orientation_mode", "")
+        )
+    )
 
 
 def evaluate_checkpoint(
@@ -175,7 +176,7 @@ def evaluate_checkpoint(
                             mode_name,
                             stage,
                             len(outcomes),
-                            episodes_per_family * 3,
+                            episodes_per_family * len(TASK_FAMILIES),
                             reset_attempts,
                         )
                     )
@@ -227,11 +228,6 @@ def evaluate_checkpoint(
                 "avg_steps": avg_steps,
                 "sub_scenarios": sub_tables,
                 "families": family_tables,
-                "parallel_rev_no_guide_success": (
-                    family_tables.get("parallel_rev", {}).get("success_rate", 0.0)
-                    if mode_name in ("no_guide", "deployment")
-                    else 0.0
-                ),
             }
         env.close() if hasattr(env, "close") else None
         summaries_by_mode[mode_name] = stage_summaries

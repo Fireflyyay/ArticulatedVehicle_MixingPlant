@@ -165,7 +165,6 @@ class LocalParkingEnv:
         self.guide_weight_current = 0.0
         self.guide_dropout_rate = 1.0
         self.guide_dropped = True
-        self._parallel_rev_stage1_sample_count = 0
 
     def set_active_stage(self, stage):
         stage = int(np.clip(stage, 1, 4))
@@ -287,21 +286,157 @@ class LocalParkingEnv:
                     metrics.get("body_clearance", 0.0)
                 ),
                 "reset_initial_min_lidar_m": float(metrics.get("min_lidar", 0.0)),
-                "parallel_rev_curriculum_sample_count": int(
-                    self._parallel_rev_stage1_sample_count
-                ),
             }
         )
-        if int(stage) == 1 and task_family == "parallel_rev":
-            self._parallel_rev_stage1_sample_count += 1
-        self.initial_sampling_diagnostics[
-            "parallel_rev_curriculum_sample_count_after"
-        ] = int(self._parallel_rev_stage1_sample_count)
+        self.initial_sampling_diagnostics["initial_task_family"] = str(task_family)
         return state, scenario, fallback_used
 
     def _valid_recovery_state(self, state):
         valid, _, _ = self._reset_candidate_viability(state, stage=4)
         return bool(valid)
+
+    def _sample_hard_case_replay_state(self, replay_case):
+        diagnostics = {
+            "hard_case_replay_attempted": True,
+            "hard_case_replay_used": False,
+            "hard_case_replay_reject_reason": "",
+        }
+        if replay_case is None:
+            diagnostics["hard_case_replay_attempted"] = False
+            return None, "", False, diagnostics
+        scene = replay_case.get("scene")
+        state = replay_case.get("state")
+        if scene is None or state is None:
+            diagnostics["hard_case_replay_reject_reason"] = "missing_scene_or_state"
+            return None, "", False, diagnostics
+
+        self.scene = scene
+        self.slot = replay_case.get("slot", scene.slot)
+        self.step_count = 0
+        stage = int(np.clip(replay_case.get("stage", self._active_stage), 1, 4))
+        attempts = max(1, int(self.config.hard_case_replay_attempts))
+        xy_std = float(self.config.hard_case_replay_xy_std)
+        heading_std = math.radians(float(self.config.hard_case_replay_heading_std_deg))
+        phi_std = math.radians(float(self.config.hard_case_replay_phi_std_deg))
+        reject_counts = {
+            "collision": 0,
+            "mask": 0,
+            "clearance": 0,
+            "recovery_clearance": 0,
+            "recovery_lidar": 0,
+        }
+        last_reason = ""
+        last_metrics = {}
+        for attempt_index in range(attempts):
+            if attempt_index == 0:
+                dx = 0.0
+                dy = 0.0
+                dtheta = 0.0
+                dphi = 0.0
+            else:
+                dx = float(self.rng.normal(0.0, xy_std))
+                dy = float(self.rng.normal(0.0, xy_std))
+                dtheta = float(self.rng.normal(0.0, heading_std))
+                dphi = float(self.rng.normal(0.0, phi_std))
+            phi = float(
+                np.clip(
+                    state.phi + dphi,
+                    -self.vehicle_params.phi_max,
+                    self.vehicle_params.phi_max,
+                )
+            )
+            theta_front = float(wrap_to_pi(state.theta_front + dtheta))
+            candidate = ArticulatedState(
+                x_front=float(state.x_front + dx),
+                y_front=float(state.y_front + dy),
+                theta_front=theta_front,
+                theta_rear=float(wrap_to_pi(theta_front - phi)),
+            )
+            valid, reject_reason, metrics = self._reset_candidate_viability(
+                candidate,
+                stage=stage,
+            )
+            if not valid:
+                reject_counts[reject_reason] = reject_counts.get(reject_reason, 0) + 1
+                last_reason = str(reject_reason)
+                last_metrics = metrics
+                continue
+            scenario = "{}_hard_case_replay".format(
+                str(replay_case.get("scenario_type", "hard_case"))
+            )
+            distance = math.hypot(
+                candidate.x_front - self.slot.x_goal,
+                candidate.y_front - self.slot.y_goal,
+            )
+            diagnostics.update(
+                {
+                    "hard_case_replay_used": True,
+                    "hard_case_replay_source_episode": int(
+                        replay_case.get("episode", -1)
+                    ),
+                    "hard_case_replay_source_stage": int(stage),
+                    "hard_case_replay_source_scene_seed": int(
+                        replay_case.get("scene_seed", self.scene.metadata["seed"])
+                    ),
+                    "hard_case_replay_source_failure": str(
+                        replay_case.get("failure_type", "")
+                    ),
+                    "hard_case_replay_attempt_count": int(attempt_index + 1),
+                    "initial_distance_min": float(distance),
+                    "initial_distance_max": float(distance),
+                    "initial_lateral_range": 0.0,
+                    "initial_heading_range_deg": float(
+                        math.degrees(abs(dtheta))
+                    ),
+                    "initial_phi_range_deg": float(math.degrees(abs(dphi))),
+                    "reset_candidate_reject_collision_count": int(
+                        reject_counts.get("collision", 0)
+                    ),
+                    "reset_candidate_reject_mask_count": int(
+                        reject_counts.get("mask", 0)
+                    ),
+                    "reset_candidate_reject_clearance_count": int(
+                        reject_counts.get("clearance", 0)
+                    ),
+                    "reset_candidate_reject_recovery_clearance_count": int(
+                        reject_counts.get("recovery_clearance", 0)
+                    ),
+                    "reset_candidate_reject_recovery_lidar_count": int(
+                        reject_counts.get("recovery_lidar", 0)
+                    ),
+                    "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
+                    "reset_initial_mask_required": float(
+                        metrics.get("mask_required", self._reset_mask_threshold(stage))
+                    ),
+                    "reset_initial_body_clearance_m": float(
+                        metrics.get("body_clearance", 0.0)
+                    ),
+                    "reset_initial_min_lidar_m": float(
+                        metrics.get("min_lidar", 0.0)
+                    ),
+                    "initial_task_family": str(
+                        replay_case.get("task_family", self._task_family_from_scene())
+                    ),
+                }
+            )
+            return candidate, scenario, False, diagnostics
+
+        diagnostics.update(
+            {
+                "hard_case_replay_reject_reason": last_reason,
+                "hard_case_replay_attempt_count": int(attempts),
+                "hard_case_replay_last_mask_max": float(
+                    last_metrics.get("mask_max", 0.0)
+                ),
+                "hard_case_replay_last_body_clearance_m": float(
+                    last_metrics.get("body_clearance", 0.0)
+                ),
+                "hard_case_replay_last_min_lidar_m": float(
+                    last_metrics.get("min_lidar", 0.0)
+                ),
+            }
+        )
+        return None, "", False, diagnostics
 
     def _task_family_from_scene(self):
         task_family = str(self.scene.metadata.get("task_family", ""))
@@ -313,9 +448,9 @@ class LocalParkingEnv:
         )
         if goal_orientation_mode == "head_in":
             return "head_in"
-        if bool(self.scene.metadata.get("parallel_reverse", False)):
-            return "parallel_rev"
-        return "parallel_fwd"
+        raise ValueError(
+            "unsupported goal orientation mode: {}".format(goal_orientation_mode)
+        )
 
     @staticmethod
     def _lerp(value_a, value_b, t):
@@ -380,7 +515,14 @@ class LocalParkingEnv:
             self.slot,
             self.vehicle_model,
         )
-        if bool(self.config.enable_offpath_reset) and trajectory.reward_available:
+        hard_case_replay_used = bool(
+            self.initial_sampling_diagnostics.get("hard_case_replay_used", False)
+        )
+        if (
+            bool(self.config.enable_offpath_reset)
+            and trajectory.reward_available
+            and not hard_case_replay_used
+        ):
             offpath_state, offpath_reason = self.hope_teacher.sample_offpath_state(
                 trajectory,
                 self.rng,
@@ -448,62 +590,6 @@ class LocalParkingEnv:
             dropped=dropped,
         )
 
-    def _parallel_rev_curriculum_ranges(
-        self,
-        stage,
-        distance_range,
-        lateral_range,
-        heading_range,
-        phi_range,
-        task_family,
-    ):
-        diagnostics = {
-            "initial_task_family": str(task_family),
-            "parallel_rev_curriculum_active": False,
-            "parallel_rev_curriculum_progress": 1.0,
-        }
-        if task_family != "parallel_rev" or int(stage) != 1:
-            return distance_range, lateral_range, heading_range, phi_range, diagnostics
-
-        total = int(max(0, self.config.parallel_rev_curriculum_episodes))
-        if total <= 0:
-            return distance_range, lateral_range, heading_range, phi_range, diagnostics
-
-        sample_progress_index = max(0, int(self._parallel_rev_stage1_sample_count))
-        progress = min(1.0, float(sample_progress_index) / float(total))
-        warm_distance = self.config.parallel_rev_warmup_distance_range
-        distance_range = (
-            self._lerp(warm_distance[0], distance_range[0], progress),
-            self._lerp(warm_distance[1], distance_range[1], progress),
-        )
-        lateral_range = self._lerp(
-            self.config.parallel_rev_warmup_lateral_range,
-            lateral_range,
-            progress,
-        )
-        heading_range = math.radians(
-            self._lerp(
-                self.config.parallel_rev_warmup_heading_range_deg,
-                math.degrees(heading_range),
-                progress,
-            )
-        )
-        phi_range = math.radians(
-            self._lerp(
-                self.config.parallel_rev_warmup_phi_range_deg,
-                math.degrees(phi_range),
-                progress,
-            )
-        )
-        diagnostics.update(
-            {
-                "parallel_rev_curriculum_active": progress < 1.0,
-                "parallel_rev_curriculum_progress": float(progress),
-                "parallel_rev_curriculum_sample_count": int(sample_progress_index),
-            }
-        )
-        return distance_range, lateral_range, heading_range, phi_range, diagnostics
-
     def _structured_recovery_state(self, goal, axis, normal):
         """Search a small Bay-mouth boundary band after random sampling fails."""
         candidates = []
@@ -544,54 +630,29 @@ class LocalParkingEnv:
         heading_range = math.radians(self.config.stage_heading_ranges_deg[index])
         phi_range = math.radians(self.config.stage_phi_ranges_deg[index])
         task_family = self._task_family_from_scene()
-        (
-            distance_range,
-            lateral_range,
-            heading_range,
-            phi_range,
-            sampling_diagnostics,
-        ) = self._parallel_rev_curriculum_ranges(
-            stage=stage,
-            distance_range=distance_range,
-            lateral_range=lateral_range,
-            heading_range=heading_range,
-            phi_range=phi_range,
-            task_family=task_family,
-        )
+        sampling_diagnostics = {"initial_task_family": str(task_family)}
         scenario = {
             1: "near_goal",
             2: "near_goal_obstacles",
             3: "poor_terminal_pose",
             4: "recovery",
         }[stage]
-        if (
-            task_family == "parallel_rev"
-            and stage == 1
-            and bool(sampling_diagnostics["parallel_rev_curriculum_active"])
-        ):
-            scenario = "parallel_rev_warmup"
 
         goal_orientation_mode = self.scene.metadata.get("goal_orientation_mode", "head_in")
-        if goal_orientation_mode == "parallel":
-            corridor_heading = float(self.scene.metadata["corridor_heading"])
-            corridor_origin = np.asarray(self.scene.metadata["corridor_origin"])
-            corridor_width = float(self.scene.metadata["corridor_width"])
-            axis = np.asarray([math.cos(corridor_heading), math.sin(corridor_heading)])
-            normal = np.asarray([-axis[1], axis[0]])
-            delta = np.asarray(goal.center) - corridor_origin
-            along_proj = float(np.dot(delta, axis))
-            ref_center = corridor_origin + axis * along_proj
-            half_width = self.vehicle_params.overall_width / 2.0
-            max_lateral = max(0.3, corridor_width / 2.0 - half_width - 0.3)
-            effective_lateral_range = min(lateral_range, max_lateral)
-        else:
-            axis = np.asarray(
-                [math.cos(goal.theta_goal), math.sin(goal.theta_goal)],
-                dtype=np.float64,
+        if goal_orientation_mode != "head_in":
+            raise ResetInitialStateError(
+                "unsupported goal orientation mode {} for scene seed {}".format(
+                    goal_orientation_mode,
+                    self.scene.metadata["seed"],
+                )
             )
-            normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
-            ref_center = np.asarray(goal.center)
-            effective_lateral_range = lateral_range
+        axis = np.asarray(
+            [math.cos(goal.theta_goal), math.sin(goal.theta_goal)],
+            dtype=np.float64,
+        )
+        normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+        ref_center = np.asarray(goal.center)
+        effective_lateral_range = lateral_range
 
         sampling_diagnostics.update(
             {
@@ -840,62 +901,77 @@ class LocalParkingEnv:
             raise RuntimeError("unexpected observation shape {}".format(observation.shape))
         return observation
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, replay_case=None):
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
-        max_scene_attempts = max(
-            1,
-            int(getattr(self.config, "reset_scene_retry_count", 1)),
+        replay_state, replay_scenario, replay_fallback, replay_diagnostics = (
+            self._sample_hard_case_replay_state(replay_case)
         )
-        start_episode_index = int(self.episode_index)
-        scene_failures = []
-        last_error = None
-        for _ in range(max_scene_attempts):
-            scene_episode_index = int(self.episode_index)
-            self.scene = self.scene_pool.get(scene_episode_index)
-            self.slot = self.scene.slot
-            self.step_count = 0
-            try:
-                self.state, scenario_type, fallback_used = self._sample_initial_state()
-            except ResetInitialStateError as exc:
-                last_error = exc
-                failed_seed = int(self.scene.metadata["seed"])
-                failed_family = self._task_family_from_scene()
-                scene_failures.append(
-                    {
-                        "seed": failed_seed,
-                        "task_family": failed_family,
-                        "reason": str(exc),
-                    }
-                )
-                replace_scene = getattr(self.scene_pool, "replace", None)
-                if replace_scene is None:
-                    self.episode_index = scene_episode_index + 1
-                    continue
-                try:
-                    replace_scene(
-                        scene_episode_index,
-                        task_family=failed_family,
-                    )
-                except RuntimeError as replace_exc:
-                    last_error = replace_exc
-                    self.episode_index = scene_episode_index + 1
-                continue
-            self.episode_index = scene_episode_index + 1
-            break
+        if replay_state is not None:
+            self.state = replay_state
+            scenario_type = replay_scenario
+            fallback_used = replay_fallback
+            self.initial_sampling_diagnostics = dict(replay_diagnostics)
+            self.episode_index += 1
+            scene_failures = []
         else:
-            failed_seeds = ",".join(
-                str(item["seed"]) for item in scene_failures[-5:]
+            max_scene_attempts = max(
+                1,
+                int(getattr(self.config, "reset_scene_retry_count", 1)),
             )
-            raise RuntimeError(
-                "reset viability failed after {} scene seeds from episode index {}; "
-                "recent failed seeds [{}]; last failure: {}".format(
-                    len(scene_failures),
-                    start_episode_index,
-                    failed_seeds,
-                    last_error,
+            start_episode_index = int(self.episode_index)
+            scene_failures = []
+            last_error = None
+            for _ in range(max_scene_attempts):
+                scene_episode_index = int(self.episode_index)
+                self.scene = self.scene_pool.get(scene_episode_index)
+                self.slot = self.scene.slot
+                self.step_count = 0
+                try:
+                    self.state, scenario_type, fallback_used = (
+                        self._sample_initial_state()
+                    )
+                except ResetInitialStateError as exc:
+                    last_error = exc
+                    failed_seed = int(self.scene.metadata["seed"])
+                    failed_family = self._task_family_from_scene()
+                    scene_failures.append(
+                        {
+                            "seed": failed_seed,
+                            "task_family": failed_family,
+                            "reason": str(exc),
+                        }
+                    )
+                    replace_scene = getattr(self.scene_pool, "replace", None)
+                    if replace_scene is None:
+                        self.episode_index = scene_episode_index + 1
+                        continue
+                    try:
+                        replace_scene(
+                            scene_episode_index,
+                            task_family=failed_family,
+                        )
+                    except RuntimeError as replace_exc:
+                        last_error = replace_exc
+                        self.episode_index = scene_episode_index + 1
+                    continue
+                self.episode_index = scene_episode_index + 1
+                break
+            else:
+                failed_seeds = ",".join(
+                    str(item["seed"]) for item in scene_failures[-5:]
                 )
-            )
+                raise RuntimeError(
+                    "reset viability failed after {} scene seeds from episode index {}; "
+                    "recent failed seeds [{}]; last failure: {}".format(
+                        len(scene_failures),
+                        start_episode_index,
+                        failed_seeds,
+                        last_error,
+                    )
+                )
+            if replay_diagnostics.get("hard_case_replay_attempted", False):
+                self.initial_sampling_diagnostics.update(replay_diagnostics)
         if scene_failures:
             last_failure = scene_failures[-1]
             self.initial_sampling_diagnostics.update(
@@ -946,7 +1022,7 @@ class LocalParkingEnv:
         for key in (
             "clearance_bucket",
             "approach_side_bucket",
-            "reverse_required_bucket",
+            "scene_complexity_bucket",
             "difficulty_label",
             "nominal_target_collision",
             "nominal_target_front_in_bay",
@@ -955,6 +1031,9 @@ class LocalParkingEnv:
             "success_neighborhood_sample_count",
             "success_neighborhood_collision_free_count",
             "success_neighborhood_feasible_count",
+            "constructed_obstacle_feature_count",
+            "constructed_wall_feature_count",
+            "scene_generation_attempt_count",
         ):
             if key in self.scene.metadata:
                 info[key] = self.scene.metadata[key]

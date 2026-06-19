@@ -1,5 +1,5 @@
 """
-Benchmark RS planner candidate_limit on parallel parking mode.
+Benchmark RS planner candidate_limit on local head-in parking scenes.
 Runs the same episodes with candidate_limit=2 and candidate_limit=10
 to measure improvement in RS path validation success rate and time cost.
 """
@@ -119,9 +119,6 @@ def evaluate_rs(checkpoint_path, device, episodes_per_stage, candidate_limit):
 
             oracle.reset()
 
-        total_parallel = sum(1 for a in stage_attempts if a["mode"] == "parallel")
-        total_head_in = sum(1 for a in stage_attempts if a["mode"] == "head_in")
-        paral_attempted = [a for a in stage_attempts if a["mode"] == "parallel"]
         headin_attempted = [a for a in stage_attempts if a["mode"] == "head_in"]
 
         def summarize(entries):
@@ -150,7 +147,6 @@ def evaluate_rs(checkpoint_path, device, episodes_per_stage, candidate_limit):
             }
 
         all_stats[stage] = {
-            "parallel": summarize(paral_attempted),
             "head_in": summarize(headin_attempted),
             "total_episodes": episodes_per_stage,
             "attempt_count": len(stage_attempts),
@@ -170,7 +166,7 @@ def print_compare(a, b, stages):
     for stage in stages:
         print()
         print(f"--- Stage {stage} ---")
-        for mode in ("parallel", "head_in"):
+        for mode in ("head_in",):
             sa = a[stage][mode]
             sb = b[stage][mode]
             label2 = f"limit=2"
@@ -224,16 +220,10 @@ def main():
         )
         for stage in sorted(stats):
             s = stats[stage]
-            p = s["parallel"]
             h = s["head_in"]
             print(f"  Stage {stage}:")
-            print(f"    parallel: n={p['n']:3d} latched={p['latched']:3d} ({p['latch_rate']*100:5.1f}%) "
-                  f"avg_time={p['avg_time_ms']:.3f}ms avg_checks={p['avg_collision_checks']:.0f}")
             print(f"    head_in:  n={h['n']:3d} latched={h['latched']:3d} ({h['latch_rate']*100:5.1f}%) "
                   f"avg_time={h['avg_time_ms']:.3f}ms")
-            if p["reasons"]:
-                for reason, cnt in sorted(p["reasons"].items()):
-                    print(f"      parallel reason '{reason}': {cnt} ({cnt*100/max(p['n'],1):.1f}%)")
         results[cl] = stats
 
     if len(results) >= 2:

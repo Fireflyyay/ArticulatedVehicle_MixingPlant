@@ -8,7 +8,7 @@ Usage:
     PYTHONPATH=src conda run -n HOPE python scripts/evaluate_teachers.py \
         --teachers lattice multi_anchor \
         --stages 1 \
-        --families head_in parallel_fwd parallel_rev \
+        --families head_in \
         --seeds-per-family 20 \
         --output-dir runs/teacher_eval \
         --mask-test
@@ -57,7 +57,7 @@ def parse_args():
                    help="Teachers to evaluate")
     p.add_argument("--stages", nargs="+", type=int, default=[1],
                    help="Curriculum stages (1-4)")
-    p.add_argument("--families", nargs="+", default=["head_in", "parallel_fwd", "parallel_rev"],
+    p.add_argument("--families", nargs="+", default=["head_in"], choices=["head_in"],
                    help="Task families to evaluate")
     p.add_argument("--seeds-per-family", type=int, default=100,
                    help="Number of seeds per (stage, family) pair")

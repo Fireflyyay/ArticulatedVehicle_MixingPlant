@@ -31,33 +31,16 @@ class TeacherHeuristic:
         self._grid_cache: Dict[int, np.ndarray] = {}
 
     def configure_for_family(self, task_family: str):
-        if task_family == "parallel_rev":
-            self.weights.update({
-                "w_grid": 2.5,
-                "w_pos": 0.3,
-                "w_theta": 0.3,
-                "w_phi": 0.15,
-                "w_entry": 0.8,
-                "w_anchor": 2.0,
-            })
-        elif task_family == "parallel_fwd":
-            self.weights.update({
-                "w_grid": 2.0,
-                "w_pos": 1.0,
-                "w_theta": 0.5,
-                "w_phi": 0.15,
-                "w_entry": 0.5,
-                "w_anchor": 0.5,
-            })
-        else:
-            self.weights.update({
-                "w_grid": 2.0,
-                "w_pos": 1.0,
-                "w_theta": 0.3,
-                "w_phi": 0.15,
-                "w_entry": 0.3,
-                "w_anchor": 0.0,
-            })
+        if task_family != "head_in":
+            raise ValueError("unsupported task family: {}".format(task_family))
+        self.weights.update({
+            "w_grid": 2.0,
+            "w_pos": 1.0,
+            "w_theta": 0.3,
+            "w_phi": 0.15,
+            "w_entry": 0.3,
+            "w_anchor": 0.0,
+        })
 
     def compute(
         self,

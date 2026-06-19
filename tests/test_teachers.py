@@ -173,11 +173,10 @@ class TestTeacherHeuristic:
         assert h.weights["w_pos"] == 1.0
         assert h.weights["w_grid"] == 2.0
 
-    def test_configure_parallel_rev(self):
+    def test_configure_rejects_deprecated_family(self):
         h = TeacherHeuristic()
-        h.configure_for_family("parallel_rev")
-        assert h.weights["w_pos"] < 1.0
-        assert h.weights["w_anchor"] > 1.0
+        with pytest.raises(ValueError, match="unsupported task family"):
+            h.configure_for_family("parallel_rev")
 
     def test_configure_head_in(self):
         h = TeacherHeuristic()
@@ -285,7 +284,7 @@ class TestMultiAnchorTeacher:
         from env.local_parking_env import LocalParkingEnv
 
         env_config = replace(DEFAULT_ENV_CONFIG, curriculum_stage=1, scene_pool_size=1,
-                             scene_family_schedule=("parallel_rev",), use_hybrid_astar=False,
+                             scene_family_schedule=("head_in",), use_hybrid_astar=False,
                              rs_potential_enabled=False)
         env = LocalParkingEnv(config=env_config, seed=42)
         env.reset()

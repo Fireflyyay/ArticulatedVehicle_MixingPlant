@@ -22,25 +22,10 @@ from planning.passenger_hybrid_astar import PassengerHybridAStar
 def _sample_initial_state(scene, rng, stage):
     """Random feasible initial pose near target bay (replicates env logic)."""
     slot = scene.slot
-    goal_mode = scene.metadata.get("goal_orientation_mode", "head_in")
-
-    if goal_mode == "parallel":
-        ch = float(scene.metadata["corridor_heading"])
-        corg = np.asarray(scene.metadata["corridor_origin"])
-        cw = float(scene.metadata["corridor_width"])
-        axis = np.asarray([math.cos(ch), math.sin(ch)])
-        normal = np.asarray([-axis[1], axis[0]])
-        delta = np.asarray(slot.center) - corg
-        along_proj = float(np.dot(delta, axis))
-        ref_center = corg + axis * along_proj
-        half_w = 1.0
-        max_lat = max(0.3, cw / 2.0 - half_w - 0.3)
-        effective_lat = min(4.0, max_lat)
-    else:
-        axis = np.asarray([math.cos(slot.theta_goal), math.sin(slot.theta_goal)])
-        normal = np.asarray([-axis[1], axis[0]])
-        ref_center = np.asarray(slot.center)
-        effective_lat = 4.0
+    axis = np.asarray([math.cos(slot.theta_goal), math.sin(slot.theta_goal)])
+    normal = np.asarray([-axis[1], axis[0]])
+    ref_center = np.asarray(slot.center)
+    effective_lat = 4.0
 
     dr = (8.0, 15.0)
 

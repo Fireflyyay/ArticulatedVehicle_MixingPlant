@@ -35,13 +35,13 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
         terminated or truncated,
         value,
         pre_tanh_action=pre_tanh_action,
-        task_family="parallel_rev",
+        task_family="head_in",
     )
     assert buffer.log_prob_action_source == "pre_tanh_action_and_raw_action"
     assert np.allclose(buffer.pre_tanh_actions[0], pre_tanh_action)
     assert np.allclose(buffer.raw_actions[0], raw_action)
     assert np.allclose(buffer.executed_actions[0], info["executed_action"])
-    assert buffer.task_families == ["parallel_rev"]
+    assert buffer.task_families == ["head_in"]
 
     obs_t = torch.as_tensor(obs).unsqueeze(0)
     pre_tanh_t = torch.as_tensor(pre_tanh_action).unsqueeze(0)
@@ -74,6 +74,42 @@ def test_env_step_advances_with_executed_action(synthetic_action_mask):
     assert info["raw_action"][0] == 1.0
     assert info["executed_action"][0] == 0.0
     assert seen["action"][0] == 0.0
+
+
+def test_env_can_reset_from_viable_hard_case_replay_state(synthetic_action_mask):
+    config = replace(
+        DEFAULT_ENV_CONFIG,
+        curriculum_stage=3,
+        hard_case_replay_attempts=1,
+        hard_case_replay_xy_std=0.0,
+        hard_case_replay_heading_std_deg=0.0,
+        hard_case_replay_phi_std_deg=0.0,
+    )
+    env = LocalParkingEnv(
+        config=config,
+        action_mask=synthetic_action_mask,
+        seed=31,
+    )
+    _, reset_info = env.reset(seed=31)
+    replay_case = {
+        "scene": env.scene,
+        "slot": env.slot,
+        "state": env.state,
+        "stage": 3,
+        "episode": 4,
+        "scene_seed": reset_info["scene_seed"],
+        "scenario_type": reset_info["scenario_type"],
+        "task_family": reset_info["task_family"],
+        "failure_type": "timeout",
+    }
+
+    obs, info = env.reset(replay_case=replay_case)
+
+    assert obs.shape == (149,)
+    assert info["hard_case_replay_attempted"] is True
+    assert info["hard_case_replay_used"] is True
+    assert info["hard_case_replay_source_episode"] == 4
+    assert info["scenario_type"].endswith("_hard_case_replay")
 
 
 def test_actor_uses_bounded_global_log_std():
@@ -126,9 +162,7 @@ def test_ppo_early_stops_after_epoch_when_target_kl_is_exceeded():
             done=index == 31,
             value=value,
             pre_tanh_action=pre_tanh_action,
-            task_family=(
-                "parallel_rev" if index % 3 == 0 else "head_in"
-            ),
+            task_family="head_in",
         )
 
     stats = agent.update(
@@ -140,7 +174,7 @@ def test_ppo_early_stops_after_epoch_when_target_kl_is_exceeded():
     assert stats["kl_early_stopped"] is True
     assert stats["ppo_epochs_completed"] == 1
     assert stats["approx_kl_max"] > config.target_kl
-    assert agent._policy_loss_weight("parallel_rev") == 0.2
+    assert agent._policy_loss_weight("head_in") == 1.0
 
 
 def test_checkpoint_preserves_log_std_bounds_and_ppo_config(tmp_path):

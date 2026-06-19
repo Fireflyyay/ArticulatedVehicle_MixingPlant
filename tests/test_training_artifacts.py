@@ -4,13 +4,17 @@ from datetime import datetime
 import os
 
 from config import DEFAULT_ENV_CONFIG, DEFAULT_PPO_CONFIG
+from env.local_parking_env import LocalParkingEnv
 from train.train_local_parking import (
+    HardCaseReplayBuffer,
     REPO_ROOT,
+    _checkpoint_selection_score,
     _resolve_output_dir,
     _update_reward_plot,
     _weighted_checkpoint_score,
     _write_config_snapshot,
 )
+import numpy as np
 
 
 def test_default_training_output_is_timestamped_under_workspace_runs():
@@ -59,16 +63,56 @@ def test_reward_plot_is_written_from_episode_rewards(tmp_path):
     assert path.stat().st_size > 0
 
 
-def test_weighted_checkpoint_score_prioritizes_parallel_reverse():
+def test_weighted_checkpoint_score_uses_head_in_success():
     score = _weighted_checkpoint_score(
         {
             "head_in": 1.0,
-            "parallel_fwd": 0.5,
-            "parallel_rev": 0.25,
         },
         DEFAULT_PPO_CONFIG,
     )
-    assert score == (1.0 + 2.0 * 0.5 + 4.0 * 0.25) / 7.0
+    assert score == 1.0
+
+
+def test_checkpoint_selection_score_uses_stage3_and_stage4_failure_slices():
+    score = _checkpoint_selection_score(
+        {
+            "stage3_no_latch_success": 0.72,
+            "stage4_recovery_success": 0.61,
+        }
+    )
+
+    assert score == 0.61
+
+
+def test_hard_case_replay_buffer_records_no_rs_collision_tail(synthetic_action_mask):
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=3),
+        action_mask=synthetic_action_mask,
+        seed=17,
+    )
+    _, reset_info = env.reset(seed=17)
+    buffer = HardCaseReplayBuffer(
+        capacity=4,
+        tail_steps=2,
+        replay_ratio=1.0,
+        rng=np.random.default_rng(3),
+    )
+
+    recorded = buffer.record_failure(
+        scene=env.scene,
+        slot=env.slot,
+        tail_states=[env.state],
+        final_info={"success": False, "rs_latched": False, "collision": True},
+        reset_info=reset_info,
+        stage=3,
+        episode_index=9,
+    )
+    sample = buffer.sample()
+
+    assert recorded == 1
+    assert len(buffer) == 1
+    assert sample["stage"] == 3
+    assert sample["failure_type"] == "collision"
 
 
 def test_default_ppo_stability_configuration():
@@ -76,9 +120,9 @@ def test_default_ppo_stability_configuration():
     assert DEFAULT_PPO_CONFIG.log_std_min == -2.5
     assert DEFAULT_PPO_CONFIG.log_std_max == -0.3
     assert DEFAULT_PPO_CONFIG.target_kl == 0.03
-    assert DEFAULT_PPO_CONFIG.ppo_epochs == 4
-    assert DEFAULT_PPO_CONFIG.clip_range == 0.15
-    assert DEFAULT_PPO_CONFIG.actor_lr == 1e-4
-    assert DEFAULT_PPO_CONFIG.critic_lr == 3e-4
+    assert DEFAULT_PPO_CONFIG.ppo_epochs == 6
+    assert DEFAULT_PPO_CONFIG.clip_range == 0.2
+    assert DEFAULT_PPO_CONFIG.actor_lr == 3e-4
+    assert DEFAULT_PPO_CONFIG.critic_lr == 1e-3
     assert DEFAULT_PPO_CONFIG.entropy_coef == 0.0
-    assert DEFAULT_PPO_CONFIG.policy_loss_weight_parallel_rev == 0.2
+    assert DEFAULT_PPO_CONFIG.policy_loss_weight_head_in == 1.0

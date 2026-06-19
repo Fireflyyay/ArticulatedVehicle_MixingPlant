@@ -155,7 +155,7 @@ def main():
     _print_latency("success cases", successes)
     _print_latency("failure cases", failures)
 
-    for mode in ("head_in", "parallel"):
+    for mode in ("head_in",):
         selected = [record for record in records if record["mode"] == mode]
         if selected:
             _print_latency("{} cases (n={})".format(mode, len(selected)), selected)

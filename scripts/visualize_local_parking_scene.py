@@ -75,7 +75,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--task-family",
-        choices=["head_in", "parallel_fwd", "parallel_rev"],
+        choices=["head_in"],
         default="head_in",
     )
     parser.add_argument("--output", default=None)

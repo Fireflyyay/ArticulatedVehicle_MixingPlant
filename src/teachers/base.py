@@ -116,14 +116,12 @@ class TeacherBase(ABC):
     @staticmethod
     def _scenario_family_from_scene(scene) -> str:
         task_family = str(scene.metadata.get("task_family", ""))
-        if task_family in ("head_in", "parallel_fwd", "parallel_rev"):
+        if task_family == "head_in":
             return task_family
         goal_mode = scene.metadata.get("goal_orientation_mode", "head_in")
         if goal_mode == "head_in":
             return "head_in"
-        if bool(scene.metadata.get("parallel_reverse", False)):
-            return "parallel_rev"
-        return "parallel_fwd"
+        raise ValueError("unsupported goal orientation mode: {}".format(goal_mode))
 
     @staticmethod
     def _compute_metrics(state, slot, vehicle_model):

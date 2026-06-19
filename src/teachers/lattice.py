@@ -64,8 +64,6 @@ class ArticulatedLatticeTeacher(TeacherBase):
 
     def configure_for_family(self, task_family: str):
         self.heuristic.configure_for_family(task_family)
-        if task_family == "parallel_rev":
-            self.w_heuristic = 2.0
 
     def _state_key(self, state: ArticulatedState, gear: int):
         x_bin = int(round(state.x_front / GRID_XY))

@@ -4,7 +4,7 @@
 Usage:
     PYTHONPATH=src conda run -n HOPE python scripts/visualize_teacher.py \
         --teacher lattice \
-        --family parallel_rev \
+        --family head_in \
         --stage 1 \
         --seeds 0 1 2 3 4
 """
@@ -45,8 +45,7 @@ def plot_vehicle(ax, state, vehicle_model, color_front="#3a86ff", color_rear="#f
 def main():
     p = argparse.ArgumentParser(description="Visualize teacher trajectories")
     p.add_argument("--teacher", default="lattice", choices=["lattice", "multi_anchor"])
-    p.add_argument("--family", default="parallel_rev",
-                   choices=["head_in", "parallel_fwd", "parallel_rev"])
+    p.add_argument("--family", default="head_in", choices=["head_in"])
     p.add_argument("--stage", type=int, default=1)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     p.add_argument("--output-dir", default="outputs/teacher_viz")

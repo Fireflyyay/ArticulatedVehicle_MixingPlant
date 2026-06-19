@@ -162,11 +162,7 @@ class MultiAnchorTeacher(TeacherBase):
         scored = []
         sx, sy = start_state.x_front, start_state.y_front
         gx, gy = slot.x_goal, slot.y_goal
-        start_to_goal = math.hypot(sx - gx, sy - gy)
-
-        is_parallel_rev = (task_family == "parallel_rev")
-        goal_vec_x = gx - sx
-        goal_vec_y = gy - sy
+        del task_family
 
         for a in anchors:
             ax, ay = a["x"], a["y"]
@@ -179,19 +175,6 @@ class MultiAnchorTeacher(TeacherBase):
             heading_error = abs(wrap_to_pi(a["heading"] - anchor_to_goal_dir))
             heading_align = 1.0 - math.cos(heading_error)
             score += 1.0 * heading_align
-
-            if is_parallel_rev and start_to_goal > 0.5:
-                anchor_to_goal_dx = gx - ax
-                anchor_to_goal_dy = gy - ay
-                reverse_bonus = 0.0
-                dot = (
-                    (anchor_to_goal_dx * goal_vec_x + anchor_to_goal_dy * goal_vec_y)
-                    / (start_to_goal * max(d_anchor_goal, 0.01))
-                )
-                dot = max(-1.0, min(1.0, dot))
-                if dot < -0.3:
-                    reverse_bonus = min(1.0, (-dot - 0.3) / 0.7)
-                score -= self.w_reverse_bonus * reverse_bonus
 
             scored.append((score, a))
 
@@ -235,8 +218,7 @@ class MultiAnchorTeacher(TeacherBase):
         if remaining_ms <= 0:
             return self._fail_result(start_time, "timeout", task_family, seed)
 
-        is_parallel_rev = (task_family == "parallel_rev")
-        direct_budget_ratio = 0.3 if is_parallel_rev else 1.0
+        direct_budget_ratio = 1.0
         direct_budget_ms = min(remaining_ms * direct_budget_ratio * 0.5, 1500.0)
 
         orig_expansions = self.lattice.max_expansions

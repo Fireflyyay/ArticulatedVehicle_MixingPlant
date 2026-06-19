@@ -69,8 +69,9 @@ def test_rule_carved_scene_is_cached_and_deterministic():
     assert 0.0 < first.metadata["free_ratio"] < 1.0
     assert first.world_bounds == (-40.0, -40.0, 40.0, 40.0)
     assert first.occupancy_grid.shape == (80, 80)
-    assert float(first.metadata["corridor_width"]) >= 12.0
+    assert float(first.metadata["corridor_width"]) >= 9.0
     assert len(first.parking_bays) >= 2
+    assert first.metadata["constructed_obstacle_feature_count"] > 0
 
 
 def test_different_seeds_produce_distinct_parameterized_layouts():
@@ -78,7 +79,7 @@ def test_different_seeds_produce_distinct_parameterized_layouts():
         generate_cached_mixing_plant_scene(
             stage=3,
             seed=100 + index,
-            task_family=TASK_FAMILIES[index % len(TASK_FAMILIES)],
+            task_family="head_in",
         )
         for index in range(18)
     ]
@@ -93,35 +94,30 @@ def test_different_seeds_produce_distinct_parameterized_layouts():
     }
     assert len(grid_signatures) == len(scenes)
     assert len(slot_poses) >= 12
-    assert {scene.metadata["task_family"] for scene in scenes} == set(TASK_FAMILIES)
-    assert {scene.metadata["goal_orientation_mode"] for scene in scenes} == {
-        "head_in",
-        "parallel",
-    }
+    assert {scene.metadata["task_family"] for scene in scenes} == {"head_in"}
+    assert {scene.metadata["goal_orientation_mode"] for scene in scenes} == {"head_in"}
+    assert len({scene.metadata["obstacle_layout_variant"] for scene in scenes}) > 1
 
 
 def test_scene_pool_uses_explicit_family_schedule_and_derived_seeds():
-    schedule = ("parallel_rev", "head_in", "parallel_rev", "parallel_fwd")
+    schedule = ("head_in",)
     first = CachedScenePool(
         stage=1,
-        pool_size=8,
+        pool_size=4,
         base_seed=23,
         family_schedule=schedule,
     )
     second = CachedScenePool(
         stage=1,
-        pool_size=8,
+        pool_size=4,
         base_seed=23,
         family_schedule=schedule,
     )
-    families = [first.get(index).metadata["task_family"] for index in range(8)]
-    seeds = [first.get(index).metadata["seed"] for index in range(8)]
-    assert families == list(schedule) * 2
-    assert seeds == [second.get(index).metadata["seed"] for index in range(8)]
-    assert seeds != [23 + index for index in range(8)]
-    assert families.count("parallel_rev") == 4
-    assert families.count("head_in") == 2
-    assert families.count("parallel_fwd") == 2
+    families = [first.get(index).metadata["task_family"] for index in range(4)]
+    seeds = [first.get(index).metadata["seed"] for index in range(4)]
+    assert families == ["head_in"] * 4
+    assert seeds == [second.get(index).metadata["seed"] for index in range(4)]
+    assert seeds != [23 + index for index in range(4)]
 
 
 def test_scene_pool_expands_default_schedule_to_balanced_family_counts():
@@ -132,16 +128,14 @@ def test_scene_pool_expands_default_schedule_to_balanced_family_counts():
         family_schedule=TASK_FAMILIES,
     )
     families = [pool.get(index).metadata["task_family"] for index in range(pool.pool_size)]
-    assert pool.pool_size == 18
-    assert families.count("head_in") == 6
-    assert families.count("parallel_fwd") == 6
-    assert families.count("parallel_rev") == 6
+    assert pool.pool_size == 16
+    assert families.count("head_in") == 16
 
 
 def test_target_slot_is_inside_bay_with_supported_orientation_modes():
     model = ArticulatedVehicleModel(DEFAULT_VEHICLE_PARAMS)
     modes = set()
-    for index, task_family in enumerate(TASK_FAMILIES * 6):
+    for index, task_family in enumerate(TASK_FAMILIES * 12):
         scene = generate_cached_mixing_plant_scene(
             stage=3,
             seed=200 + index,
@@ -160,10 +154,13 @@ def test_target_slot_is_inside_bay_with_supported_orientation_modes():
             "open",
         }
         assert scene.metadata["approach_side_bucket"] in {"left_bay", "right_bay"}
-        assert scene.metadata["reverse_required_bucket"] in {
-            "required",
-            "not_required",
+        assert scene.metadata["scene_complexity_bucket"] in {
+            "normal",
+            "complex",
+            "extreme",
         }
+        assert scene.metadata["constructed_obstacle_feature_count"] > 0
+        assert scene.metadata["constructed_wall_feature_count"] > 0
         goal = scene.slot
         target_state = ArticulatedState(
             goal.x_goal,
@@ -192,11 +189,9 @@ def test_target_slot_is_inside_bay_with_supported_orientation_modes():
                 math.sin(scene.target_bay.inward_heading),
             ]
         )
-        if scene.metadata["goal_orientation_mode"] == "parallel":
-            assert abs(float(np.dot(goal_direction, corridor_direction))) > 0.999
-        else:
-            assert float(np.dot(goal_direction, inward_direction)) > 0.999
-    assert modes == {"head_in", "parallel"}
+        assert abs(float(np.dot(goal_direction, corridor_direction))) < 1e-6
+        assert float(np.dot(goal_direction, inward_direction)) > 0.999
+    assert modes == {"head_in"}
 
 
 def test_target_bay_mouth_connects_to_main_corridor():
@@ -218,7 +213,7 @@ def test_parking_bays_do_not_overlap_each_other():
         scene = generate_cached_mixing_plant_scene(
             stage=3,
             seed=index,
-            task_family=TASK_FAMILIES[index % len(TASK_FAMILIES)],
+            task_family="head_in",
         )
         for index, first in enumerate(scene.parking_bays):
             for second in scene.parking_bays[index + 1 :]:
@@ -280,62 +275,14 @@ def test_near_goal_initial_states_cover_distance_heading_lateral_and_phi(
     assert max(item[3] for item in states) > 10.0
 
 
-def test_parallel_reverse_initial_curriculum_expands_from_warmup(
-    synthetic_action_mask,
-):
-    env = LocalParkingEnv(
-        config=replace(
-            DEFAULT_ENV_CONFIG,
-            curriculum_stage=1,
-            scene_pool_size=1,
-            scene_family_schedule=("parallel_rev",),
-            parallel_rev_curriculum_episodes=4,
-        ),
-        action_mask=synthetic_action_mask,
-        seed=17,
-    )
-    _, first_info = env.reset(seed=17)
-    assert first_info["task_family"] == "parallel_rev"
-    assert first_info["scenario_type"] == "parallel_rev_warmup"
-    assert np.isclose(first_info["parallel_rev_curriculum_progress"], 0.0)
-    assert np.isclose(first_info["initial_distance_min"], 4.0)
-    assert np.isclose(first_info["initial_distance_max"], 8.0)
-    assert first_info["initial_lateral_range"] <= 1.25
-    assert np.isclose(first_info["initial_heading_range_deg"], 20.0)
-    assert np.isclose(first_info["initial_phi_range_deg"], 8.0)
-
-    last_info = first_info
-    for _ in range(4):
-        _, last_info = env.reset()
-    assert np.isclose(last_info["parallel_rev_curriculum_progress"], 1.0)
-    assert np.isclose(last_info["initial_distance_min"], 8.0)
-    assert np.isclose(last_info["initial_distance_max"], 15.0)
-    assert np.isclose(last_info["initial_heading_range_deg"], 45.0)
-    assert np.isclose(last_info["initial_phi_range_deg"], 12.0)
-
-
-def test_parallel_reverse_curriculum_counts_actual_reverse_samples(
-    synthetic_action_mask,
-):
-    env = LocalParkingEnv(
-        config=replace(
-            DEFAULT_ENV_CONFIG,
-            curriculum_stage=1,
-            scene_pool_size=2,
-            scene_family_schedule=("head_in", "parallel_rev"),
-            parallel_rev_curriculum_episodes=4,
-        ),
-        action_mask=synthetic_action_mask,
-        seed=23,
-    )
-    _, head_info = env.reset(seed=23)
-    assert head_info["task_family"] == "head_in"
-
-    _, rev_info = env.reset()
-    assert rev_info["task_family"] == "parallel_rev"
-    assert np.isclose(rev_info["parallel_rev_curriculum_progress"], 0.0)
-    assert rev_info["parallel_rev_curriculum_sample_count"] == 0
-    assert rev_info["parallel_rev_curriculum_sample_count_after"] == 1
+def test_deprecated_parallel_families_are_rejected():
+    with pytest.raises(ValueError, match="unsupported task family"):
+        CachedScenePool(
+            stage=1,
+            pool_size=1,
+            base_seed=23,
+            family_schedule=("parallel_rev",),
+        )
 
 
 def test_reset_rejects_collision_free_state_without_executable_mask():
@@ -364,7 +311,7 @@ def test_reset_replaces_scene_seed_after_recovery_sampling_failure(
             DEFAULT_ENV_CONFIG,
             curriculum_stage=4,
             scene_pool_size=1,
-            scene_family_schedule=("parallel_rev",),
+            scene_family_schedule=("head_in",),
             reset_scene_retry_count=3,
         ),
         action_mask=synthetic_action_mask,
@@ -389,7 +336,7 @@ def test_reset_replaces_scene_seed_after_recovery_sampling_failure(
     _, info = env.reset(seed=37)
 
     assert calls["count"] == 1
-    assert info["task_family"] == "parallel_rev"
+    assert info["task_family"] == "head_in"
     assert info["reset_scene_retry_count"] == 1
     assert info["reset_scene_last_failed_seed"] == failed_seed
     assert info["scene_seed"] != failed_seed

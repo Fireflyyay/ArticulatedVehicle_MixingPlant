@@ -24,6 +24,7 @@ from env.mixing_plant_scene import (
     TASK_FAMILIES as SCENE_TASK_FAMILIES,
     normalize_family_schedule,
 )
+from env.vehicle import ArticulatedState
 from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
 from planning.passenger_hybrid_astar import PassengerHybridAStar
 from train.curriculum import CurriculumStageSelector, MultiStageScenePool
@@ -50,11 +51,7 @@ def _task_family(reset_info, scene_metadata):
     mode = str(reset_info.get("goal_orientation_mode", ""))
     if mode == "head_in":
         return "head_in"
-    if mode != "parallel":
-        raise ValueError("unsupported goal orientation mode: {}".format(mode))
-    if bool(scene_metadata.get("parallel_reverse", False)):
-        return "parallel_rev"
-    return "parallel_fwd"
+    raise ValueError("unsupported goal orientation mode: {}".format(mode))
 
 
 def _parse_family_schedule(value):
@@ -101,7 +98,7 @@ def _write_jsonl(path, record):
 
 def _rs_metrics_by_mode(infos):
     grouped = {}
-    for mode in ("head_in", "parallel"):
+    for mode in ("head_in",):
         selected = [
             item
             for item in infos
@@ -128,6 +125,91 @@ def _rs_metrics_by_mode(infos):
             ),
         }
     return grouped
+
+
+def _copy_articulated_state(state):
+    return ArticulatedState(
+        x_front=float(state.x_front),
+        y_front=float(state.y_front),
+        theta_front=float(state.theta_front),
+        theta_rear=float(state.theta_rear),
+        v=0.0,
+        phi_dot=0.0,
+    )
+
+
+class HardCaseReplayBuffer:
+    def __init__(self, capacity, tail_steps, replay_ratio, rng):
+        self.capacity = max(0, int(capacity))
+        self.tail_steps = max(1, int(tail_steps))
+        self.replay_ratio = float(np.clip(replay_ratio, 0.0, 1.0))
+        self.rng = rng
+        self._entries = []
+        self._next_index = 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    def _append(self, entry):
+        if self.capacity <= 0:
+            return
+        if len(self._entries) < self.capacity:
+            self._entries.append(entry)
+            return
+        self._entries[self._next_index] = entry
+        self._next_index = (self._next_index + 1) % self.capacity
+
+    def record_failure(
+        self,
+        scene,
+        slot,
+        tail_states,
+        final_info,
+        reset_info,
+        stage,
+        episode_index,
+    ):
+        if self.capacity <= 0:
+            return 0
+        if bool(final_info.get("success", False)):
+            return 0
+        if bool(final_info.get("rs_latched", False)):
+            return 0
+        collision = bool(final_info.get("collision", False))
+        timeout = bool(final_info.get("timeout", False))
+        if not (collision or timeout):
+            return 0
+        selected_states = list(tail_states)[-self.tail_steps:]
+        if not selected_states:
+            return 0
+        failure_type = "collision" if collision else "timeout"
+        count = 0
+        for state in selected_states:
+            self._append(
+                {
+                    "scene": scene,
+                    "slot": slot,
+                    "state": _copy_articulated_state(state),
+                    "stage": int(stage),
+                    "episode": int(episode_index),
+                    "scene_seed": int(reset_info.get("scene_seed", -1)),
+                    "scenario_type": str(reset_info.get("scenario_type", "")),
+                    "task_family": str(reset_info.get("task_family", "")),
+                    "failure_type": failure_type,
+                }
+            )
+            count += 1
+        return count
+
+    def sample(self):
+        if not self._entries:
+            return None
+        if self.replay_ratio <= 0.0:
+            return None
+        if float(self.rng.random()) >= self.replay_ratio:
+            return None
+        index = int(self.rng.integers(0, len(self._entries)))
+        return self._entries[index]
 
 
 def _resolve_output_dir(output_dir, seed, timestamp=None):
@@ -204,12 +286,6 @@ def _build_update_record(
     family_success = _success_by_family(completed)
     no_guide_success = _eval_mode_success_mean(latest_evaluation, "no_guide")
     guided_success = _eval_mode_success_mean(latest_evaluation, "guided")
-    parallel_rev_no_guide = _eval_family_value(
-        latest_evaluation,
-        "no_guide",
-        "deterministic",
-        "parallel_rev",
-    )
     return {
         "global_step": global_step,
         "episode": episode_index,
@@ -218,11 +294,7 @@ def _build_update_record(
         "steps_per_second": global_step / max(time.perf_counter() - start_time, 1e-6),
         **update_stats,
         "success/head_in": family_success["head_in"],
-        "success/parallel_fwd": family_success["parallel_fwd"],
-        "success/parallel_rev": family_success["parallel_rev"],
         "episodes/head_in": family_success["head_in_count"],
-        "episodes/parallel_fwd": family_success["parallel_fwd_count"],
-        "episodes/parallel_rev": family_success["parallel_rev_count"],
         "global_log_std": np.asarray(global_log_std, dtype=np.float32).tolist(),
         "pre_tanh_abs_mean": float(np.mean(np.abs(pre_tanh_actions))),
         "raw_action_saturation_rate": float(
@@ -241,6 +313,17 @@ def _build_update_record(
             latest_evaluation.get("stochastic", {})
         ),
         "weighted_score": float(latest_evaluation.get("weighted_score", 0.0)),
+        "checkpoint_selection_score": float(
+            latest_evaluation.get("checkpoint_selection_score", 0.0)
+        ),
+        "stage3_no_latch_success": float(
+            latest_evaluation.get("stage3_no_latch_success", 0.0)
+        ),
+        "stage4_recovery_success": float(
+            latest_evaluation.get("stage4_recovery_success", 0.0)
+        ),
+        "eval_collision_rate": float(latest_evaluation.get("collision_rate", 0.0)),
+        "eval_timeout_rate": float(latest_evaluation.get("timeout_rate", 0.0)),
         "raw_action_mean": raw_actions.mean(axis=0).tolist(),
         "raw_action_std": raw_actions.std(axis=0).tolist(),
         "executed_action_mean": executed_actions.mean(axis=0).tolist(),
@@ -275,7 +358,6 @@ def _build_update_record(
         "guided_success_rate": guided_success,
         "no_guide_success_rate": no_guide_success,
         "success_gap_guided_minus_noguide": guided_success - no_guide_success,
-        "parallel_rev_no_guide_success": parallel_rev_no_guide,
         "collision_rate": _safe_mean(
             [float(item["collision"]) for item in completed]
         ),
@@ -438,12 +520,6 @@ def _build_update_record(
                 for item in completed
             ]
         ),
-        "reverse_entry_episode_rate": _safe_mean(
-            [
-                float(str(item.get("task_family", "")) == "parallel_rev")
-                for item in completed
-            ]
-        ),
     }
 
 
@@ -480,8 +556,6 @@ def _write_tensorboard_update(writer, record):
 def _weighted_checkpoint_score(success_by_family, ppo_config):
     weights = {
         "head_in": float(ppo_config.checkpoint_score_weight_head_in),
-        "parallel_fwd": float(ppo_config.checkpoint_score_weight_parallel_fwd),
-        "parallel_rev": float(ppo_config.checkpoint_score_weight_parallel_rev),
     }
     denominator = sum(weights.values())
     if denominator <= 0.0:
@@ -493,6 +567,93 @@ def _weighted_checkpoint_score(success_by_family, ppo_config):
         )
         / denominator
     )
+
+
+def _summarize_eval_outcomes(outcomes):
+    outcomes = list(outcomes)
+    no_latch = [
+        item for item in outcomes if not bool(item.get("rs_latched", False))
+    ]
+    scenario_success = {}
+    scenario_counts = {}
+    for scenario in sorted(set(str(item.get("scenario_type", "")) for item in outcomes)):
+        selected = [
+            item
+            for item in outcomes
+            if str(item.get("scenario_type", "")) == scenario
+        ]
+        if not selected:
+            continue
+        scenario_success[scenario] = _safe_mean(
+            [float(item.get("success", False)) for item in selected]
+        )
+        scenario_counts[scenario] = len(selected)
+    return {
+        "episode_count": len(outcomes),
+        "success_rate": _safe_mean(
+            [float(item.get("success", False)) for item in outcomes]
+        ),
+        "collision_rate": _safe_mean(
+            [float(item.get("collision", False)) for item in outcomes]
+        ),
+        "timeout_rate": _safe_mean(
+            [float(item.get("timeout", False)) for item in outcomes]
+        ),
+        "rs_latched_rate": _safe_mean(
+            [float(item.get("rs_latched", False)) for item in outcomes]
+        ),
+        "no_latch_count": len(no_latch),
+        "no_latch_success_rate": _safe_mean(
+            [float(item.get("success", False)) for item in no_latch]
+        ),
+        "scenario_success": scenario_success,
+        "scenario_counts": scenario_counts,
+    }
+
+
+def _aggregate_success_by_family(stage_results, policy_mode):
+    aggregate = {}
+    for family in TASK_FAMILIES:
+        aggregate[family] = _safe_mean(
+            [
+                float(result.get(policy_mode, {}).get(family, 0.0))
+                for result in stage_results.values()
+            ]
+        )
+    return aggregate
+
+
+def _aggregate_eval_summaries(stage_results, policy_mode):
+    summary_key = "{}_summary".format(policy_mode)
+    summaries = [
+        result.get(summary_key, {})
+        for result in stage_results.values()
+        if isinstance(result.get(summary_key, {}), dict)
+    ]
+    return {
+        "episode_count": int(sum(int(item.get("episode_count", 0)) for item in summaries)),
+        "success_rate": _safe_mean(
+            [float(item.get("success_rate", 0.0)) for item in summaries]
+        ),
+        "collision_rate": _safe_mean(
+            [float(item.get("collision_rate", 0.0)) for item in summaries]
+        ),
+        "timeout_rate": _safe_mean(
+            [float(item.get("timeout_rate", 0.0)) for item in summaries]
+        ),
+        "rs_latched_rate": _safe_mean(
+            [float(item.get("rs_latched_rate", 0.0)) for item in summaries]
+        ),
+        "no_latch_success_rate": _safe_mean(
+            [float(item.get("no_latch_success_rate", 0.0)) for item in summaries]
+        ),
+    }
+
+
+def _checkpoint_selection_score(evaluation):
+    stage3 = float(evaluation.get("stage3_no_latch_success", 0.0))
+    stage4 = float(evaluation.get("stage4_recovery_success", 0.0))
+    return min(stage3, stage4)
 
 
 def _evaluate_policy_by_family(
@@ -535,7 +696,6 @@ def _evaluate_policy_by_family(
             use_hybrid_astar=False,
             rs_potential_enabled=False,
             scene_family_schedule=TASK_FAMILIES,
-            parallel_rev_curriculum_episodes=0,
             enable_hope_teacher=enable_teacher,
             use_teacher_reward=use_teacher_reward,
             enable_offpath_reset=False,
@@ -550,11 +710,14 @@ def _evaluate_policy_by_family(
                 config=eval_config,
                 seed=base_seed,
             )
-            successes = dict((family, []) for family in TASK_FAMILIES)
-            while min(len(values) for values in successes.values()) < episodes_per_family:
+            outcomes_by_family = dict((family, []) for family in TASK_FAMILIES)
+            while (
+                min(len(values) for values in outcomes_by_family.values())
+                < episodes_per_family
+            ):
                 observation, reset_info = env.reset()
                 family = _task_family(reset_info, env.scene.metadata)
-                if len(successes[family]) >= episodes_per_family:
+                if len(outcomes_by_family[family]) >= episodes_per_family:
                     continue
                 done = False
                 final_info = None
@@ -567,11 +730,34 @@ def _evaluate_policy_by_family(
                         raw_action
                     )
                     done = terminated or truncated
-                successes[family].append(float(final_info["success"]))
+                outcomes_by_family[family].append(
+                    {
+                        "success": bool(final_info["success"]),
+                        "collision": bool(final_info["collision"]),
+                        "timeout": bool(final_info["timeout"]),
+                        "rs_latched": bool(final_info.get("rs_latched", False)),
+                        "scenario_type": str(reset_info.get("scenario_type", "")),
+                        "task_family": family,
+                    }
+                )
             mode = "deterministic" if deterministic else "stochastic"
             mode_results[mode] = dict(
-                (family, _safe_mean(successes[family]))
+                (
+                    family,
+                    _safe_mean(
+                        [
+                            float(item.get("success", False))
+                            for item in outcomes_by_family[family]
+                        ]
+                    ),
+                )
                 for family in TASK_FAMILIES
+            )
+            all_outcomes = []
+            for family in TASK_FAMILIES:
+                all_outcomes.extend(outcomes_by_family[family])
+            mode_results["{}_summary".format(mode)] = _summarize_eval_outcomes(
+                all_outcomes
             )
         return mode_results
 
@@ -595,16 +781,126 @@ def _evaluate_policy_by_family(
     results["success_gap_guided_minus_noguide"] = (
         results["guided_success_rate"] - results["no_guide_success_rate"]
     )
-    results["parallel_rev_no_guide_success"] = _eval_family_value(
-        results,
-        "no_guide",
-        "deterministic",
-        "parallel_rev",
-    )
+    deterministic_summary = results.get("deterministic_summary", {})
+    results["collision_rate"] = float(deterministic_summary.get("collision_rate", 0.0))
+    results["timeout_rate"] = float(deterministic_summary.get("timeout_rate", 0.0))
     results["stage"] = int(stage)
     results["episodes_per_family"] = episodes_per_family
     results["eval_modes"] = list(eval_modes)
     return results
+
+
+def _evaluate_policy_across_stages(
+    agent,
+    env_config,
+    stages,
+    seed,
+    episodes_per_family,
+    eval_modes=("no_guide",),
+):
+    stage_results = {}
+    for stage in stages:
+        result = _evaluate_policy_by_family(
+            agent=agent,
+            env_config=env_config,
+            stage=int(stage),
+            seed=int(seed) + 10_000 * int(stage),
+            episodes_per_family=episodes_per_family,
+            eval_modes=eval_modes,
+        )
+        stage_results[str(int(stage))] = result
+
+    primary_mode = "no_guide" if "no_guide" in eval_modes else tuple(eval_modes)[0]
+    primary_stage_results = {}
+    for stage_key, result in stage_results.items():
+        primary_stage_results[stage_key] = result
+
+    aggregate = {
+        "stages": stage_results,
+        "eval_stages": [int(stage) for stage in stages],
+        "episodes_per_family": int(episodes_per_family),
+        "eval_modes": list(eval_modes),
+        "deterministic": _aggregate_success_by_family(
+            primary_stage_results,
+            "deterministic",
+        ),
+        "stochastic": _aggregate_success_by_family(
+            primary_stage_results,
+            "stochastic",
+        ),
+        "deterministic_summary": _aggregate_eval_summaries(
+            primary_stage_results,
+            "deterministic",
+        ),
+        "stochastic_summary": _aggregate_eval_summaries(
+            primary_stage_results,
+            "stochastic",
+        ),
+    }
+    aggregate[primary_mode] = {
+        "deterministic": dict(aggregate["deterministic"]),
+        "stochastic": dict(aggregate["stochastic"]),
+        "deterministic_summary": dict(aggregate["deterministic_summary"]),
+        "stochastic_summary": dict(aggregate["stochastic_summary"]),
+    }
+    for eval_mode in eval_modes:
+        if eval_mode == primary_mode:
+            continue
+        aggregate[eval_mode] = {
+            "deterministic": _aggregate_success_by_family(
+                {
+                    stage: result[eval_mode]
+                    if eval_mode in result
+                    else result
+                    for stage, result in stage_results.items()
+                },
+                "deterministic",
+            ),
+            "stochastic": _aggregate_success_by_family(
+                {
+                    stage: result[eval_mode]
+                    if eval_mode in result
+                    else result
+                    for stage, result in stage_results.items()
+                },
+                "stochastic",
+            ),
+        }
+
+    stage3 = stage_results.get("3", {})
+    stage4 = stage_results.get("4", {})
+    stage3_summary = stage3.get("deterministic_summary", {})
+    stage4_summary = stage4.get("deterministic_summary", {})
+    stage4_scenario_success = stage4_summary.get("scenario_success", {})
+    aggregate["stage3_success"] = float(stage3_summary.get("success_rate", 0.0))
+    aggregate["stage4_success"] = float(stage4_summary.get("success_rate", 0.0))
+    aggregate["stage3_no_latch_success"] = float(
+        stage3_summary.get("no_latch_success_rate", 0.0)
+    )
+    aggregate["stage4_recovery_success"] = float(
+        stage4_scenario_success.get(
+            "recovery",
+            stage4_summary.get("success_rate", 0.0),
+        )
+    )
+    aggregate["collision_rate"] = float(
+        aggregate["deterministic_summary"].get("collision_rate", 0.0)
+    )
+    aggregate["timeout_rate"] = float(
+        aggregate["deterministic_summary"].get("timeout_rate", 0.0)
+    )
+    aggregate["family_weighted_score"] = _weighted_checkpoint_score(
+        aggregate["deterministic"],
+        agent.config,
+    )
+    aggregate["checkpoint_selection_score"] = _checkpoint_selection_score(aggregate)
+    aggregate["weighted_score"] = float(aggregate["checkpoint_selection_score"])
+    aggregate["guided_success_rate"] = _eval_mode_success_mean(aggregate, "guided")
+    aggregate["no_guide_success_rate"] = _eval_mode_success_mean(aggregate, "no_guide")
+    aggregate["success_gap_guided_minus_noguide"] = (
+        aggregate["guided_success_rate"] - aggregate["no_guide_success_rate"]
+    )
+    return aggregate
 
 
 def _save_best_checkpoints(
@@ -616,7 +912,18 @@ def _save_best_checkpoints(
 ):
     metrics = dict(evaluation["deterministic"])
     metrics["weighted_score"] = float(evaluation["weighted_score"])
+    metrics["checkpoint_selection_score"] = float(
+        evaluation.get("checkpoint_selection_score", evaluation["weighted_score"])
+    )
+    metrics["stage3_no_latch_success"] = float(
+        evaluation.get("stage3_no_latch_success", 0.0)
+    )
+    metrics["stage4_recovery_success"] = float(
+        evaluation.get("stage4_recovery_success", 0.0)
+    )
     for name, score in metrics.items():
+        if name not in best_scores:
+            best_scores[name] = -float("inf")
         if float(score) <= float(best_scores[name]):
             continue
         best_scores[name] = float(score)
@@ -661,26 +968,10 @@ def train(args):
         raise ValueError("--max-grad-norm must be positive")
     policy_weights = (
         args.policy_loss_weight_head_in,
-        args.policy_loss_weight_parallel_fwd,
-        args.policy_loss_weight_parallel_rev,
     )
     if any(float(weight) < 0.0 for weight in policy_weights):
         raise ValueError("policy loss weights must be non-negative")
     family_schedule = _parse_family_schedule(args.scene_family_schedule)
-    if args.parallel_rev_curriculum_episodes < 0:
-        raise ValueError("--parallel-rev-curriculum-episodes must be non-negative")
-    if args.parallel_rev_warmup_distance_min <= 0.0:
-        raise ValueError("--parallel-rev-warmup-distance-min must be positive")
-    if args.parallel_rev_warmup_distance_max < args.parallel_rev_warmup_distance_min:
-        raise ValueError(
-            "--parallel-rev-warmup-distance-max must be >= --parallel-rev-warmup-distance-min"
-        )
-    if args.parallel_rev_warmup_lateral < 0.0:
-        raise ValueError("--parallel-rev-warmup-lateral must be non-negative")
-    if args.parallel_rev_warmup_heading_deg < 0.0:
-        raise ValueError("--parallel-rev-warmup-heading-deg must be non-negative")
-    if args.parallel_rev_warmup_phi_deg < 0.0:
-        raise ValueError("--parallel-rev-warmup-phi-deg must be non-negative")
     if args.guide_anneal_end_episode < args.guide_anneal_start_episode:
         raise ValueError("--guide-anneal-end-episode must be >= start episode")
     if not 0.0 <= args.guide_dropout_initial <= 1.0:
@@ -693,6 +984,20 @@ def train(args):
         raise ValueError("--teacher-reward-clip must be positive")
     if args.no_guide_eval_interval < 0:
         raise ValueError("--no-guide-eval-interval must be non-negative")
+    if not 0.0 <= args.hard_case_replay_ratio <= 1.0:
+        raise ValueError("--hard-case-replay-ratio must be inside [0, 1]")
+    if args.hard_case_replay_capacity < 0:
+        raise ValueError("--hard-case-replay-capacity must be non-negative")
+    if args.hard_case_replay_tail_steps <= 0:
+        raise ValueError("--hard-case-replay-tail-steps must be positive")
+    if args.hard_case_replay_attempts <= 0:
+        raise ValueError("--hard-case-replay-attempts must be positive")
+    if args.hard_case_replay_xy_std < 0.0:
+        raise ValueError("--hard-case-replay-xy-std must be non-negative")
+    if args.hard_case_replay_heading_std_deg < 0.0:
+        raise ValueError("--hard-case-replay-heading-std-deg must be non-negative")
+    if args.hard_case_replay_phi_std_deg < 0.0:
+        raise ValueError("--hard-case-replay-phi-std-deg must be non-negative")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env_config = replace(
@@ -703,14 +1008,6 @@ def train(args):
         rs_potential_enabled=not bool(
             getattr(args, "disable_rs_potential", False)
         ),
-        parallel_rev_curriculum_episodes=args.parallel_rev_curriculum_episodes,
-        parallel_rev_warmup_distance_range=(
-            args.parallel_rev_warmup_distance_min,
-            args.parallel_rev_warmup_distance_max,
-        ),
-        parallel_rev_warmup_lateral_range=args.parallel_rev_warmup_lateral,
-        parallel_rev_warmup_heading_range_deg=args.parallel_rev_warmup_heading_deg,
-        parallel_rev_warmup_phi_range_deg=args.parallel_rev_warmup_phi_deg,
         enable_hope_teacher=bool(args.enable_hope_teacher),
         hope_code_dir=args.hope_code_dir,
         hope_weight_path=args.hope_weight_path,
@@ -731,6 +1028,14 @@ def train(args):
         enable_offpath_reset=bool(args.enable_offpath_reset),
         enable_failure_aggregation=bool(args.enable_failure_aggregation),
         no_guide_eval_interval=args.no_guide_eval_interval,
+        hard_case_replay_enabled=not bool(args.disable_hard_case_replay),
+        hard_case_replay_ratio=args.hard_case_replay_ratio,
+        hard_case_replay_capacity=args.hard_case_replay_capacity,
+        hard_case_replay_tail_steps=args.hard_case_replay_tail_steps,
+        hard_case_replay_attempts=args.hard_case_replay_attempts,
+        hard_case_replay_xy_std=args.hard_case_replay_xy_std,
+        hard_case_replay_heading_std_deg=args.hard_case_replay_heading_std_deg,
+        hard_case_replay_phi_std_deg=args.hard_case_replay_phi_std_deg,
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -747,11 +1052,7 @@ def train(args):
         log_std_min=args.log_std_min,
         log_std_max=args.log_std_max,
         policy_loss_weight_head_in=args.policy_loss_weight_head_in,
-        policy_loss_weight_parallel_fwd=args.policy_loss_weight_parallel_fwd,
-        policy_loss_weight_parallel_rev=args.policy_loss_weight_parallel_rev,
         checkpoint_score_weight_head_in=args.checkpoint_score_weight_head_in,
-        checkpoint_score_weight_parallel_fwd=args.checkpoint_score_weight_parallel_fwd,
-        checkpoint_score_weight_parallel_rev=args.checkpoint_score_weight_parallel_rev,
     )
     output_dir = _resolve_output_dir(args.output_dir, args.seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -817,6 +1118,19 @@ def train(args):
     latest_evaluation = {}
     best_scores = dict((name, -float("inf")) for name in TASK_FAMILIES)
     best_scores["weighted_score"] = -float("inf")
+    best_scores["checkpoint_selection_score"] = -float("inf")
+    best_scores["stage3_no_latch_success"] = -float("inf")
+    best_scores["stage4_recovery_success"] = -float("inf")
+    hard_case_replay = HardCaseReplayBuffer(
+        capacity=env_config.hard_case_replay_capacity
+        if bool(env_config.hard_case_replay_enabled)
+        else 0,
+        tail_steps=env_config.hard_case_replay_tail_steps,
+        replay_ratio=env_config.hard_case_replay_ratio
+        if bool(env_config.hard_case_replay_enabled)
+        else 0.0,
+        rng=np.random.default_rng(int(args.seed) + 97_531),
+    )
     start_time = time.perf_counter()
 
     while episode_index < args.total_episodes:
@@ -835,6 +1149,7 @@ def train(args):
         previous_motion_gear = None
         final_info = None
         done = False
+        episode_tail_states = []
         task_family = _task_family(reset_info, env.scene.metadata)
         while not done:
             raw_action, pre_tanh_action, log_prob, value = agent.act_with_pre_tanh(
@@ -870,6 +1185,9 @@ def train(args):
             episode_steps += 1
             episode_reward += float(reward)
             final_info = info
+            episode_tail_states.append(_copy_articulated_state(env.state))
+            if len(episode_tail_states) > env_config.hard_case_replay_tail_steps:
+                episode_tail_states.pop(0)
             last_done = done
 
         episode_index += 1
@@ -877,6 +1195,15 @@ def train(args):
         final_info["task_family"] = task_family
         final_info["gear_switch_count"] = int(episode_gear_switch_count)
         rollout_completed.append(final_info)
+        hard_case_recorded_count = hard_case_replay.record_failure(
+            scene=env.scene,
+            slot=env.slot,
+            tail_states=episode_tail_states,
+            final_info=final_info,
+            reset_info=reset_info,
+            stage=actual_stage,
+            episode_index=episode_index,
+        )
         episode_record = {
             "episode": episode_index,
             "global_step": global_step,
@@ -895,10 +1222,27 @@ def train(args):
             "task_family": task_family,
             "clearance_bucket": str(reset_info.get("clearance_bucket", "")),
             "approach_side_bucket": str(reset_info.get("approach_side_bucket", "")),
-            "reverse_required_bucket": str(
-                reset_info.get("reverse_required_bucket", "")
+            "scene_complexity_bucket": str(
+                reset_info.get("scene_complexity_bucket", "")
             ),
             "difficulty_label": str(reset_info.get("difficulty_label", "")),
+            "hard_case_replay_attempted": bool(
+                reset_info.get("hard_case_replay_attempted", False)
+            ),
+            "hard_case_replay_used": bool(
+                reset_info.get("hard_case_replay_used", False)
+            ),
+            "hard_case_replay_source_episode": int(
+                reset_info.get("hard_case_replay_source_episode", -1)
+            ),
+            "hard_case_replay_source_stage": int(
+                reset_info.get("hard_case_replay_source_stage", -1)
+            ),
+            "hard_case_replay_source_failure": str(
+                reset_info.get("hard_case_replay_source_failure", "")
+            ),
+            "hard_case_replay_recorded_count": int(hard_case_recorded_count),
+            "hard_case_replay_buffer_size": int(len(hard_case_replay)),
             "nominal_target_collision": bool(
                 reset_info.get("nominal_target_collision", False)
             ),
@@ -907,6 +1251,15 @@ def train(args):
             ),
             "success_neighborhood_feasible_count": int(
                 reset_info.get("success_neighborhood_feasible_count", 0)
+            ),
+            "constructed_obstacle_feature_count": int(
+                reset_info.get("constructed_obstacle_feature_count", 0)
+            ),
+            "constructed_wall_feature_count": int(
+                reset_info.get("constructed_wall_feature_count", 0)
+            ),
+            "scene_generation_attempt_count": int(
+                reset_info.get("scene_generation_attempt_count", 1)
             ),
             "initial_distance_min": float(
                 reset_info.get("initial_distance_min", 0.0)
@@ -922,15 +1275,6 @@ def train(args):
             ),
             "initial_phi_range_deg": float(
                 reset_info.get("initial_phi_range_deg", 0.0)
-            ),
-            "parallel_rev_curriculum_progress": float(
-                reset_info.get("parallel_rev_curriculum_progress", 1.0)
-            ),
-            "parallel_rev_curriculum_sample_count": int(
-                reset_info.get("parallel_rev_curriculum_sample_count", 0)
-            ),
-            "parallel_rev_curriculum_sample_count_after": int(
-                reset_info.get("parallel_rev_curriculum_sample_count_after", 0)
             ),
             "reset_initial_mask_max": float(
                 reset_info.get("reset_initial_mask_max", 0.0)
@@ -1089,10 +1433,10 @@ def train(args):
             eval_modes = ("no_guide",)
             if bool(env_config.enable_hope_teacher):
                 eval_modes = ("guided", "no_guide")
-            latest_evaluation = _evaluate_policy_by_family(
+            latest_evaluation = _evaluate_policy_across_stages(
                 agent=agent,
                 env_config=env_config,
-                stage=args.stage,
+                stages=(1, 2, 3, 4),
                 seed=args.seed,
                 episodes_per_family=args.eval_episodes_per_family,
                 eval_modes=eval_modes,
@@ -1107,6 +1451,7 @@ def train(args):
                 "global_step": global_step,
                 "episode": episode_index,
                 "stage": args.stage,
+                "eval_stages": [1, 2, 3, 4],
             }
             _save_best_checkpoints(
                 agent=agent,
@@ -1117,11 +1462,17 @@ def train(args):
             )
             print(
                 "evaluation episode={episode} det={det} stochastic={stochastic} "
-                "weighted_score={score:.3f}".format(
+                "stage3_no_latch={stage3:.3f} stage4_recovery={stage4:.3f} "
+                "collision={collision:.3f} timeout={timeout:.3f} "
+                "checkpoint_score={score:.3f}".format(
                     episode=episode_index,
                     det=latest_evaluation["deterministic"],
                     stochastic=latest_evaluation["stochastic"],
-                    score=latest_evaluation["weighted_score"],
+                    stage3=latest_evaluation["stage3_no_latch_success"],
+                    stage4=latest_evaluation["stage4_recovery_success"],
+                    collision=latest_evaluation["collision_rate"],
+                    timeout=latest_evaluation["timeout_rate"],
+                    score=latest_evaluation["checkpoint_selection_score"],
                 )
             )
 
@@ -1184,7 +1535,13 @@ def train(args):
             env.set_active_stage(actual_stage)
 
         if episode_index < args.total_episodes:
-            observation, reset_info = env.reset()
+            replay_case = hard_case_replay.sample()
+            if replay_case is not None:
+                replay_stage = int(replay_case.get("stage", actual_stage))
+                if curriculum and replay_stage != int(actual_stage):
+                    actual_stage = replay_stage
+                    env.set_active_stage(actual_stage)
+            observation, reset_info = env.reset(replay_case=replay_case)
 
     agent.save(
         os.path.join(output_dir, "checkpoint_final.pt"),
@@ -1263,69 +1620,15 @@ def main():
         default=DEFAULT_PPO_CONFIG.policy_loss_weight_head_in,
     )
     parser.add_argument(
-        "--policy-loss-weight-parallel-fwd",
-        type=float,
-        default=DEFAULT_PPO_CONFIG.policy_loss_weight_parallel_fwd,
-    )
-    parser.add_argument(
-        "--policy-loss-weight-parallel-rev",
-        type=float,
-        default=DEFAULT_PPO_CONFIG.policy_loss_weight_parallel_rev,
-    )
-    parser.add_argument(
         "--checkpoint-score-weight-head-in",
         type=float,
         default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_head_in,
-    )
-    parser.add_argument(
-        "--checkpoint-score-weight-parallel-fwd",
-        type=float,
-        default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_parallel_fwd,
-    )
-    parser.add_argument(
-        "--checkpoint-score-weight-parallel-rev",
-        type=float,
-        default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_parallel_rev,
     )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument(
         "--scene-family-schedule",
         default=",".join(DEFAULT_ENV_CONFIG.scene_family_schedule),
-        help=(
-            "Comma-separated family schedule for cached scenes; repeat a family "
-            "to oversample it, e.g. head_in,parallel_fwd,parallel_rev,parallel_rev"
-        ),
-    )
-    parser.add_argument(
-        "--parallel-rev-curriculum-episodes",
-        type=int,
-        default=DEFAULT_ENV_CONFIG.parallel_rev_curriculum_episodes,
-        help="Episodes over which stage-1 parallel_rev starts expand to full ranges",
-    )
-    parser.add_argument(
-        "--parallel-rev-warmup-distance-min",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_distance_range[0],
-    )
-    parser.add_argument(
-        "--parallel-rev-warmup-distance-max",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_distance_range[1],
-    )
-    parser.add_argument(
-        "--parallel-rev-warmup-lateral",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_lateral_range,
-    )
-    parser.add_argument(
-        "--parallel-rev-warmup-heading-deg",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_heading_range_deg,
-    )
-    parser.add_argument(
-        "--parallel-rev-warmup-phi-deg",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.parallel_rev_warmup_phi_range_deg,
+        help="Comma-separated family schedule for cached scenes; currently only head_in",
     )
     parser.add_argument("--use-hybrid-astar", action="store_true")
     parser.add_argument(
@@ -1433,6 +1736,48 @@ def main():
         type=int,
         default=DEFAULT_ENV_CONFIG.no_guide_eval_interval,
         help="Optional extra no-guide evaluation interval; 0 disables the extra trigger",
+    )
+    parser.add_argument(
+        "--disable-hard-case-replay",
+        action="store_true",
+        help="Disable automatic replay resets from no-RS collision/timeout failures",
+    )
+    parser.add_argument(
+        "--hard-case-replay-ratio",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_ratio,
+        help="Probability of sampling a reset from the hard-case replay buffer",
+    )
+    parser.add_argument(
+        "--hard-case-replay-capacity",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_capacity,
+    )
+    parser.add_argument(
+        "--hard-case-replay-tail-steps",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_tail_steps,
+        help="Number of terminal tail states recorded from each eligible failure",
+    )
+    parser.add_argument(
+        "--hard-case-replay-attempts",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_attempts,
+    )
+    parser.add_argument(
+        "--hard-case-replay-xy-std",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_xy_std,
+    )
+    parser.add_argument(
+        "--hard-case-replay-heading-std-deg",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_heading_std_deg,
+    )
+    parser.add_argument(
+        "--hard-case-replay-phi-std-deg",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.hard_case_replay_phi_std_deg,
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)

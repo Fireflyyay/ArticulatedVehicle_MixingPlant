@@ -13,7 +13,7 @@ from env.geometry import DirectedParkingSlot, overlap_ratio, wrap_to_pi
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
 
 
-TASK_FAMILIES = ("head_in", "parallel_fwd", "parallel_rev")
+TASK_FAMILIES = ("head_in",)
 _TASK_FAMILY_TO_INDEX = dict((family, index) for index, family in enumerate(TASK_FAMILIES))
 
 
@@ -58,13 +58,12 @@ class _SceneLayout:
     corridor_heading: float
     corridor_origin: Tuple[float, float]
     task_family: str
-    target_mode: str
     target_side: float
     target_along: float
-    parallel_reverse: bool
     first_branch_along: float
     second_branch_along: float
     branch_bay_along: float
+    obstacle_variant: int
 
 
 def _quantize(value, resolution):
@@ -98,12 +97,8 @@ def normalize_family_schedule(family_schedule):
 
 
 def family_to_goal_mode(task_family):
-    task_family = normalize_task_family(task_family)
-    if task_family == "head_in":
-        return "head_in", False
-    if task_family == "parallel_fwd":
-        return "parallel", False
-    return "parallel", True
+    normalize_task_family(task_family)
+    return "head_in"
 
 
 def derive_scene_seed(base_seed, pool_index, task_family, stage):
@@ -133,7 +128,6 @@ def _sample_layout(seed, scene_config, task_family):
     """Map every seed to a reproducible constructive layout."""
     seed = int(seed)
     task_family = normalize_task_family(task_family)
-    target_mode, parallel_reverse = family_to_goal_mode(task_family)
     rng = np.random.default_rng(np.random.SeedSequence(seed & 0xFFFFFFFF))
     resolution = float(scene_config.resolution)
     corridor_heading = float(rng.choice((0.0, 0.5 * math.pi)))
@@ -178,13 +172,12 @@ def _sample_layout(seed, scene_config, task_family):
         corridor_heading=float(corridor_heading),
         corridor_origin=(float(origin[0]), float(origin[1])),
         task_family=task_family,
-        target_mode=target_mode,
         target_side=target_side,
         target_along=target_along,
-        parallel_reverse=bool(parallel_reverse),
         first_branch_along=float(branch_positions[0]),
         second_branch_along=float(branch_positions[1]),
         branch_bay_along=sample_range(scene_config.branch_bay_along_range),
+        obstacle_variant=int(rng.integers(0, 8)),
     )
 
 
@@ -206,6 +199,16 @@ def _carve_world_polygon(occupancy, polygon, world_min, resolution):
         (x1 - world_min) / resolution,
         (y1 - world_min) / resolution,
     )
+
+
+def _occupy_world_polygon(occupancy, polygon, world_min, resolution):
+    x0, y0, x1, y1 = polygon.bounds
+    height, width = occupancy.shape
+    xa = max(0, min(width, int(math.floor((x0 - world_min) / resolution))))
+    xb = max(0, min(width, int(math.ceil((x1 - world_min) / resolution))))
+    ya = max(0, min(height, int(math.floor((y0 - world_min) / resolution))))
+    yb = max(0, min(height, int(math.ceil((y1 - world_min) / resolution))))
+    occupancy[ya:yb, xa:xb] = 1
 
 
 def _merge_occupied_cells(occupancy, origin, resolution):
@@ -277,16 +280,12 @@ def _build_bay(
     mode,
     scene_config,
     is_target=False,
-    parallel_reverse=False,
 ):
     axis, normal = _cardinal_frame(corridor_heading)
     side = 1.0 if float(side) >= 0.0 else -1.0
     if mode == "head_in":
         along_length = float(scene_config.head_in_bay_width)
         depth = float(scene_config.head_in_bay_depth)
-    elif mode == "parallel":
-        along_length = float(scene_config.parallel_bay_length)
-        depth = float(scene_config.parallel_bay_depth)
     else:
         raise ValueError("unknown parking-bay mode '{}'".format(mode))
 
@@ -305,12 +304,7 @@ def _build_bay(
     mouth_b = np.asarray(corridor_origin) + axis * u1 + normal * edge_n
     inward_heading = math.atan2(side * normal[1], side * normal[0])
 
-    if mode == "head_in":
-        goal_heading = inward_heading
-    else:
-        goal_heading = wrap_to_pi(
-            float(corridor_heading) + (math.pi if parallel_reverse else 0.0)
-        )
+    goal_heading = inward_heading
     return ParkingBay(
         name=str(name),
         polygon=polygon,
@@ -424,17 +418,16 @@ def _target_feasibility_audit(target_bay, slot, obstacle_union, prepared_obstacl
 def _difficulty_metadata(layout, target_bay, audit):
     clearance_bucket = _bucket_clearance(audit["nominal_target_clearance_m"])
     approach_side_bucket = "left_bay" if float(layout.target_side) > 0.0 else "right_bay"
-    reverse_required_bucket = (
-        "required" if layout.task_family == "parallel_rev" else "not_required"
-    )
     return {
         "clearance_bucket": clearance_bucket,
         "approach_side_bucket": approach_side_bucket,
-        "reverse_required_bucket": reverse_required_bucket,
+        "scene_complexity_bucket": _scene_complexity_bucket(
+            int(audit.get("constructed_obstacle_feature_count", 0)),
+        ),
         "difficulty_label": "{}|{}|{}".format(
             clearance_bucket,
             approach_side_bucket,
-            reverse_required_bucket,
+            "head_in",
         ),
         "bay_goal_alignment_deg": float(
             math.degrees(
@@ -442,6 +435,187 @@ def _difficulty_metadata(layout, target_bay, audit):
             )
         ),
     }
+
+
+def _scene_complexity_bucket(feature_count):
+    feature_count = int(feature_count)
+    if feature_count <= 2:
+        return "normal"
+    if feature_count <= 4:
+        return "complex"
+    return "extreme"
+
+
+def _wall_stub(origin, heading, along_center, side, length, depth, corridor_width):
+    side = 1.0 if float(side) >= 0.0 else -1.0
+    edge = side * 0.5 * float(corridor_width)
+    inner = edge - side * float(depth)
+    n0, n1 = sorted((edge, inner))
+    return _frame_polygon(
+        origin,
+        heading,
+        float(along_center) - 0.5 * float(length),
+        float(along_center) + 0.5 * float(length),
+        n0,
+        n1,
+    )
+
+
+def _equipment_block(origin, heading, along_center, lateral_center, length, width):
+    return _frame_polygon(
+        origin,
+        heading,
+        float(along_center) - 0.5 * float(length),
+        float(along_center) + 0.5 * float(length),
+        float(lateral_center) - 0.5 * float(width),
+        float(lateral_center) + 0.5 * float(width),
+    )
+
+
+def _target_approach_keepout(layout, corridor_heading, corridor_width, scene_config):
+    bay_half = 0.5 * float(scene_config.head_in_bay_width)
+    keepout_along = bay_half + float(scene_config.target_approach_keepout_along)
+    return _frame_polygon(
+        layout.corridor_origin,
+        corridor_heading,
+        float(layout.target_along) - keepout_along,
+        float(layout.target_along) + keepout_along,
+        -0.5 * float(corridor_width),
+        0.5 * float(corridor_width),
+    )
+
+
+def _constrained_obstacle_features(
+    stage,
+    layout,
+    corridor_polygons,
+    parking_bays,
+    branches,
+    corridor_heading,
+    corridor_width,
+    branch_width,
+    scene_config,
+):
+    """Build deterministic non-critical obstacles without random rejection loops."""
+    desired_by_stage = tuple(scene_config.noncritical_obstacle_count_by_stage)
+    desired = int(desired_by_stage[max(0, min(3, int(stage) - 1))])
+    free_space = unary_union(
+        list(corridor_polygons) + [bay.polygon for bay in parking_bays]
+    )
+    target_bay = parking_bays[0]
+    critical_keepout = unary_union(
+        [
+            target_bay.polygon.buffer(
+                float(scene_config.target_obstacle_keepout),
+                cap_style=2,
+                join_style=2,
+            ),
+            _target_approach_keepout(
+                layout,
+                corridor_heading,
+                corridor_width,
+                scene_config,
+            ),
+        ]
+    )
+    candidates = []
+    main_anchors = (-32.0, -24.0, -12.0, 12.0, 24.0, 32.0)
+    shift = (int(layout.obstacle_variant) % 3 - 1) * 1.0
+    for idx, along in enumerate(main_anchors):
+        side = -float(layout.target_side) if idx % 2 == 0 else float(layout.target_side)
+        wall = _wall_stub(
+            layout.corridor_origin,
+            corridor_heading,
+            along + shift,
+            side,
+            scene_config.wall_stub_length,
+            scene_config.wall_stub_depth,
+            corridor_width,
+        )
+        candidates.append(("wall_stub", wall))
+        lateral = 0.25 * float(corridor_width) * (-1.0 if idx % 2 == 0 else 1.0)
+        block = _equipment_block(
+            layout.corridor_origin,
+            corridor_heading,
+            along - shift,
+            lateral,
+            scene_config.equipment_obstacle_length,
+            scene_config.equipment_obstacle_width,
+        )
+        candidates.append(("equipment_island", block))
+
+    for branch_index, (branch_origin, branch_heading) in enumerate(branches):
+        branch_shift = shift if branch_index % 2 == 0 else -shift
+        for along, side in ((18.0 + branch_shift, -1.0), (-18.0 - branch_shift, 1.0)):
+            candidates.append(
+                (
+                    "branch_wall_stub",
+                    _wall_stub(
+                        branch_origin,
+                        branch_heading,
+                        along,
+                        side,
+                        scene_config.wall_stub_length,
+                        scene_config.wall_stub_depth,
+                        branch_width,
+                    ),
+                )
+            )
+        candidates.append(
+            (
+                "branch_equipment_island",
+                _equipment_block(
+                    branch_origin,
+                    branch_heading,
+                    8.0 + branch_shift,
+                    0.0,
+                    scene_config.equipment_obstacle_length,
+                    scene_config.equipment_obstacle_width,
+                ),
+            )
+        )
+
+    if int(stage) >= 4:
+        axis, normal = _cardinal_frame(corridor_heading)
+        yard_center = np.asarray(layout.corridor_origin) + axis * 2.0 - normal * 18.0
+        for offset in ((-4.0, -3.0), (4.0, 3.0), (0.0, 5.0)):
+            center = yard_center + axis * offset[0] + normal * offset[1]
+            candidates.append(
+                (
+                    "yard_equipment_island",
+                    box(
+                        center[0] - 1.5,
+                        center[1] - 1.0,
+                        center[0] + 1.5,
+                        center[1] + 1.0,
+                    ),
+                )
+            )
+
+    if candidates:
+        rotation = int(layout.obstacle_variant) % len(candidates)
+        candidates = candidates[rotation:] + candidates[:rotation]
+
+    selected = []
+    labels = []
+    for label, candidate in candidates:
+        if len(selected) >= desired:
+            break
+        if not free_space.covers(candidate):
+            continue
+        if candidate.intersects(critical_keepout):
+            continue
+        if any(candidate.intersects(bay.polygon.buffer(0.25)) for bay in parking_bays):
+            continue
+        if any(
+            candidate.distance(existing)
+            < float(scene_config.noncritical_obstacle_spacing)
+            for existing in selected
+        ):
+            continue
+        selected.append(candidate)
+        labels.append(label)
+    return selected, labels
 
 
 def _corridor_polygons(stage, layout, scene_config):
@@ -534,10 +708,9 @@ def generate_cached_mixing_plant_scene(
         corridor_width=corridor_width,
         along_center=layout.target_along,
         side=layout.target_side,
-        mode=layout.target_mode,
+        mode=family_to_goal_mode(task_family),
         scene_config=config,
         is_target=True,
-        parallel_reverse=layout.parallel_reverse,
     )
     parking_bays = [target_bay]
 
@@ -569,9 +742,8 @@ def generate_cached_mixing_plant_scene(
                 corridor_width=branch_width,
                 along_center=along_center,
                 side=-1.0,
-                mode="parallel",
+                mode="head_in",
                 scene_config=config,
-                parallel_reverse=not layout.parallel_reverse,
             )
             if all(
                 candidate.polygon.intersection(existing.polygon).area <= 1e-8
@@ -582,6 +754,20 @@ def generate_cached_mixing_plant_scene(
 
     for bay in parking_bays:
         _carve_world_polygon(occupancy, bay.polygon, world_min, resolution)
+
+    constructed_obstacles, constructed_labels = _constrained_obstacle_features(
+        stage=stage,
+        layout=layout,
+        corridor_polygons=corridor_polygons,
+        parking_bays=parking_bays,
+        branches=branches,
+        corridor_heading=corridor_heading,
+        corridor_width=corridor_width,
+        branch_width=branch_width,
+        scene_config=config,
+    )
+    for obstacle in constructed_obstacles:
+        _occupy_world_polygon(occupancy, obstacle, world_min, resolution)
 
     obstacle_polygons = _merge_occupied_cells(
         occupancy,
@@ -604,6 +790,10 @@ def generate_cached_mixing_plant_scene(
         obstacle_union=obstacle_union,
         prepared_obstacles=prepared_obstacles,
     )
+    audit["constructed_obstacle_feature_count"] = int(len(constructed_obstacles))
+    audit["constructed_wall_feature_count"] = int(
+        sum(1 for label in constructed_labels if "wall" in label)
+    )
     free_ratio = float(np.mean(occupancy == 0))
     metadata = {
         "scene_type": "cached_rule_carved_mixing_plant",
@@ -622,11 +812,12 @@ def generate_cached_mixing_plant_scene(
         "branch_width": float(branch_width),
         "target_bay_along": float(layout.target_along),
         "target_bay_side": float(layout.target_side),
-        "parallel_reverse": bool(layout.parallel_reverse),
         "parking_bay_count": len(parking_bays),
         "target_bay_name": target_bay.name,
         "goal_type": "parking_bay",
         "goal_orientation_mode": target_bay.goal_orientation_mode,
+        "obstacle_layout_variant": int(layout.obstacle_variant),
+        "constructed_obstacle_labels": tuple(constructed_labels),
         "bay_inward_heading": float(target_bay.inward_heading),
         "free_ratio": free_ratio,
         "obstacle_count": len(obstacle_polygons),
@@ -672,7 +863,7 @@ class CachedScenePool:
         self._scenes = []
         self._next_replacement_index = self.pool_size
         for index in range(self.pool_size):
-            self._scenes.append(self._generate_scene(index))
+            self._scenes.append(self._generate_scene_with_retries(index))
 
     def __len__(self):
         return len(self._scenes)
@@ -711,6 +902,29 @@ class CachedScenePool:
                 )
         return scene
 
+    def _generate_scene_with_retries(self, pool_index, task_family=None, max_attempts=8):
+        last_error = None
+        for attempt in range(max(1, int(max_attempts))):
+            if attempt == 0:
+                candidate_index = int(pool_index)
+            else:
+                candidate_index = self._next_replacement_index
+                self._next_replacement_index += 1
+            try:
+                scene = self._generate_scene(candidate_index, task_family=task_family)
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            scene.metadata["scene_generation_attempt_count"] = int(attempt + 1)
+            return scene
+        raise RuntimeError(
+            "failed to generate valid scene family {} after {} attempts: {}".format(
+                task_family,
+                max(1, int(max_attempts)),
+                last_error,
+            )
+        )
+
     def get(self, episode_index):
         return self._scenes[int(episode_index) % len(self._scenes)]
 
@@ -719,7 +933,7 @@ class CachedScenePool:
         if task_family is None:
             task_family = self._scenes[scene_slot].metadata.get("task_family")
         last_error = None
-        for _ in range(max(1, int(max_attempts))):
+        for attempt_index in range(1, max(1, int(max_attempts)) + 1):
             replacement_index = self._next_replacement_index
             self._next_replacement_index += 1
             try:
@@ -730,6 +944,7 @@ class CachedScenePool:
             except RuntimeError as exc:
                 last_error = exc
                 continue
+            scene.metadata["scene_generation_attempt_count"] = int(attempt_index)
             self._scenes[scene_slot] = scene
             return scene
         raise RuntimeError(

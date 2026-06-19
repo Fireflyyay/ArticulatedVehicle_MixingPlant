@@ -572,7 +572,7 @@ def main():
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=3)
     parser.add_argument(
         "--task-family",
-        choices=["head_in", "parallel_fwd", "parallel_rev"],
+        choices=["head_in"],
         default="head_in",
     )
     parser.add_argument("--checkpoint", required=True, help="Path to a PPO checkpoint .pt file")

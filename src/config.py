@@ -74,7 +74,7 @@ class ActionMaskConfig:
 
 @dataclass(frozen=True)
 class MixingPlantSceneConfig:
-    """Constructive corridor-and-bay scene geometry in meters."""
+    """Constructive corridor, wall, obstacle, and bay scene geometry in meters."""
 
     world_half_extent: float = 40.0
     resolution: float = 1.0
@@ -82,16 +82,14 @@ class MixingPlantSceneConfig:
     main_corridor_length: float = 72.0
     branch_corridor_length: float = 56.0
     corridor_width_by_stage: Tuple[float, float, float, float] = (
-        14.0,
-        12.0,
-        9.0,
-        11.0,
+        10.0,
+        8.0,
+        5.0,
+        5.0,
     )
     branch_width_ratio: float = 0.85
     head_in_bay_width: float = 8.0
     head_in_bay_depth: float = 10.0
-    parallel_bay_length: float = 12.0
-    parallel_bay_depth: float = 6.0
     parking_head_wall_clearance: float = 1.0
     main_origin_jitter: float = 2.0
     target_bay_along_range: Tuple[float, float] = (-18.0, 18.0)
@@ -99,6 +97,19 @@ class MixingPlantSceneConfig:
     target_branch_clearance: float = 17.0
     branch_to_branch_clearance: float = 11.0
     branch_bay_along_range: Tuple[float, float] = (-16.0, 16.0)
+    target_obstacle_keepout: float = 6.0
+    target_approach_keepout_along: float = 7.0
+    noncritical_obstacle_count_by_stage: Tuple[int, ...] = (
+        4,
+        5,
+        6,
+        7,
+    )
+    noncritical_obstacle_spacing: float = 2.0
+    wall_stub_length: float = 5.0
+    wall_stub_depth: float = 2.0
+    equipment_obstacle_length: float = 3.0
+    equipment_obstacle_width: float = 2.0
 
     def corridor_width(self, stage: int) -> float:
         index = max(0, min(3, int(stage) - 1))
@@ -116,8 +127,6 @@ class LocalParkingEnvConfig:
     scene_pool_size: int = 18
     scene_family_schedule: Tuple[str, ...] = (
         "head_in",
-        "parallel_fwd",
-        "parallel_rev",
     )
     use_hybrid_astar: bool = False
     initial_sampling_attempts: int = 128
@@ -140,11 +149,6 @@ class LocalParkingEnvConfig:
     recovery_min_abs_phi_deg: float = 18.0
     recovery_max_body_clearance: float = 0.80
     recovery_max_lidar_distance: float = 2.20
-    parallel_rev_curriculum_episodes: int = 2000
-    parallel_rev_warmup_distance_range: Tuple[float, float] = (4.0, 8.0)
-    parallel_rev_warmup_lateral_range: float = 1.25
-    parallel_rev_warmup_heading_range_deg: float = 20.0
-    parallel_rev_warmup_phi_range_deg: float = 8.0
 
     success_reward: float = 5.0
     failure_reward: float = -5.0
@@ -218,6 +222,16 @@ class LocalParkingEnvConfig:
     enable_failure_aggregation: bool = False
     no_guide_eval_interval: int = 0
 
+    # --- Training-only hard-case replay from actual failed rollouts ---
+    hard_case_replay_enabled: bool = True
+    hard_case_replay_ratio: float = 0.20
+    hard_case_replay_capacity: int = 4096
+    hard_case_replay_tail_steps: int = 12
+    hard_case_replay_attempts: int = 32
+    hard_case_replay_xy_std: float = 0.45
+    hard_case_replay_heading_std_deg: float = 6.0
+    hard_case_replay_phi_std_deg: float = 5.0
+
 
 @dataclass(frozen=True)
 class PPOConfig:
@@ -238,11 +252,7 @@ class PPOConfig:
     log_std_min: float = -2.5
     log_std_max: float = -0.3
     policy_loss_weight_head_in: float = 1.0
-    policy_loss_weight_parallel_fwd: float = 1.0
-    policy_loss_weight_parallel_rev: float = 0.8
     checkpoint_score_weight_head_in: float = 1.0
-    checkpoint_score_weight_parallel_fwd: float = 2.0
-    checkpoint_score_weight_parallel_rev: float = 4.0
 
 
 DEFAULT_VEHICLE_PARAMS = ZL50GNVehicleParams()

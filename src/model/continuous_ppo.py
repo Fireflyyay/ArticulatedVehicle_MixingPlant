@@ -462,8 +462,6 @@ class ContinuousPPOAgent:
     def _policy_loss_weight(self, task_family):
         weights = {
             "head_in": self.config.policy_loss_weight_head_in,
-            "parallel_fwd": self.config.policy_loss_weight_parallel_fwd,
-            "parallel_rev": self.config.policy_loss_weight_parallel_rev,
         }
         if task_family not in weights:
             raise ValueError("unknown task family: {}".format(task_family))
