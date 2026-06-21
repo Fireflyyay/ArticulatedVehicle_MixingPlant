@@ -153,6 +153,7 @@ class LocalParkingEnv:
         self.scene = None
         self.slot = None
         self.current_mask = None
+        self.current_mask_floor_info = self._empty_mask_floor_info()
         self.last_front_lidar_m = None
         self.last_rear_lidar_m = None
         self.prev_motion_gear = None
@@ -205,8 +206,56 @@ class LocalParkingEnv:
                         threshold,
                     )
                 ),
-            )
+        )
         return float(threshold)
+
+    @staticmethod
+    def _empty_mask_floor_info():
+        return {
+            "mask_degenerate": False,
+            "mask_floor_applied": False,
+            "mask_all_zero_before_floor": False,
+            "mask_max_before_floor": 0.0,
+        }
+
+    def _mask_floor_state(self, mask):
+        mask_array = np.asarray(mask, dtype=np.float32)
+        if mask_array.size == 0:
+            raise ValueError("action mask must not be empty")
+        finite_mask = np.nan_to_num(
+            mask_array,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        finite_mask = np.clip(finite_mask, 0.0, 1.0).astype(np.float32, copy=False)
+        mask_max = float(np.max(finite_mask))
+        all_zero = bool(np.all(finite_mask <= 0.0))
+        eps = max(0.0, float(getattr(self.config, "mask_degenerate_eps", 0.0)))
+        if bool(getattr(self.config, "apply_floor_only_when_all_zero", False)):
+            degenerate = all_zero
+        else:
+            degenerate = bool(all_zero or mask_max < eps)
+
+        floor_applied = bool(
+            degenerate
+            and bool(getattr(self.config, "enable_mask_floor_fallback", False))
+        )
+        if floor_applied:
+            configured_floor = float(getattr(self.config, "mask_floor_value", 0.0))
+            r_min = float(getattr(self.action_mask, "min_safe_ratio", 1e-3))
+            floor_value = max(configured_floor, r_min + 1e-7)
+            floor_value = float(np.clip(floor_value, 0.0, 1.0))
+            effective_mask = np.full_like(finite_mask, floor_value, dtype=np.float32)
+        else:
+            effective_mask = finite_mask.copy()
+
+        return effective_mask, {
+            "mask_degenerate": bool(degenerate),
+            "mask_floor_applied": bool(floor_applied),
+            "mask_all_zero_before_floor": bool(all_zero),
+            "mask_max_before_floor": float(mask_max),
+        }
 
     def _reset_candidate_metrics(self, state, stage):
         front_lidar, rear_lidar = self.lidar.observe(
@@ -220,10 +269,15 @@ class LocalParkingEnv:
             front_lidar,
             rear_lidar,
         )
+        _, floor_info = self._mask_floor_state(mask)
         return {
             "body_clearance": self._body_clearance(state),
             "min_lidar": float(min(np.min(front_lidar), np.min(rear_lidar))),
             "mask_max": float(np.max(mask)),
+            "mask_degenerate": bool(floor_info["mask_degenerate"]),
+            "mask_all_zero_before_floor": bool(
+                floor_info["mask_all_zero_before_floor"]
+            ),
             "mask_required": self._reset_mask_threshold(stage),
         }
 
@@ -279,6 +333,12 @@ class LocalParkingEnv:
                     reject_counts.get("recovery_lidar", 0)
                 ),
                 "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
+                "reset_initial_mask_degenerate": bool(
+                    metrics.get("mask_degenerate", False)
+                ),
+                "reset_initial_mask_all_zero": bool(
+                    metrics.get("mask_all_zero_before_floor", False)
+                ),
                 "reset_initial_mask_required": float(
                     metrics.get("mask_required", self._reset_mask_threshold(stage))
                 ),
@@ -405,6 +465,12 @@ class LocalParkingEnv:
                         reject_counts.get("recovery_lidar", 0)
                     ),
                     "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
+                    "reset_initial_mask_degenerate": bool(
+                        metrics.get("mask_degenerate", False)
+                    ),
+                    "reset_initial_mask_all_zero": bool(
+                        metrics.get("mask_all_zero_before_floor", False)
+                    ),
                     "reset_initial_mask_required": float(
                         metrics.get("mask_required", self._reset_mask_threshold(stage))
                     ),
@@ -558,6 +624,12 @@ class LocalParkingEnv:
                 self.initial_sampling_diagnostics["hope_offpath_reset_used"] = True
                 self.initial_sampling_diagnostics["reset_initial_mask_max"] = float(
                     metrics.get("mask_max", 0.0)
+                )
+                self.initial_sampling_diagnostics[
+                    "reset_initial_mask_degenerate"
+                ] = bool(metrics.get("mask_degenerate", False))
+                self.initial_sampling_diagnostics["reset_initial_mask_all_zero"] = bool(
+                    metrics.get("mask_all_zero_before_floor", False)
                 )
                 self.initial_sampling_diagnostics[
                     "reset_initial_body_clearance_m"
@@ -842,6 +914,9 @@ class LocalParkingEnv:
             front_m,
             rear_m,
         )
+        self.current_mask, self.current_mask_floor_info = self._mask_floor_state(
+            self.current_mask
+        )
 
     def _observation(self, metrics=None):
         if metrics is None:
@@ -1018,6 +1093,18 @@ class LocalParkingEnv:
         info["fallback_used"] = bool(fallback_used)
         info["initial_collision"] = self._state_collides(self.state)
         info["task_family"] = self._task_family_from_scene()
+        info["initial_degenerate_mask"] = bool(
+            self.current_mask_floor_info["mask_degenerate"]
+        )
+        info["initial_mask_floor_applied"] = bool(
+            self.current_mask_floor_info["mask_floor_applied"]
+        )
+        info["initial_mask_max_before_floor"] = float(
+            self.current_mask_floor_info["mask_max_before_floor"]
+        )
+        info["initial_mask_all_zero_before_floor"] = bool(
+            self.current_mask_floor_info["mask_all_zero_before_floor"]
+        )
         info.update(self.initial_sampling_diagnostics)
         for key in (
             "clearance_bucket",
@@ -1074,6 +1161,12 @@ class LocalParkingEnv:
             "raw_safe_ratio": 0.0,
             "exec_safe_ratio": 0.0,
             "forced_stop": False,
+            "degenerate_mask": False,
+            "mask_floor_applied": False,
+            "mask_all_zero_before_floor": False,
+            "mask_max_before_floor": 0.0,
+            "collision_after_mask_floor": False,
+            "success_after_mask_floor": False,
             "clip_ratio": 0.0,
             "mask_cost": 0.0,
             "gear": 0,
@@ -1094,9 +1187,11 @@ class LocalParkingEnv:
         if self.state is None:
             raise RuntimeError("reset() must be called before step()")
         previous_state = self.state
+        mask_for_action = np.asarray(self.current_mask, dtype=np.float32).copy()
+        mask_floor_info = dict(self.current_mask_floor_info)
         decoded = self.action_mask.decode_safe_speed_and_cost(
             raw_action,
-            self.current_mask,
+            mask_for_action,
             self.state.phi,
             dt=self.vehicle_params.dt,
             prev_motion_gear=self.prev_motion_gear,
@@ -1136,6 +1231,9 @@ class LocalParkingEnv:
             success = False
         terminated = bool(success or collision or out_of_bounds or articulation_violation)
         truncated = bool(timeout and not terminated)
+        mask_floor_applied = bool(mask_floor_info.get("mask_floor_applied", False))
+        collision_after_mask_floor = bool(mask_floor_applied and collision)
+        success_after_mask_floor = bool(mask_floor_applied and success)
 
         rs_value, rs_info = self.rs_potential.step(
             self.scene,
@@ -1226,10 +1324,10 @@ class LocalParkingEnv:
                 "raw_action": np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0),
                 "executed_action": executed_action,
                 "mask_safe_ratio": float(decoded["r_raw"]),
-                "mask_safe_ratio_mean": float(np.mean(self.current_mask)),
-                "mask_safe_ratio_min": float(np.min(self.current_mask)),
+                "mask_safe_ratio_mean": float(np.mean(mask_for_action)),
+                "mask_safe_ratio_min": float(np.min(mask_for_action)),
                 "mask_zero_fraction": float(
-                    np.mean(self.current_mask <= self.action_mask.min_safe_ratio)
+                    np.mean(mask_for_action <= self.action_mask.min_safe_ratio)
                 ),
                 "mask_invalid_rate": 1.0 if decoded["forced_stop"] else 0.0,
                 "selected_action_masked": bool(decoded["forced_stop"]),
@@ -1240,6 +1338,16 @@ class LocalParkingEnv:
                 "exec_safe_ratio": float(decoded["r_exec"]),
                 "max_safe_ratio": float(decoded["r_max"]),
                 "forced_stop": bool(decoded["forced_stop"]),
+                "degenerate_mask": bool(mask_floor_info.get("mask_degenerate", False)),
+                "mask_floor_applied": bool(mask_floor_applied),
+                "mask_all_zero_before_floor": bool(
+                    mask_floor_info.get("mask_all_zero_before_floor", False)
+                ),
+                "mask_max_before_floor": float(
+                    mask_floor_info.get("mask_max_before_floor", 0.0)
+                ),
+                "collision_after_mask_floor": bool(collision_after_mask_floor),
+                "success_after_mask_floor": bool(success_after_mask_floor),
                 "clip_ratio": float(decoded["clip_ratio"]),
                 "mask_cost": float(decoded["mask_cost"]),
                 "planner_source": planner_source,

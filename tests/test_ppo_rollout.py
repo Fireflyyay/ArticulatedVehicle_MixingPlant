@@ -55,13 +55,14 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
     assert np.isclose(log_prob, float(recomputed.item()), atol=1e-4)
 
 
-def test_env_step_advances_with_executed_action(synthetic_action_mask):
+def test_env_step_lifts_degenerate_mask_before_executing_action(synthetic_action_mask):
     env = LocalParkingEnv(
         action_mask=synthetic_action_mask,
         seed=3,
     )
     env.reset()
-    env.current_mask[:] = 0.0
+    zero_mask = np.zeros((2, 11), dtype=np.float32)
+    env.current_mask, env.current_mask_floor_info = env._mask_floor_state(zero_mask)
     seen = {}
     original_step = env.vehicle_model.step
 
@@ -72,8 +73,35 @@ def test_env_step_advances_with_executed_action(synthetic_action_mask):
     env.vehicle_model.step = recording_step
     _, _, _, _, info = env.step(np.asarray([1.0, 0.25], dtype=np.float32))
     assert info["raw_action"][0] == 1.0
+    assert info["degenerate_mask"] is True
+    assert info["mask_floor_applied"] is True
+    assert info["forced_stop"] is False
+    assert np.isclose(info["mask_max_before_floor"], 0.0)
+    assert np.isclose(info["raw_safe_ratio"], DEFAULT_ENV_CONFIG.mask_floor_value)
+    expected_speed = (
+        DEFAULT_ENV_CONFIG.mask_floor_value
+        * synthetic_action_mask.vehicle_params.parking_v_forward_max
+    )
+    assert np.isclose(info["executed_action"][0], expected_speed)
+    assert np.isclose(seen["action"][0], expected_speed)
+
+
+def test_env_step_can_disable_mask_floor_fallback(synthetic_action_mask):
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, enable_mask_floor_fallback=False),
+        action_mask=synthetic_action_mask,
+        seed=3,
+    )
+    env.reset()
+    zero_mask = np.zeros((2, 11), dtype=np.float32)
+    env.current_mask, env.current_mask_floor_info = env._mask_floor_state(zero_mask)
+
+    _, _, _, _, info = env.step(np.asarray([1.0, 0.25], dtype=np.float32))
+
+    assert info["degenerate_mask"] is True
+    assert info["mask_floor_applied"] is False
+    assert info["forced_stop"] is True
     assert info["executed_action"][0] == 0.0
-    assert seen["action"][0] == 0.0
 
 
 def test_env_can_reset_from_viable_hard_case_replay_state(synthetic_action_mask):

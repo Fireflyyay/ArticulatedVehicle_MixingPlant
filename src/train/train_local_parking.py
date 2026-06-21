@@ -44,6 +44,15 @@ def _safe_mean(values):
     return float(np.mean(values)) if values else 0.0
 
 
+def _conditional_rate(items, value_key, condition_key):
+    selected = [
+        float(item.get(value_key, False))
+        for item in items
+        if bool(item.get(condition_key, False))
+    ]
+    return _safe_mean(selected)
+
+
 def _task_family(reset_info, scene_metadata):
     task_family = str(reset_info.get("task_family", ""))
     if task_family in TASK_FAMILIES:
@@ -428,6 +437,41 @@ def _build_update_record(
         "rs_by_goal_orientation_mode": _rs_metrics_by_mode(infos),
         "forced_stop_rate": _safe_mean(
             [float(item.get("forced_stop", False)) for item in infos]
+        ),
+        "degenerate_mask_rate": _safe_mean(
+            [float(item.get("degenerate_mask", False)) for item in infos]
+        ),
+        "initial_degenerate_mask_rate": _safe_mean(
+            [float(item.get("initial_degenerate_mask", False)) for item in completed]
+        ),
+        "mask_floor_applied_rate": _safe_mean(
+            [float(item.get("mask_floor_applied", False)) for item in infos]
+        ),
+        "mean_mask_max_before_floor": _safe_mean(
+            [float(item.get("mask_max_before_floor", 0.0)) for item in infos]
+        ),
+        "collision_after_mask_floor_rate": _conditional_rate(
+            infos,
+            "collision_after_mask_floor",
+            "mask_floor_applied",
+        ),
+        "success_after_mask_floor_rate": _conditional_rate(
+            infos,
+            "success_after_mask_floor",
+            "mask_floor_applied",
+        ),
+        "episode_mask_floor_applied_rate": _safe_mean(
+            [float(item.get("episode_mask_floor_applied", False)) for item in completed]
+        ),
+        "episode_collision_after_mask_floor_rate": _conditional_rate(
+            completed,
+            "episode_collision_after_mask_floor",
+            "episode_mask_floor_applied",
+        ),
+        "episode_success_after_mask_floor_rate": _conditional_rate(
+            completed,
+            "episode_success_after_mask_floor",
+            "episode_mask_floor_applied",
         ),
         "low_safe_abs_rate": _safe_mean(
             [float(item.get("raw_safe_ratio", 0.0) < 0.15) for item in infos]
@@ -998,6 +1042,10 @@ def train(args):
         raise ValueError("--hard-case-replay-heading-std-deg must be non-negative")
     if args.hard_case_replay_phi_std_deg < 0.0:
         raise ValueError("--hard-case-replay-phi-std-deg must be non-negative")
+    if args.mask_degenerate_eps < 0.0:
+        raise ValueError("--mask-degenerate-eps must be non-negative")
+    if not 0.0 < args.mask_floor_value <= 1.0:
+        raise ValueError("--mask-floor-value must be inside (0, 1]")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env_config = replace(
@@ -1036,6 +1084,10 @@ def train(args):
         hard_case_replay_xy_std=args.hard_case_replay_xy_std,
         hard_case_replay_heading_std_deg=args.hard_case_replay_heading_std_deg,
         hard_case_replay_phi_std_deg=args.hard_case_replay_phi_std_deg,
+        enable_mask_floor_fallback=not bool(args.disable_mask_floor_fallback),
+        mask_degenerate_eps=args.mask_degenerate_eps,
+        mask_floor_value=args.mask_floor_value,
+        apply_floor_only_when_all_zero=bool(args.apply_floor_only_when_all_zero),
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -1150,6 +1202,10 @@ def train(args):
         final_info = None
         done = False
         episode_tail_states = []
+        episode_degenerate_mask = False
+        episode_mask_floor_applied = False
+        episode_collision_after_mask_floor = False
+        episode_success_after_mask_floor = False
         task_family = _task_family(reset_info, env.scene.metadata)
         while not done:
             raw_action, pre_tanh_action, log_prob, value = agent.act_with_pre_tanh(
@@ -1179,6 +1235,20 @@ def train(args):
                 task_family=task_family,
             )
             info["task_family"] = task_family
+            episode_degenerate_mask = bool(
+                episode_degenerate_mask or info.get("degenerate_mask", False)
+            )
+            episode_mask_floor_applied = bool(
+                episode_mask_floor_applied or info.get("mask_floor_applied", False)
+            )
+            episode_collision_after_mask_floor = bool(
+                episode_collision_after_mask_floor
+                or info.get("collision_after_mask_floor", False)
+            )
+            episode_success_after_mask_floor = bool(
+                episode_success_after_mask_floor
+                or info.get("success_after_mask_floor", False)
+            )
             rollout_infos.append(info)
             observation = next_observation
             global_step += 1
@@ -1194,6 +1264,29 @@ def train(args):
         episode_rewards.append(episode_reward)
         final_info["task_family"] = task_family
         final_info["gear_switch_count"] = int(episode_gear_switch_count)
+        final_info["episode_degenerate_mask"] = bool(episode_degenerate_mask)
+        final_info["episode_mask_floor_applied"] = bool(episode_mask_floor_applied)
+        final_info["episode_collision_after_mask_floor"] = bool(
+            episode_mask_floor_applied and final_info.get("collision", False)
+        )
+        final_info["episode_success_after_mask_floor"] = bool(
+            episode_mask_floor_applied and final_info.get("success", False)
+        )
+        final_info["step_collision_after_mask_floor"] = bool(
+            episode_collision_after_mask_floor
+        )
+        final_info["step_success_after_mask_floor"] = bool(
+            episode_success_after_mask_floor
+        )
+        final_info["initial_degenerate_mask"] = bool(
+            reset_info.get("initial_degenerate_mask", False)
+        )
+        final_info["initial_mask_floor_applied"] = bool(
+            reset_info.get("initial_mask_floor_applied", False)
+        )
+        final_info["initial_mask_max_before_floor"] = float(
+            reset_info.get("initial_mask_max_before_floor", 0.0)
+        )
         rollout_completed.append(final_info)
         hard_case_recorded_count = hard_case_replay.record_failure(
             scene=env.scene,
@@ -1278,6 +1371,21 @@ def train(args):
             ),
             "reset_initial_mask_max": float(
                 reset_info.get("reset_initial_mask_max", 0.0)
+            ),
+            "initial_degenerate_mask": bool(
+                reset_info.get("initial_degenerate_mask", False)
+            ),
+            "initial_mask_floor_applied": bool(
+                reset_info.get("initial_mask_floor_applied", False)
+            ),
+            "initial_mask_max_before_floor": float(
+                reset_info.get("initial_mask_max_before_floor", 0.0)
+            ),
+            "reset_initial_mask_degenerate": bool(
+                reset_info.get("reset_initial_mask_degenerate", False)
+            ),
+            "reset_initial_mask_all_zero": bool(
+                reset_info.get("reset_initial_mask_all_zero", False)
             ),
             "reset_initial_mask_required": float(
                 reset_info.get("reset_initial_mask_required", 0.0)
@@ -1380,6 +1488,35 @@ def train(args):
             ),
             "mask_cost": float(final_info.get("mask_cost", 0.0)),
             "forced_stop": int(final_info.get("forced_stop", False)),
+            "degenerate_mask": bool(final_info.get("degenerate_mask", False)),
+            "mask_floor_applied": bool(final_info.get("mask_floor_applied", False)),
+            "mask_max_before_floor": float(
+                final_info.get("mask_max_before_floor", 0.0)
+            ),
+            "episode_degenerate_mask": bool(
+                final_info.get("episode_degenerate_mask", False)
+            ),
+            "episode_mask_floor_applied": bool(
+                final_info.get("episode_mask_floor_applied", False)
+            ),
+            "episode_collision_after_mask_floor": bool(
+                final_info.get("episode_collision_after_mask_floor", False)
+            ),
+            "episode_success_after_mask_floor": bool(
+                final_info.get("episode_success_after_mask_floor", False)
+            ),
+            "step_collision_after_mask_floor": bool(
+                final_info.get("step_collision_after_mask_floor", False)
+            ),
+            "step_success_after_mask_floor": bool(
+                final_info.get("step_success_after_mask_floor", False)
+            ),
+            "collision_after_mask_floor": bool(
+                final_info.get("collision_after_mask_floor", False)
+            ),
+            "success_after_mask_floor": bool(
+                final_info.get("success_after_mask_floor", False)
+            ),
             "raw_safe_ratio_final": float(final_info.get("raw_safe_ratio", 0.0)),
             "mask_coef": float(current_mask_coef),
             "gear_switch_count": int(episode_gear_switch_count),
@@ -1635,6 +1772,28 @@ def main():
         "--disable-rs-potential",
         action="store_true",
         help="Disable near-goal Reeds-Shepp potential shaping",
+    )
+    parser.add_argument(
+        "--disable-mask-floor-fallback",
+        action="store_true",
+        help="Disable degenerate action-mask floor fallback",
+    )
+    parser.add_argument(
+        "--mask-degenerate-eps",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.mask_degenerate_eps,
+        help="Treat action masks with max ratio below this value as degenerate",
+    )
+    parser.add_argument(
+        "--mask-floor-value",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.mask_floor_value,
+        help="Uniform positive safe-speed ratio used for degenerate masks",
+    )
+    parser.add_argument(
+        "--apply-floor-only-when-all-zero",
+        action="store_true",
+        help="Only apply mask floor fallback when every mask entry is zero",
     )
     parser.add_argument(
         "--enable-hope-teacher",

@@ -199,6 +199,10 @@ class LocalParkingEnvConfig:
     mask_cost_safe_threshold: float = 0.15
     mask_cost_max: float = 3.0
     mask_cost_coef_final: float = 0.8
+    enable_mask_floor_fallback: bool = True
+    mask_degenerate_eps: float = 1e-3
+    mask_floor_value: float = 0.01
+    apply_floor_only_when_all_zero: bool = False
 
     # --- Training-only HOPE teacher guidance ---
     enable_hope_teacher: bool = False
@@ -223,7 +227,7 @@ class LocalParkingEnvConfig:
     no_guide_eval_interval: int = 0
 
     # --- Training-only hard-case replay from actual failed rollouts ---
-    hard_case_replay_enabled: bool = True
+    hard_case_replay_enabled: bool = False
     hard_case_replay_ratio: float = 0.20
     hard_case_replay_capacity: int = 4096
     hard_case_replay_tail_steps: int = 12
