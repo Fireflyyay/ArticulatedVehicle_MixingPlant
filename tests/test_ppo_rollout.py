@@ -57,6 +57,7 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
 
 def test_env_step_lifts_degenerate_mask_before_executing_action(synthetic_action_mask):
     env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, enable_mask_floor_fallback=True),
         action_mask=synthetic_action_mask,
         seed=3,
     )
@@ -93,15 +94,25 @@ def test_env_step_can_disable_mask_floor_fallback(synthetic_action_mask):
         seed=3,
     )
     env.reset()
+    previous_state = env.state
+    env.prev_motion_gear = 0
+    env.prev_gear_in_obs = 1.0
     zero_mask = np.zeros((2, 11), dtype=np.float32)
     env.current_mask, env.current_mask_floor_info = env._mask_floor_state(zero_mask)
 
-    _, _, _, _, info = env.step(np.asarray([1.0, 0.25], dtype=np.float32))
+    _, _, _, _, info = env.step(np.asarray([-1.0, 1.0], dtype=np.float32))
 
     assert info["degenerate_mask"] is True
     assert info["mask_floor_applied"] is False
     assert info["forced_stop"] is True
-    assert info["executed_action"][0] == 0.0
+    assert np.allclose(info["executed_action"], [0.0, 0.0])
+    assert np.isclose(env.state.x_front, previous_state.x_front)
+    assert np.isclose(env.state.y_front, previous_state.y_front)
+    assert np.isclose(env.state.theta_front, previous_state.theta_front)
+    assert np.isclose(env.state.theta_rear, previous_state.theta_rear)
+    assert np.isclose(env.state.phi, previous_state.phi)
+    assert env.prev_motion_gear == 0
+    assert env.prev_gear_in_obs == 1.0
 
 
 def test_env_can_reset_from_viable_hard_case_replay_state(synthetic_action_mask):

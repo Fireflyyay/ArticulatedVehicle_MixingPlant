@@ -3,6 +3,8 @@ import numpy as np
 from config import DEFAULT_ENV_CONFIG, DEFAULT_VEHICLE_PARAMS
 from env.articulated_action_mask import (
     ArticulatedActionMask,
+    FORWARD_GEAR,
+    REVERSE_GEAR,
     default_action_mask_path,
     generate_sweep_tables,
     save_sweep_tables,
@@ -114,6 +116,28 @@ def test_decode_uses_mapped_phi_dot_for_action_mask_lookup(synthetic_action_mask
         decoded["v_exec"],
         expected_ratio * p.parking_v_forward_max,
     )
+
+
+def test_decode_forced_stop_freezes_speed_and_articulation(synthetic_action_mask):
+    p = DEFAULT_VEHICLE_PARAMS
+    zero_mask = np.zeros((2, 11), dtype=np.float32)
+
+    decoded = synthetic_action_mask.decode_safe_speed_and_cost(
+        [-1.0, 1.0],
+        zero_mask,
+        0.0,
+        dt=p.dt,
+        prev_motion_gear=FORWARD_GEAR,
+        config=DEFAULT_ENV_CONFIG,
+    )
+
+    assert decoded["forced_stop"] is True
+    assert decoded["gear"] == REVERSE_GEAR
+    assert decoded["r_raw"] <= synthetic_action_mask.min_safe_ratio
+    assert decoded["v_exec"] == 0.0
+    assert decoded["phi_dot_exec"] == 0.0
+    assert decoded["prev_motion_gear"] == FORWARD_GEAR
+    assert decoded["prev_gear_in_obs"] == 1.0
 
 
 def test_mapped_phi_dot_respects_articulated_vehicle_dynamics(synthetic_action_mask):

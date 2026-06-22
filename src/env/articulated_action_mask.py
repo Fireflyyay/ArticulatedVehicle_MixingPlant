@@ -258,6 +258,7 @@ class ArticulatedActionMask:
             forced_stop = (r_raw <= r_min)
             if forced_stop:
                 v_exec = 0.0
+                phi_dot_exec = 0.0
             else:
                 v_safe_max = r_raw * gear_vmax
                 v_decoded = a0_sign * rho * v_safe_max
@@ -278,17 +279,15 @@ class ArticulatedActionMask:
         )
         mask_cost = float(np.clip(c_stop + c_abs + c_rel, 0.0, c_max))
 
-        if abs(raw[0]) >= deadband:
-            if raw[0] >= 0.0:
-                new_motion_gear = FORWARD_GEAR
-            else:
-                new_motion_gear = REVERSE_GEAR
+        motion_eps = 1e-8
+        if abs(v_exec) > motion_eps:
+            new_motion_gear = FORWARD_GEAR if v_exec > 0.0 else REVERSE_GEAR
         else:
             new_motion_gear = prev_motion_gear
 
-        if gear == STOP_GEAR:
+        if new_motion_gear is None:
             prev_gear_in_obs = 0.0
-        elif gear == FORWARD_GEAR:
+        elif new_motion_gear == FORWARD_GEAR:
             prev_gear_in_obs = 1.0
         else:
             prev_gear_in_obs = -1.0
