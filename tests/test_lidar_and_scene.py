@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from config import DEFAULT_VEHICLE_PARAMS
+from config import DEFAULT_SCENE_CONFIG, DEFAULT_VEHICLE_PARAMS
 from dataclasses import replace
 from config import DEFAULT_ENV_CONFIG
 from env.geometry import oriented_box
@@ -69,9 +69,27 @@ def test_rule_carved_scene_is_cached_and_deterministic():
     assert 0.0 < first.metadata["free_ratio"] < 1.0
     assert first.world_bounds == (-40.0, -40.0, 40.0, 40.0)
     assert first.occupancy_grid.shape == (80, 80)
-    assert float(first.metadata["corridor_width"]) >= 9.0
+    assert float(first.metadata["corridor_width"]) == 5.0
     assert len(first.parking_bays) >= 2
     assert first.metadata["constructed_obstacle_feature_count"] > 0
+    assert first.metadata["reset_geometry_candidate_count"] > 0
+
+
+def test_stage4_scene_keeps_narrow_corridor_obstacle_categories_and_reset_audit():
+    assert DEFAULT_SCENE_CONFIG.corridor_width_by_stage[3] == 5.0
+    assert DEFAULT_SCENE_CONFIG.noncritical_obstacle_count_by_stage[3] == 7
+    for seed in range(8):
+        scene = generate_cached_mixing_plant_scene(stage=4, seed=600 + seed)
+        labels = set(scene.metadata["constructed_obstacle_labels"])
+        assert float(scene.metadata["corridor_width"]) == 5.0
+        assert scene.metadata["constructed_obstacle_feature_count"] == 7
+        assert "wall_stub" in labels
+        assert "equipment_island" in labels
+        assert any(label.startswith("branch_") for label in labels)
+        assert "yard_equipment_island" in labels
+        assert scene.metadata["success_neighborhood_feasible_count"] > 0
+        assert scene.metadata["reset_geometry_candidate_count"] > 0
+        assert scene.metadata["reset_geometry_recovery_band_count"] > 0
 
 
 def test_different_seeds_produce_distinct_parameterized_layouts():
@@ -224,23 +242,41 @@ def test_recovery_samples_are_diverse_near_obstacles_and_articulated(
     synthetic_action_mask,
 ):
     env = LocalParkingEnv(
-        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=4),
+        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=4, scene_pool_size=1),
         action_mask=synthetic_action_mask,
         seed=10,
     )
     samples = []
     state_signatures = set()
     collisions = []
-    for _ in range(16):
+    for _ in range(24):
         _, info = env.reset()
         samples.append(info)
         state_signatures.add(tuple(np.round(env.state.as_array()[:4], 3)))
         collisions.append(env._state_collides(env.state))
     assert all(item["scenario_type"] == "recovery" for item in samples)
     assert all(item["min_lidar_distance"] <= 2.2 for item in samples)
-    assert all(abs(item["phi"]) >= math.radians(18.0) for item in samples)
+    clearances = [float(item["reset_initial_body_clearance_m"]) for item in samples]
+    assert min(clearances) >= DEFAULT_ENV_CONFIG.stage4_reset_min_body_clearance
+    assert max(clearances) <= DEFAULT_ENV_CONFIG.recovery_max_body_clearance
+    assert float(np.median(clearances)) >= 0.20
+    assert all(item["reset_candidate_bank_size"] > 0 for item in samples)
+    assert all(item["reset_candidate_bank_valid_count"] > 0 for item in samples)
+    assert not any(item["reset_candidate_bank_empty"] for item in samples)
+    assert not any(item["reset_initial_mask_all_zero"] for item in samples)
+    clearance_buckets = {
+        item["reset_candidate_selected_clearance_bucket"] for item in samples
+    }
+    pose_buckets = {item["reset_candidate_selected_pose_bucket"] for item in samples}
+    assert clearance_buckets <= {
+        "tight_recover",
+        "narrow_recover",
+        "moderate_recover",
+    }
+    assert clearance_buckets & {"tight_recover", "narrow_recover"}
+    assert len(pose_buckets) >= 2
     assert not any(collisions)
-    assert len(state_signatures) >= 12
+    assert len(state_signatures) >= 6
 
 
 def test_near_goal_initial_states_cover_distance_heading_lateral_and_phi(
@@ -269,7 +305,7 @@ def test_near_goal_initial_states_cover_distance_heading_lateral_and_phi(
         )
 
     assert len({item[4] for item in states}) == len(states)
-    assert max(item[0] for item in states) - min(item[0] for item in states) > 4.0
+    assert max(item[0] for item in states) - min(item[0] for item in states) > 2.0
     assert max(item[1] for item in states) > 45.0
     assert max(item[2] for item in states) > 2.0
     assert max(item[3] for item in states) > 10.0

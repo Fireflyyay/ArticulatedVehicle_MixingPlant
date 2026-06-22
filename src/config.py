@@ -133,7 +133,7 @@ class LocalParkingEnvConfig:
     reset_scene_retry_count: int = 18
     reset_min_mask_safe_ratio: float = 1e-3
     stage4_reset_min_mask_safe_ratio: float = 0.125
-    stage4_reset_min_body_clearance: float = 0.02
+    stage4_reset_min_body_clearance: float = 0.15
     stage_distance_ranges: Tuple[Tuple[float, float], ...] = (
         (8.0, 15.0),
         (10.0, 18.0),
@@ -199,7 +199,7 @@ class LocalParkingEnvConfig:
     mask_cost_safe_threshold: float = 0.15
     mask_cost_max: float = 3.0
     mask_cost_coef_final: float = 0.8
-    enable_mask_floor_fallback: bool = True
+    enable_mask_floor_fallback: bool = False
     mask_degenerate_eps: float = 1e-3
     mask_floor_value: float = 0.01
     apply_floor_only_when_all_zero: bool = False

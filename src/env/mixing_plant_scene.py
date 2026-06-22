@@ -8,7 +8,12 @@ from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 from shapely.prepared import prep
 
-from config import DEFAULT_SCENE_CONFIG, DEFAULT_VEHICLE_PARAMS, MixingPlantSceneConfig
+from config import (
+    DEFAULT_ENV_CONFIG,
+    DEFAULT_SCENE_CONFIG,
+    DEFAULT_VEHICLE_PARAMS,
+    MixingPlantSceneConfig,
+)
 from env.geometry import DirectedParkingSlot, overlap_ratio, wrap_to_pi
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
 
@@ -64,6 +69,7 @@ class _SceneLayout:
     second_branch_along: float
     branch_bay_along: float
     obstacle_variant: int
+    jitter_token: int
 
 
 def _quantize(value, resolution):
@@ -178,6 +184,7 @@ def _sample_layout(seed, scene_config, task_family):
         second_branch_along=float(branch_positions[1]),
         branch_bay_along=sample_range(scene_config.branch_bay_along_range),
         obstacle_variant=int(rng.integers(0, 8)),
+        jitter_token=int(rng.integers(0, 2**31 - 1)),
     )
 
 
@@ -415,6 +422,61 @@ def _target_feasibility_audit(target_bay, slot, obstacle_union, prepared_obstacl
     }
 
 
+def _reset_geometry_audit(slot, obstacle_union, prepared_obstacles):
+    """Low-cost reset geometry probe; action-mask viability stays in LocalParkingEnv."""
+    params = DEFAULT_VEHICLE_PARAMS
+    model = ArticulatedVehicleModel(params)
+    axis = np.asarray(
+        [math.cos(float(slot.theta_goal)), math.sin(float(slot.theta_goal))],
+        dtype=np.float64,
+    )
+    normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+    center = np.asarray(slot.center, dtype=np.float64)
+    distances = (4.5, 6.0, 8.0, 10.0, 12.0, 14.0, 18.0)
+    laterals = (-4.0, -2.2, 0.0, 2.2, 4.0)
+    heading_offsets = tuple(math.radians(v) for v in (-40.0, -20.0, 0.0, 20.0, 40.0))
+    phi_offsets = tuple(math.radians(v) for v in (-30.0, -18.0, 0.0, 18.0, 30.0))
+    min_clearance = float(DEFAULT_ENV_CONFIG.stage4_reset_min_body_clearance)
+    max_clearance = float(DEFAULT_ENV_CONFIG.recovery_max_body_clearance)
+    sample_count = 0
+    collision_free_count = 0
+    recovery_band_count = 0
+    for distance in distances:
+        for lateral in laterals:
+            sample_center = center - float(distance) * axis + float(lateral) * normal
+            for heading_error in heading_offsets:
+                theta_front = wrap_to_pi(float(slot.theta_goal) + float(heading_error))
+                for phi in phi_offsets:
+                    sample_count += 1
+                    sample_state = ArticulatedState(
+                        x_front=float(sample_center[0]),
+                        y_front=float(sample_center[1]),
+                        theta_front=float(theta_front),
+                        theta_rear=float(wrap_to_pi(theta_front - float(phi))),
+                    )
+                    front_box, rear_box = model.body_boxes(sample_state)
+                    collision = bool(
+                        prepared_obstacles.intersects(front_box)
+                        or prepared_obstacles.intersects(rear_box)
+                    )
+                    if collision:
+                        continue
+                    collision_free_count += 1
+                    clearance = float(
+                        min(
+                            front_box.distance(obstacle_union),
+                            rear_box.distance(obstacle_union),
+                        )
+                    )
+                    if min_clearance <= clearance <= max_clearance:
+                        recovery_band_count += 1
+    return {
+        "reset_geometry_candidate_count": int(sample_count),
+        "reset_geometry_collision_free_count": int(collision_free_count),
+        "reset_geometry_recovery_band_count": int(recovery_band_count),
+    }
+
+
 def _difficulty_metadata(layout, target_bay, audit):
     clearance_bucket = _bucket_clearance(audit["nominal_target_clearance_m"])
     approach_side_bucket = "left_bay" if float(layout.target_side) > 0.0 else "right_bay"
@@ -472,6 +534,37 @@ def _equipment_block(origin, heading, along_center, lateral_center, length, widt
     )
 
 
+def _layout_unit_noise(layout, salt):
+    token = (
+        int(layout.jitter_token)
+        + 0x9E3779B9 * (int(layout.obstacle_variant) + 1)
+        + 0x85EBCA6B * (int(salt) + 17)
+    ) & 0xFFFFFFFF
+    token ^= (token >> 16)
+    token = (token * 0x7FEB352D) & 0xFFFFFFFF
+    token ^= (token >> 15)
+    token = (token * 0x846CA68B) & 0xFFFFFFFF
+    token ^= (token >> 16)
+    return (float(token) / float(0xFFFFFFFF)) * 2.0 - 1.0
+
+
+def _jittered_dimension(base_value, layout, salt, jitter, lower, upper):
+    return float(
+        np.clip(
+            float(base_value) + _layout_unit_noise(layout, salt) * float(jitter),
+            float(lower),
+            float(upper),
+        )
+    )
+
+
+def _bounded_lateral_center(base_lateral, width, corridor_width):
+    limit = max(0.0, 0.5 * float(corridor_width) - 0.5 * float(width) - 0.05)
+    if limit <= 0.0:
+        return 0.0
+    return float(np.clip(float(base_lateral), -limit, limit))
+
+
 def _target_approach_keepout(layout, corridor_heading, corridor_width, scene_config):
     bay_half = 0.5 * float(scene_config.head_in_bay_width)
     keepout_along = bay_half + float(scene_config.target_approach_keepout_along)
@@ -522,72 +615,182 @@ def _constrained_obstacle_features(
     main_anchors = (-32.0, -24.0, -12.0, 12.0, 24.0, 32.0)
     shift = (int(layout.obstacle_variant) % 3 - 1) * 1.0
     for idx, along in enumerate(main_anchors):
+        wall_length = _jittered_dimension(
+            scene_config.wall_stub_length,
+            layout,
+            10 + idx,
+            0.70,
+            4.20,
+            5.80,
+        )
+        wall_depth = _jittered_dimension(
+            scene_config.wall_stub_depth,
+            layout,
+            30 + idx,
+            0.30,
+            1.60,
+            min(2.35, 0.5 * float(corridor_width) - 0.10),
+        )
+        wall_along = (
+            float(along)
+            + shift
+            + _layout_unit_noise(layout, 50 + idx) * 1.25
+        )
         side = -float(layout.target_side) if idx % 2 == 0 else float(layout.target_side)
         wall = _wall_stub(
             layout.corridor_origin,
             corridor_heading,
-            along + shift,
+            wall_along,
             side,
-            scene_config.wall_stub_length,
-            scene_config.wall_stub_depth,
+            wall_length,
+            wall_depth,
             corridor_width,
         )
         candidates.append(("wall_stub", wall))
-        lateral = 0.25 * float(corridor_width) * (-1.0 if idx % 2 == 0 else 1.0)
+        block_length = _jittered_dimension(
+            scene_config.equipment_obstacle_length,
+            layout,
+            70 + idx,
+            0.55,
+            2.40,
+            3.70,
+        )
+        block_width = _jittered_dimension(
+            scene_config.equipment_obstacle_width,
+            layout,
+            90 + idx,
+            0.35,
+            1.60,
+            2.35,
+        )
+        lateral = (
+            0.25 * float(corridor_width) * (-1.0 if idx % 2 == 0 else 1.0)
+            + _layout_unit_noise(layout, 110 + idx) * 0.35
+        )
+        lateral = _bounded_lateral_center(lateral, block_width, corridor_width)
         block = _equipment_block(
             layout.corridor_origin,
             corridor_heading,
-            along - shift,
+            float(along) - shift + _layout_unit_noise(layout, 130 + idx) * 0.80,
             lateral,
-            scene_config.equipment_obstacle_length,
-            scene_config.equipment_obstacle_width,
+            block_length,
+            block_width,
         )
         candidates.append(("equipment_island", block))
 
     for branch_index, (branch_origin, branch_heading) in enumerate(branches):
         branch_shift = shift if branch_index % 2 == 0 else -shift
-        for along, side in ((18.0 + branch_shift, -1.0), (-18.0 - branch_shift, 1.0)):
+        for local_index, (along, side) in enumerate(
+            ((18.0 + branch_shift, -1.0), (-18.0 - branch_shift, 1.0))
+        ):
+            salt = 170 + branch_index * 20 + local_index
+            wall_length = _jittered_dimension(
+                scene_config.wall_stub_length,
+                layout,
+                salt,
+                0.65,
+                4.20,
+                5.80,
+            )
+            wall_depth = _jittered_dimension(
+                scene_config.wall_stub_depth,
+                layout,
+                salt + 7,
+                0.35,
+                1.60,
+                min(2.50, 0.5 * float(branch_width) - 0.10),
+            )
             candidates.append(
                 (
                     "branch_wall_stub",
                     _wall_stub(
                         branch_origin,
                         branch_heading,
-                        along,
+                        float(along) + _layout_unit_noise(layout, salt + 13) * 1.30,
                         side,
-                        scene_config.wall_stub_length,
-                        scene_config.wall_stub_depth,
+                        wall_length,
+                        wall_depth,
                         branch_width,
                     ),
                 )
             )
+        branch_block_length = _jittered_dimension(
+            scene_config.equipment_obstacle_length,
+            layout,
+            230 + branch_index,
+            0.55,
+            2.40,
+            3.70,
+        )
+        branch_block_width = _jittered_dimension(
+            scene_config.equipment_obstacle_width,
+            layout,
+            240 + branch_index,
+            0.35,
+            1.60,
+            2.35,
+        )
+        branch_lateral = _layout_unit_noise(layout, 250 + branch_index) * 0.60
+        branch_lateral = _bounded_lateral_center(
+            branch_lateral,
+            branch_block_width,
+            branch_width,
+        )
         candidates.append(
             (
                 "branch_equipment_island",
                 _equipment_block(
                     branch_origin,
                     branch_heading,
-                    8.0 + branch_shift,
-                    0.0,
-                    scene_config.equipment_obstacle_length,
-                    scene_config.equipment_obstacle_width,
+                    8.0
+                    + branch_shift
+                    + _layout_unit_noise(layout, 260 + branch_index) * 1.10,
+                    branch_lateral,
+                    branch_block_length,
+                    branch_block_width,
                 ),
             )
         )
 
     if int(stage) >= 4:
-        axis, normal = _cardinal_frame(corridor_heading)
-        yard_center = np.asarray(layout.corridor_origin) + axis * 2.0 - normal * 18.0
-        for offset in ((-4.0, -3.0), (4.0, 3.0), (0.0, 5.0)):
-            center = yard_center + axis * offset[0] + normal * offset[1]
+        yard_offsets = ((-4.0, -3.0), (4.0, 3.0), (0.0, 5.0))
+        for idx, offset in enumerate(yard_offsets):
+            length = _jittered_dimension(
+                scene_config.equipment_obstacle_length,
+                layout,
+                300 + idx,
+                0.65,
+                2.40,
+                3.90,
+            )
+            width = _jittered_dimension(
+                scene_config.equipment_obstacle_width,
+                layout,
+                320 + idx,
+                0.45,
+                1.60,
+                2.50,
+            )
+            along_center = (
+                2.0
+                + float(offset[0])
+                + _layout_unit_noise(layout, 340 + idx) * 1.20
+            )
+            lateral_center = (
+                -18.0
+                + float(offset[1])
+                + _layout_unit_noise(layout, 360 + idx) * 1.20
+            )
             candidates.append(
                 (
                     "yard_equipment_island",
-                    box(
-                        center[0] - 1.5,
-                        center[1] - 1.0,
-                        center[0] + 1.5,
-                        center[1] + 1.0,
+                    _equipment_block(
+                        layout.corridor_origin,
+                        corridor_heading,
+                        along_center,
+                        lateral_center,
+                        length,
+                        width,
                     ),
                 )
             )
@@ -598,23 +801,46 @@ def _constrained_obstacle_features(
 
     selected = []
     labels = []
-    for label, candidate in candidates:
-        if len(selected) >= desired:
-            break
+
+    def candidate_is_valid(candidate):
         if not free_space.covers(candidate):
-            continue
+            return False
         if candidate.intersects(critical_keepout):
-            continue
+            return False
         if any(candidate.intersects(bay.polygon.buffer(0.25)) for bay in parking_bays):
-            continue
+            return False
         if any(
-            candidate.distance(existing)
-            < float(scene_config.noncritical_obstacle_spacing)
+            candidate.distance(existing) < float(scene_config.noncritical_obstacle_spacing)
             for existing in selected
         ):
-            continue
+            return False
+        return True
+
+    def try_add(label, candidate):
+        if len(selected) >= desired:
+            return False
+        if not candidate_is_valid(candidate):
+            return False
         selected.append(candidate)
         labels.append(label)
+        return True
+
+    if int(stage) >= 4:
+        category_predicates = (
+            lambda label: label == "wall_stub",
+            lambda label: label == "equipment_island",
+            lambda label: label.startswith("branch_"),
+            lambda label: label == "yard_equipment_island",
+        )
+        for predicate in category_predicates:
+            for label, candidate in candidates:
+                if predicate(label) and try_add(label, candidate):
+                    break
+
+    for label, candidate in candidates:
+        try_add(label, candidate)
+        if len(selected) >= desired:
+            break
     return selected, labels
 
 
@@ -790,6 +1016,13 @@ def generate_cached_mixing_plant_scene(
         obstacle_union=obstacle_union,
         prepared_obstacles=prepared_obstacles,
     )
+    audit.update(
+        _reset_geometry_audit(
+            slot=slot,
+            obstacle_union=obstacle_union,
+            prepared_obstacles=prepared_obstacles,
+        )
+    )
     audit["constructed_obstacle_feature_count"] = int(len(constructed_obstacles))
     audit["constructed_wall_feature_count"] = int(
         sum(1 for label in constructed_labels if "wall" in label)
@@ -896,6 +1129,15 @@ class CachedScenePool:
             if int(scene.metadata.get("success_neighborhood_feasible_count", 0)) <= 0:
                 raise RuntimeError(
                     "scene audit failed: empty success neighborhood for seed {} family {}".format(
+                        scene_seed,
+                        task_family,
+                    )
+                )
+            if self.stage >= 4 and int(
+                scene.metadata.get("reset_geometry_recovery_band_count", 0)
+            ) <= 0:
+                raise RuntimeError(
+                    "scene audit failed: empty reset recovery band for seed {} family {}".format(
                         scene_seed,
                         task_family,
                     )

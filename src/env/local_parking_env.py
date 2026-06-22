@@ -166,6 +166,8 @@ class LocalParkingEnv:
         self.guide_weight_current = 0.0
         self.guide_dropout_rate = 1.0
         self.guide_dropped = True
+        self._reset_candidate_cache = {}
+        self._reset_candidate_bucket_counts = {}
 
     def set_active_stage(self, stage):
         stage = int(np.clip(stage, 1, 4))
@@ -305,6 +307,326 @@ class LocalParkingEnv:
 
         return True, "", metrics
 
+    @staticmethod
+    def _reset_reject_counts():
+        return {
+            "collision": 0,
+            "mask": 0,
+            "clearance": 0,
+            "recovery_clearance": 0,
+            "recovery_lidar": 0,
+        }
+
+    @staticmethod
+    def _halton(index, base):
+        result = 0.0
+        fraction = 1.0 / float(base)
+        value = int(index)
+        while value > 0:
+            result += fraction * float(value % int(base))
+            value //= int(base)
+            fraction /= float(base)
+        return float(result)
+
+    def _low_discrepancy_rows(self, count, dimensions, seed_items):
+        seed_sequence = np.random.SeedSequence([int(item) & 0xFFFFFFFF for item in seed_items])
+        local_rng = np.random.default_rng(seed_sequence)
+        shifts = local_rng.random(int(dimensions))
+        bases = (2, 3, 5, 7, 11, 13, 17)
+        rows = np.zeros((int(count), int(dimensions)), dtype=np.float64)
+        for row_index in range(int(count)):
+            for dim_index in range(int(dimensions)):
+                rows[row_index, dim_index] = (
+                    self._halton(row_index + 1, bases[dim_index]) + shifts[dim_index]
+                ) % 1.0
+        return rows
+
+    def _state_from_goal_offsets(self, goal, axis, normal, distance, lateral, heading_error, phi):
+        center = (
+            np.asarray(goal.center, dtype=np.float64)
+            - float(distance) * np.asarray(axis, dtype=np.float64)
+            + float(lateral) * np.asarray(normal, dtype=np.float64)
+        )
+        theta_front = wrap_to_pi(float(goal.theta_goal) + float(heading_error))
+        return ArticulatedState(
+            x_front=float(center[0]),
+            y_front=float(center[1]),
+            theta_front=float(theta_front),
+            theta_rear=float(wrap_to_pi(theta_front - float(phi))),
+        )
+
+    def _reset_clearance_bucket(self, clearance_m, stage):
+        clearance_m = float(clearance_m)
+        if int(stage) == 4:
+            if clearance_m < 0.30:
+                return "tight_recover"
+            if clearance_m < 0.50:
+                return "narrow_recover"
+            if clearance_m <= float(self.config.recovery_max_body_clearance):
+                return "moderate_recover"
+            return "open"
+        if clearance_m < 0.50:
+            return "tight"
+        if clearance_m < 1.00:
+            return "narrow"
+        if clearance_m < 2.00:
+            return "normal"
+        return "open"
+
+    @staticmethod
+    def _reset_mask_bucket(mask_max, mask_required):
+        mask_max = float(mask_max)
+        mask_required = float(mask_required)
+        span = max(1e-6, 1.0 - mask_required)
+        quality = (mask_max - mask_required) / span
+        if quality < 0.25:
+            return "weak"
+        if quality < 0.60:
+            return "medium"
+        return "strong"
+
+    def _reset_pose_bucket(self, state, goal, stage):
+        index = max(0, min(3, int(stage) - 1))
+        slot_error = goal.position_error_in_slot_frame(state.x_front, state.y_front)
+        heading_range = max(
+            1e-6,
+            math.radians(float(self.config.stage_heading_ranges_deg[index])),
+        )
+        lateral_range = max(1e-6, float(self.config.stage_lateral_ranges[index]))
+        phi_range = max(
+            1e-6,
+            math.radians(float(self.config.stage_phi_ranges_deg[index])),
+        )
+        heading_score = abs(float(wrap_to_pi(state.theta_front - goal.theta_goal))) / heading_range
+        lateral_score = abs(float(slot_error[1])) / lateral_range
+        phi_score = abs(float(state.phi)) / phi_range
+        scores = {
+            "heading_dominant": heading_score,
+            "lateral_dominant": lateral_score,
+            "articulation_dominant": phi_score,
+        }
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if len(ordered) >= 2 and ordered[1][1] >= 0.70 * max(ordered[0][1], 1e-6):
+            return "mixed"
+        return ordered[0][0]
+
+    def _reset_distance_bucket(self, state, goal, stage):
+        index = max(0, min(3, int(stage) - 1))
+        distance_range = self.config.stage_distance_ranges[index]
+        distance = math.hypot(
+            float(state.x_front) - float(goal.x_goal),
+            float(state.y_front) - float(goal.y_goal),
+        )
+        t = (distance - float(distance_range[0])) / max(
+            1e-6,
+            float(distance_range[1]) - float(distance_range[0]),
+        )
+        if t < 0.33:
+            return "near"
+        if t < 0.66:
+            return "mid"
+        return "far"
+
+    def _reset_candidate_score(self, state, stage, metrics):
+        mask_required = float(metrics.get("mask_required", self._reset_mask_threshold(stage)))
+        mask_quality = (float(metrics.get("mask_max", 0.0)) - mask_required) / max(
+            1e-6,
+            1.0 - mask_required,
+        )
+        mask_quality = float(np.clip(mask_quality, 0.0, 1.0))
+        if int(stage) == 4:
+            min_clearance = float(self.config.stage4_reset_min_body_clearance)
+            max_clearance = float(self.config.recovery_max_body_clearance)
+            clearance = float(metrics.get("body_clearance", 0.0))
+            target_clearance = 0.5 * (min_clearance + max_clearance)
+            clearance_quality = 1.0 - abs(clearance - target_clearance) / max(
+                1e-6,
+                max_clearance - min_clearance,
+            )
+            clearance_quality = float(np.clip(clearance_quality, 0.0, 1.0))
+            lidar_quality = 1.0 - float(metrics.get("min_lidar", 0.0)) / max(
+                1e-6,
+                float(self.config.recovery_max_lidar_distance),
+            )
+            lidar_quality = float(np.clip(lidar_quality, 0.0, 1.0))
+            articulation_quality = abs(float(state.phi)) / max(
+                1e-6,
+                float(self.vehicle_params.phi_max),
+            )
+            articulation_quality = float(np.clip(articulation_quality, 0.0, 1.0))
+            return float(
+                0.40 * mask_quality
+                + 0.30 * clearance_quality
+                + 0.15 * lidar_quality
+                + 0.15 * articulation_quality
+            )
+        clearance_quality = 1.0 / (1.0 + max(0.0, float(metrics.get("body_clearance", 0.0))))
+        return float(0.70 * mask_quality + 0.30 * clearance_quality)
+
+    def _annotate_reset_candidate_metrics(self, state, stage, metrics):
+        annotated = dict(metrics)
+        clearance_bucket = self._reset_clearance_bucket(
+            annotated.get("body_clearance", 0.0),
+            stage,
+        )
+        mask_bucket = self._reset_mask_bucket(
+            annotated.get("mask_max", 0.0),
+            annotated.get("mask_required", self._reset_mask_threshold(stage)),
+        )
+        pose_bucket = self._reset_pose_bucket(state, self.slot, stage)
+        annotated["clearance_bucket"] = str(clearance_bucket)
+        annotated["mask_bucket"] = str(mask_bucket)
+        annotated["pose_bucket"] = str(pose_bucket)
+        annotated["distance_bucket"] = str(
+            self._reset_distance_bucket(state, self.slot, stage)
+        )
+        annotated["candidate_score"] = float(
+            self._reset_candidate_score(state, stage, annotated)
+        )
+        return annotated
+
+    def _record_reset_candidate(self, bank, state, scenario, stage):
+        bank["size"] = int(bank.get("size", 0)) + 1
+        valid, reject_reason, metrics = self._reset_candidate_viability(state, stage)
+        if not valid:
+            reject_counts = bank["reject_counts"]
+            reject_counts[reject_reason] = reject_counts.get(reject_reason, 0) + 1
+            return
+        metrics = self._annotate_reset_candidate_metrics(state, stage, metrics)
+        bucket_key = (
+            str(metrics["clearance_bucket"]),
+            str(metrics["mask_bucket"]),
+            str(metrics["pose_bucket"]),
+            str(metrics["distance_bucket"]),
+        )
+        bank["candidates"].append(
+            {
+                "state": state,
+                "scenario": str(scenario),
+                "metrics": metrics,
+                "bucket_key": bucket_key,
+                "score": float(metrics["candidate_score"]),
+            }
+        )
+
+    def _build_reset_candidate_bank(self, stage, goal, axis, normal):
+        scene_seed = int(self.scene.metadata["seed"])
+        cache_key = (scene_seed, int(stage))
+        cached = self._reset_candidate_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bank = {
+            "cache_key": cache_key,
+            "size": 0,
+            "candidates": [],
+            "reject_counts": self._reset_reject_counts(),
+        }
+        index = max(0, min(3, int(stage) - 1))
+        distance_range = self.config.stage_distance_ranges[index]
+        lateral_range = float(self.config.stage_lateral_ranges[index])
+        heading_range = math.radians(float(self.config.stage_heading_ranges_deg[index]))
+        phi_range = math.radians(float(self.config.stage_phi_ranges_deg[index]))
+
+        if int(stage) == 4:
+            # Stage 4 needs near-obstacle recovery states. Pure uniform sampling spends
+            # most attempts in collision or fully blocked-mask poses in the narrow 5 m corridor.
+            for state, scenario in self._structured_recovery_state(goal, axis, normal):
+                self._record_reset_candidate(bank, state, scenario, stage)
+        else:
+            count = 160 if int(stage) < 3 else 240
+            rows = self._low_discrepancy_rows(
+                count,
+                4,
+                (scene_seed, int(stage), 0xA71CE),
+            )
+            for candidate_index, row in enumerate(rows):
+                distance = self._lerp(distance_range[0], distance_range[1], row[0])
+                lateral = (2.0 * row[1] - 1.0) * lateral_range
+                heading_error = (2.0 * row[2] - 1.0) * heading_range
+                phi = (2.0 * row[3] - 1.0) * phi_range
+                scenario = {
+                    1: "near_goal",
+                    2: "near_goal_obstacles",
+                    3: "poor_terminal_pose",
+                }[int(stage)]
+                if int(stage) == 3:
+                    pose_mode = int(candidate_index % 3)
+                    if pose_mode == 0:
+                        min_heading = math.radians(self.config.poor_pose_min_heading_deg)
+                        magnitude = self._lerp(min_heading, heading_range, row[2])
+                        heading_error = math.copysign(
+                            magnitude,
+                            -1.0 if row[3] < 0.5 else 1.0,
+                        )
+                        scenario = "poor_terminal_heading"
+                    elif pose_mode == 1:
+                        min_lateral = min(
+                            float(self.config.poor_pose_min_lateral),
+                            lateral_range,
+                        )
+                        magnitude = self._lerp(min_lateral, lateral_range, row[1])
+                        lateral = math.copysign(
+                            magnitude,
+                            -1.0 if row[2] < 0.5 else 1.0,
+                        )
+                        scenario = "poor_terminal_lateral"
+                    else:
+                        min_phi = math.radians(self.config.poor_pose_min_abs_phi_deg)
+                        magnitude = self._lerp(min_phi, phi_range, row[3])
+                        phi = math.copysign(
+                            magnitude,
+                            -1.0 if row[1] < 0.5 else 1.0,
+                        )
+                        scenario = "poor_terminal_articulation"
+                state = self._state_from_goal_offsets(
+                    goal,
+                    axis,
+                    normal,
+                    distance,
+                    lateral,
+                    heading_error,
+                    phi,
+                )
+                self._record_reset_candidate(bank, state, scenario, stage)
+
+        bank["valid_count"] = int(len(bank["candidates"]))
+        bank["bucket_count"] = int(
+            len({candidate["bucket_key"] for candidate in bank["candidates"]})
+        )
+        self._reset_candidate_cache[cache_key] = bank
+        return bank
+
+    def _select_reset_candidate_from_bank(self, bank):
+        candidates = list(bank.get("candidates", ()))
+        if not candidates:
+            return None
+        buckets = sorted({candidate["bucket_key"] for candidate in candidates})
+        cache_key = bank.get("cache_key", ("", 0))
+        counts = {
+            bucket: int(
+                self._reset_candidate_bucket_counts.get((cache_key, bucket), 0)
+            )
+            for bucket in buckets
+        }
+        min_count = min(counts.values())
+        eligible_buckets = [bucket for bucket in buckets if counts[bucket] == min_count]
+        bucket = eligible_buckets[int(self.rng.integers(0, len(eligible_buckets)))]
+        bucket_candidates = [
+            candidate for candidate in candidates if candidate["bucket_key"] == bucket
+        ]
+        weights = np.asarray(
+            [
+                0.50 + 0.50 * float(np.clip(candidate.get("score", 0.0), 0.0, 1.0))
+                for candidate in bucket_candidates
+            ],
+            dtype=np.float64,
+        )
+        weights = weights / float(np.sum(weights))
+        choice_index = int(self.rng.choice(len(bucket_candidates), p=weights))
+        self._reset_candidate_bucket_counts[(cache_key, bucket)] = counts[bucket] + 1
+        return bucket_candidates[choice_index]
+
     def _finalize_reset_candidate(
         self,
         state,
@@ -315,6 +637,7 @@ class LocalParkingEnv:
         metrics,
         reject_counts,
     ):
+        metrics = self._annotate_reset_candidate_metrics(state, stage, metrics)
         self.initial_sampling_diagnostics.update(
             {
                 "reset_candidate_reject_collision_count": int(
@@ -346,6 +669,15 @@ class LocalParkingEnv:
                     metrics.get("body_clearance", 0.0)
                 ),
                 "reset_initial_min_lidar_m": float(metrics.get("min_lidar", 0.0)),
+                "reset_candidate_selected_clearance_bucket": str(
+                    metrics.get("clearance_bucket", "")
+                ),
+                "reset_candidate_selected_pose_bucket": str(
+                    metrics.get("pose_bucket", "")
+                ),
+                "reset_candidate_selected_mask_max": float(
+                    metrics.get("mask_max", 0.0)
+                ),
             }
         )
         self.initial_sampling_diagnostics["initial_task_family"] = str(task_family)
@@ -663,35 +995,151 @@ class LocalParkingEnv:
         )
 
     def _structured_recovery_state(self, goal, axis, normal):
-        """Search a small Bay-mouth boundary band after random sampling fails."""
+        """Generate deterministic Stage 4 recovery candidates for the current scene."""
         candidates = []
-        for distance in np.arange(8.0, 12.01, 0.5):
-            for lateral_abs in np.arange(3.5, 4.51, 0.25):
-                for lateral_sign in (-1.0, 1.0):
-                    for heading_abs in np.arange(30.0, 50.01, 5.0):
-                        for heading_sign in (-1.0, 1.0):
-                            for phi_deg in (-30.0, -24.0, -18.0, 18.0, 24.0, 30.0):
-                                candidates.append(
-                                    (
-                                        float(distance),
-                                        float(lateral_sign * lateral_abs),
-                                        float(heading_sign * heading_abs),
-                                        float(phi_deg),
-                                    )
-                                )
-        for candidate_index in self.rng.permutation(len(candidates)):
-            distance, lateral, heading_deg, phi_deg = candidates[candidate_index]
-            center = np.asarray(goal.center) - distance * axis + lateral * normal
-            theta_front = wrap_to_pi(goal.theta_goal + math.radians(heading_deg))
-            state = ArticulatedState(
-                x_front=float(center[0]),
-                y_front=float(center[1]),
-                theta_front=float(theta_front),
-                theta_rear=float(wrap_to_pi(theta_front - math.radians(phi_deg))),
+        index = 3
+        distance_range = self.config.stage_distance_ranges[index]
+        lateral_range = float(self.config.stage_lateral_ranges[index])
+        heading_limit_deg = float(self.config.stage_heading_ranges_deg[index])
+        phi_limit_deg = float(self.config.stage_phi_ranges_deg[index])
+        min_phi_deg = float(self.config.recovery_min_abs_phi_deg)
+
+        def unique_sorted(values):
+            result = []
+            for value in values:
+                value = float(np.round(float(value), 3))
+                if value not in result:
+                    result.append(value)
+            return result
+
+        def bounded_distance(value):
+            return float(np.clip(float(value), float(distance_range[0]), float(distance_range[1])))
+
+        def bounded_lateral(value):
+            return float(np.clip(float(value), -lateral_range, lateral_range))
+
+        def add_offset_candidate(distance, lateral, heading_deg, phi_deg):
+            heading_deg = float(np.clip(float(heading_deg), -heading_limit_deg, heading_limit_deg))
+            phi_deg = float(np.clip(float(phi_deg), -phi_limit_deg, phi_limit_deg))
+            state = self._state_from_goal_offsets(
+                goal,
+                axis,
+                normal,
+                bounded_distance(distance),
+                bounded_lateral(lateral),
+                math.radians(heading_deg),
+                math.radians(phi_deg),
             )
-            if self._valid_recovery_state(state):
-                return state
-        return None
+            candidates.append((state, "recovery"))
+
+        toward_goal_modes = (
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (-10.0, 0.0),
+            (0.0, 8.0),
+            (0.0, -8.0),
+        )
+        slight_yaw_modes = (
+            (18.0, 12.0),
+            (-18.0, -12.0),
+            (24.0, -min_phi_deg),
+            (-24.0, min_phi_deg),
+        )
+        recovery_modes = (
+            (35.0, min_phi_deg),
+            (-35.0, -min_phi_deg),
+            (45.0, 24.0),
+            (-45.0, -24.0),
+            (heading_limit_deg, phi_limit_deg),
+            (-heading_limit_deg, -phi_limit_deg),
+            (35.0, -24.0),
+            (-35.0, 24.0),
+        )
+
+        core_distances = unique_sorted(
+            bounded_distance(value)
+            for value in (
+                4.5,
+                6.0,
+                7.5,
+                9.0,
+                10.5,
+                12.0,
+                14.0,
+                16.5,
+                19.5,
+            )
+        )
+        center_laterals = unique_sorted((0.0, -0.8, 0.8, -1.4, 1.4))
+        near_wall_laterals = unique_sorted(
+            (
+                -0.55 * lateral_range,
+                -0.78 * lateral_range,
+                -0.96 * lateral_range,
+                0.55 * lateral_range,
+                0.78 * lateral_range,
+                0.96 * lateral_range,
+            )
+        )
+
+        for distance in core_distances:
+            for lateral in center_laterals:
+                for heading_deg, phi_deg in toward_goal_modes + slight_yaw_modes:
+                    add_offset_candidate(distance, lateral, heading_deg, phi_deg)
+
+        for distance in core_distances[1:-1]:
+            for lateral in near_wall_laterals:
+                for heading_deg, phi_deg in slight_yaw_modes + recovery_modes:
+                    add_offset_candidate(distance, lateral, heading_deg, phi_deg)
+
+        mouth_center = np.asarray(self.scene.target_bay.mouth_center, dtype=np.float64)
+        goal_center = np.asarray(goal.center, dtype=np.float64)
+        mouth_distance = float(np.dot(goal_center - mouth_center, axis))
+        mouth_distances = unique_sorted(
+            bounded_distance(mouth_distance + offset) for offset in (0.5, 2.0, 3.5, 5.0)
+        )
+        mouth_laterals = unique_sorted(
+            (
+                -0.90 * lateral_range,
+                -0.45 * lateral_range,
+                0.0,
+                0.45 * lateral_range,
+                0.90 * lateral_range,
+            )
+        )
+        for distance in mouth_distances:
+            for lateral in mouth_laterals:
+                for heading_deg, phi_deg in toward_goal_modes + recovery_modes:
+                    add_offset_candidate(distance, lateral, heading_deg, phi_deg)
+
+        if int(self.scene.metadata.get("stage", 0)) >= 4:
+            corridor_heading = float(self.scene.metadata.get("corridor_heading", goal.theta_goal))
+            corridor_axis = np.asarray(
+                [math.cos(corridor_heading), math.sin(corridor_heading)],
+                dtype=np.float64,
+            )
+            corridor_normal = np.asarray([-corridor_axis[1], corridor_axis[0]], dtype=np.float64)
+            corridor_origin = np.asarray(
+                self.scene.metadata.get("corridor_origin", (0.0, 0.0)),
+                dtype=np.float64,
+            )
+            target_along = float(self.scene.metadata.get("target_bay_along", 0.0))
+            for along in unique_sorted((target_along - 4.0, target_along, target_along + 4.0, 2.0)):
+                for lateral in (-9.5, -11.5, -13.5):
+                    center = corridor_origin + corridor_axis * float(along) + corridor_normal * lateral
+                    for heading_deg, phi_deg in recovery_modes:
+                        theta_front = wrap_to_pi(goal.theta_goal + math.radians(heading_deg))
+                        state = ArticulatedState(
+                            x_front=float(center[0]),
+                            y_front=float(center[1]),
+                            theta_front=float(theta_front),
+                            theta_rear=float(
+                                wrap_to_pi(theta_front - math.radians(float(phi_deg)))
+                            ),
+                        )
+                        candidates.append((state, "recovery"))
+
+        return candidates
 
     def _sample_initial_state(self):
         stage = int(np.clip(self._active_stage, 1, 4))
@@ -738,13 +1186,34 @@ class LocalParkingEnv:
         self.initial_sampling_diagnostics = dict(sampling_diagnostics)
 
         fallback_used = False
-        reject_counts = {
-            "collision": 0,
-            "mask": 0,
-            "clearance": 0,
-            "recovery_clearance": 0,
-            "recovery_lidar": 0,
-        }
+        bank = self._build_reset_candidate_bank(stage, goal, axis, normal)
+        self.initial_sampling_diagnostics.update(
+            {
+                "reset_candidate_bank_size": int(bank.get("size", 0)),
+                "reset_candidate_bank_valid_count": int(
+                    bank.get("valid_count", 0)
+                ),
+                "reset_candidate_selected_clearance_bucket": "",
+                "reset_candidate_selected_pose_bucket": "",
+                "reset_candidate_selected_mask_max": 0.0,
+                "reset_candidate_bank_empty": bool(
+                    int(bank.get("valid_count", 0)) <= 0
+                ),
+            }
+        )
+        reject_counts = dict(bank.get("reject_counts", self._reset_reject_counts()))
+        selected_candidate = self._select_reset_candidate_from_bank(bank)
+        if selected_candidate is not None:
+            return self._finalize_reset_candidate(
+                selected_candidate["state"],
+                selected_candidate["scenario"],
+                fallback_used,
+                stage,
+                task_family,
+                selected_candidate["metrics"],
+                reject_counts,
+            )
+
         for _ in range(max(1, int(self.config.initial_sampling_attempts))):
             distance = self.rng.uniform(*distance_range)
             lateral = self.rng.uniform(-effective_lateral_range, effective_lateral_range)
@@ -815,22 +1284,32 @@ class LocalParkingEnv:
             )
 
         if stage == 4:
-            state = self._structured_recovery_state(goal, axis, normal)
+            fallback_used = True
+            recovery_candidates = self._structured_recovery_state(goal, axis, normal)
+            state = None
+            metrics = {}
+            reject_reason = ""
+            if recovery_candidates:
+                for candidate_index in self.rng.permutation(len(recovery_candidates)):
+                    candidate_state, _ = recovery_candidates[int(candidate_index)]
+                    valid, reject_reason, candidate_metrics = (
+                        self._reset_candidate_viability(
+                            candidate_state,
+                            stage=stage,
+                        )
+                    )
+                    if not valid:
+                        reject_counts[reject_reason] = (
+                            reject_counts.get(reject_reason, 0) + 1
+                        )
+                        continue
+                    state = candidate_state
+                    metrics = candidate_metrics
+                    break
             if state is None:
                 raise ResetInitialStateError(
                     "no reset-viable near-obstacle recovery state for scene seed {}".format(
                         self.scene.metadata["seed"]
-                    )
-                )
-            valid, reject_reason, metrics = self._reset_candidate_viability(
-                state,
-                stage=stage,
-            )
-            if not valid:
-                raise ResetInitialStateError(
-                    "structured recovery state failed reset viability for scene seed {} reason {}".format(
-                        self.scene.metadata["seed"],
-                        reject_reason,
                     )
                 )
             return self._finalize_reset_candidate(
@@ -1111,6 +1590,7 @@ class LocalParkingEnv:
             "approach_side_bucket",
             "scene_complexity_bucket",
             "difficulty_label",
+            "corridor_width",
             "nominal_target_collision",
             "nominal_target_front_in_bay",
             "nominal_target_rear_in_bay",
@@ -1118,6 +1598,8 @@ class LocalParkingEnv:
             "success_neighborhood_sample_count",
             "success_neighborhood_collision_free_count",
             "success_neighborhood_feasible_count",
+            "reset_geometry_candidate_count",
+            "reset_geometry_recovery_band_count",
             "constructed_obstacle_feature_count",
             "constructed_wall_feature_count",
             "scene_generation_attempt_count",
