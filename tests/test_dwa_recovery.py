@@ -2,6 +2,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+from shapely.geometry import box
 
 from config import DEFAULT_ENV_CONFIG, DEFAULT_VEHICLE_PARAMS
 from env.articulated_action_mask import FORWARD_GEAR
@@ -129,9 +130,70 @@ def test_dwa_unlock_deadlocks_when_safe_ratio_never_recovers(synthetic_action_ma
     assert result.raw_action is None
 
 
+def test_dwa_unlock_accepts_prefix_before_later_invalid(synthetic_action_mask):
+    cfg = replace(DEFAULT_ENV_CONFIG, dwa_horizon_steps=3, dwa_unlock_safe_ratio=0.08)
+    scene = SimpleNamespace(
+        world_bounds=(-10.0, -10.0, 10.0, 10.0),
+        prepared_obstacles=_EmptyPrepared(),
+    )
+    slot = SimpleNamespace()
+    initial_state = SimpleNamespace(phi=0.0, sim_step=0)
+
+    class PrefixVehicleModel:
+        params = SimpleNamespace(
+            phi_max=10.0,
+            dt=1.0,
+        )
+
+        def step(self, state, action):
+            return SimpleNamespace(
+                phi=float(state.phi) + float(action[1]),
+                sim_step=int(getattr(state, "sim_step", 0)) + 1,
+            )
+
+        def body_boxes(self, state):
+            if int(getattr(state, "sim_step", 0)) >= 2:
+                return box(20.0, 0.0, 21.0, 1.0), box(20.0, 0.0, 21.0, 1.0)
+            return box(0.0, 0.0, 1.0, 1.0), box(0.0, 0.0, 1.0, 1.0)
+
+    def compute_mask(phi, front_lidar, rear_lidar):
+        del front_lidar, rear_lidar
+        if abs(float(phi)) > 0.0:
+            return np.full((2, 11), 0.10, dtype=np.float32)
+        return np.zeros((2, 11), dtype=np.float32)
+
+    synthetic_action_mask.compute_mask = compute_mask
+    controller = DWARecoveryController(cfg)
+    result = controller.run_unlock(
+        initial_state,
+        slot,
+        scene,
+        PrefixVehicleModel(),
+        _FakeLidar(),
+        synthetic_action_mask,
+        np.zeros((2, 11), dtype=np.float32),
+        None,
+        None,
+        None,
+        cfg,
+    )
+
+    assert result.used is True
+    assert result.unlock_success is True
+    assert result.deadlock is False
+    assert result.unlock_step == 1
+    assert result.valid_candidate_count >= 1
+    assert result.final_max_safe_ratio >= cfg.dwa_unlock_safe_ratio
+
+
 def test_env_default_config_keeps_dwa_disabled(synthetic_action_mask):
+    cfg = replace(
+        DEFAULT_ENV_CONFIG,
+        enable_dwa_recovery=False,
+        dwa_override_policy_action=False,
+    )
     env = LocalParkingEnv(
-        config=DEFAULT_ENV_CONFIG,
+        config=cfg,
         action_mask=synthetic_action_mask,
         seed=13,
     )

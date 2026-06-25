@@ -20,6 +20,7 @@ class DWAResult:
     final_max_safe_ratio: float = 0.0
     best_score: object = None
     unlock_success: bool = False
+    unlock_step: int = -1
     deadlock: bool = False
 
 
@@ -132,6 +133,7 @@ class DWARecoveryController:
         need_metrics=True,
         track_success=True,
         target_front_box=None,
+        stop_safe_ratio=None,
     ):
         horizon = max(1, int(getattr(self.config, "dwa_horizon_steps", 1)))
         current = state
@@ -150,7 +152,8 @@ class DWARecoveryController:
             if need_metrics
             else None
         )
-        for _ in range(horizon):
+        stop_ratio = None if stop_safe_ratio is None else float(stop_safe_ratio)
+        for step_index in range(1, horizon + 1):
             current = vehicle_model.step(current, action)
             invalid, front_box, _ = self._state_invalid(current, scene, vehicle_model)
             if invalid:
@@ -161,6 +164,8 @@ class DWARecoveryController:
                     "final_ratio": float(final_ratio),
                     "metrics": final_metrics,
                     "success_reached": bool(success_reached),
+                    "step": int(step_index),
+                    "unlock_step": -1,
                 }
             final_ratio = self._future_mask_ratio(
                 current,
@@ -170,6 +175,17 @@ class DWARecoveryController:
                 action_mask,
             )
             max_future_ratio = max(max_future_ratio, final_ratio)
+            if stop_ratio is not None and final_ratio >= stop_ratio:
+                return {
+                    "valid": True,
+                    "state": current,
+                    "max_future_ratio": float(max_future_ratio),
+                    "final_ratio": float(final_ratio),
+                    "metrics": final_metrics,
+                    "success_reached": bool(success_reached),
+                    "step": int(step_index),
+                    "unlock_step": int(step_index),
+                }
             if need_metrics:
                 final_metrics = self._metrics(
                     current,
@@ -186,6 +202,8 @@ class DWARecoveryController:
             "final_ratio": float(final_ratio),
             "metrics": final_metrics,
             "success_reached": bool(success_reached),
+            "step": int(horizon),
+            "unlock_step": -1,
         }
 
     def run_unlock(
@@ -225,6 +243,8 @@ class DWARecoveryController:
                     "final_ratio": float(current_ratio),
                     "metrics": None,
                     "success_reached": False,
+                    "step": 0,
+                    "unlock_step": 0 if current_ratio >= threshold else -1,
                 }
             else:
                 rollout = self._simulate(
@@ -237,6 +257,7 @@ class DWARecoveryController:
                     action_mask,
                     need_metrics=False,
                     track_success=False,
+                    stop_safe_ratio=threshold,
                 )
             best_future_ratio = max(best_future_ratio, rollout["max_future_ratio"])
             if not bool(rollout["valid"]):
@@ -280,6 +301,7 @@ class DWARecoveryController:
                 final_max_safe_ratio=float(best_future_ratio),
                 best_score=best_collision_free_score,
                 unlock_success=False,
+                unlock_step=-1,
                 deadlock=True,
             )
         return DWAResult(
@@ -293,6 +315,7 @@ class DWARecoveryController:
             final_max_safe_ratio=float(best["final_ratio"]),
             best_score=best_score,
             unlock_success=True,
+            unlock_step=int(best.get("unlock_step", -1)),
             deadlock=False,
         )
 

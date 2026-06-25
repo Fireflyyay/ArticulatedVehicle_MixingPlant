@@ -118,7 +118,7 @@ class MixingPlantSceneConfig:
 
 @dataclass(frozen=True)
 class LocalParkingEnvConfig:
-    max_steps: int = 400
+    max_steps: int = 600
     collision_tolerance: float = 1e-8
     articulation_tolerance: float = math.radians(1.0)
     success_overlap: float = 0.80

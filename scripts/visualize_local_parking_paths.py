@@ -523,10 +523,11 @@ def _plot_scene_and_path(
     ]
     if bool(info.get("dwa_triggered", False)):
         summary_lines.append(
-            "dwa: mode={} override={} unlock={} deadlock={} valid={}/{} r={:.3f}".format(
+            "dwa: mode={} override={} unlock={} step={} deadlock={} valid={}/{} r={:.3f}".format(
                 str(info.get("dwa_mode", "none")),
                 int(bool(info.get("dwa_override_policy_action", False))),
                 int(bool(info.get("dwa_unlock_success", False))),
+                int(info.get("dwa_unlock_step", -1)),
                 int(bool(info.get("deadlock", False))),
                 int(info.get("dwa_valid_candidate_count", 0)),
                 int(info.get("dwa_candidate_count", 0)),

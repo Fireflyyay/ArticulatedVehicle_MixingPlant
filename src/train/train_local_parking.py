@@ -937,6 +937,7 @@ def _evaluate_policy_by_family(
                         "dwa_unlock_success": bool(
                             final_info.get("dwa_unlock_success", False)
                         ),
+                        "dwa_unlock_step": int(final_info.get("dwa_unlock_step", -1)),
                         "dwa_deadlock": bool(final_info.get("dwa_deadlock", False)),
                         "dwa_valid_candidate_count": int(
                             final_info.get("dwa_valid_candidate_count", 0)
@@ -1725,6 +1726,7 @@ def train(args):
             "dwa_unlock_success": bool(
                 final_info.get("dwa_unlock_success", False)
             ),
+            "dwa_unlock_step": int(final_info.get("dwa_unlock_step", -1)),
             "dwa_deadlock": bool(final_info.get("dwa_deadlock", False)),
             "dwa_final_max_safe_ratio": float(
                 final_info.get("dwa_final_max_safe_ratio", 0.0)

@@ -57,7 +57,12 @@ def test_ppo_rollout_shapes_and_raw_action_log_prob(synthetic_action_mask):
 
 def test_env_step_lifts_degenerate_mask_before_executing_action(synthetic_action_mask):
     env = LocalParkingEnv(
-        config=replace(DEFAULT_ENV_CONFIG, enable_mask_floor_fallback=True),
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            enable_mask_floor_fallback=True,
+            enable_dwa_recovery=False,
+            dwa_override_policy_action=False,
+        ),
         action_mask=synthetic_action_mask,
         seed=3,
     )
@@ -89,7 +94,12 @@ def test_env_step_lifts_degenerate_mask_before_executing_action(synthetic_action
 
 def test_env_step_can_disable_mask_floor_fallback(synthetic_action_mask):
     env = LocalParkingEnv(
-        config=replace(DEFAULT_ENV_CONFIG, enable_mask_floor_fallback=False),
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            enable_mask_floor_fallback=False,
+            enable_dwa_recovery=False,
+            dwa_override_policy_action=False,
+        ),
         action_mask=synthetic_action_mask,
         seed=3,
     )

@@ -77,6 +77,7 @@ def _compact_info(info):
         "dwa_candidate_count",
         "dwa_valid_candidate_count",
         "dwa_unlock_success",
+        "dwa_unlock_step",
         "dwa_deadlock",
         "dwa_final_max_safe_ratio",
         "dwa_override_policy_action",

@@ -92,6 +92,57 @@ def test_stage4_scene_keeps_narrow_corridor_obstacle_categories_and_reset_audit(
         assert scene.metadata["reset_geometry_recovery_band_count"] > 0
 
 
+def _in_target_bay_approach_band(scene, state):
+    bay = scene.target_bay
+    mouth = np.asarray(bay.mouth_center, dtype=np.float64)
+    corridor_axis = np.asarray(
+        [math.cos(bay.corridor_heading), math.sin(bay.corridor_heading)],
+        dtype=np.float64,
+    )
+    inward_axis = np.asarray(
+        [math.cos(bay.inward_heading), math.sin(bay.inward_heading)],
+        dtype=np.float64,
+    )
+    delta = np.asarray((state.x_front, state.y_front), dtype=np.float64) - mouth
+    along = abs(float(np.dot(delta, corridor_axis)))
+    inward = float(np.dot(delta, inward_axis))
+    bay_half_width = 0.5 * float(DEFAULT_SCENE_CONFIG.head_in_bay_width)
+    corridor_width = float(scene.metadata["corridor_width"])
+    return bool(
+        along
+        <= bay_half_width + float(DEFAULT_ENV_CONFIG.stage_lateral_ranges[3]) + 0.75
+        and -corridor_width - 0.75
+        <= inward
+        <= float(DEFAULT_SCENE_CONFIG.head_in_bay_depth) + 0.75
+    )
+
+
+def test_stage4_structured_recovery_candidates_stay_at_target_bay_approach(
+    synthetic_action_mask,
+):
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=4, scene_pool_size=1),
+        action_mask=synthetic_action_mask,
+        seed=10,
+    )
+    for seed in (32690671, 4009347464, 600, 601, 602, 603):
+        scene = generate_cached_mixing_plant_scene(stage=4, seed=seed)
+        env.scene = scene
+        env.slot = scene.slot
+        axis = np.asarray(
+            [math.cos(scene.slot.theta_goal), math.sin(scene.slot.theta_goal)],
+            dtype=np.float64,
+        )
+        normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+        bank = env._build_reset_candidate_bank(4, scene.slot, axis, normal)
+        candidates = bank["candidates"]
+        assert candidates
+        assert all(
+            _in_target_bay_approach_band(scene, candidate["state"])
+            for candidate in candidates
+        )
+
+
 def test_different_seeds_produce_distinct_parameterized_layouts():
     scenes = [
         generate_cached_mixing_plant_scene(
@@ -254,6 +305,7 @@ def test_recovery_samples_are_diverse_near_obstacles_and_articulated(
         samples.append(info)
         state_signatures.add(tuple(np.round(env.state.as_array()[:4], 3)))
         collisions.append(env._state_collides(env.state))
+        assert _in_target_bay_approach_band(env.scene, env.state)
     assert all(item["scenario_type"] == "recovery" for item in samples)
     assert all(item["min_lidar_distance"] <= 2.2 for item in samples)
     clearances = [float(item["reset_initial_body_clearance_m"]) for item in samples]

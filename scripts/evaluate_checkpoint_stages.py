@@ -178,6 +178,7 @@ def evaluate_checkpoint(
                         "dwa_unlock_success": bool(
                             final_info.get("dwa_unlock_success", False)
                         ),
+                        "dwa_unlock_step": int(final_info.get("dwa_unlock_step", -1)),
                         "dwa_deadlock": bool(final_info.get("dwa_deadlock", False)),
                         "front_overlap": float(final_info["front_overlap"]),
                         "heading_error_deg": float(final_info["heading_error_deg"]),

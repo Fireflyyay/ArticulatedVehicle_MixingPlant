@@ -252,6 +252,7 @@ class LocalParkingEnv:
             "dwa_candidate_count": 0,
             "dwa_valid_candidate_count": 0,
             "dwa_unlock_success": False,
+            "dwa_unlock_step": -1,
             "dwa_deadlock": False,
             "dwa_final_max_safe_ratio": 0.0,
             "dwa_best_score": (),
@@ -298,6 +299,7 @@ class LocalParkingEnv:
                 "dwa_candidate_count": int(result.candidate_count),
                 "dwa_valid_candidate_count": int(result.valid_candidate_count),
                 "dwa_unlock_success": bool(result.unlock_success),
+                "dwa_unlock_step": int(getattr(result, "unlock_step", -1)),
                 "dwa_deadlock": bool(result.deadlock),
                 "dwa_final_max_safe_ratio": float(result.final_max_safe_ratio),
                 "dwa_best_score": self._score_to_info(result.best_score),
@@ -420,11 +422,53 @@ class LocalParkingEnv:
             "mask_required": self._reset_mask_threshold(stage),
         }
 
+    def _stage4_target_access_metrics(self, state):
+        bay = self.scene.target_bay
+        mouth = np.asarray(bay.mouth_center, dtype=np.float64)
+        corridor_axis = np.asarray(
+            [math.cos(float(bay.corridor_heading)), math.sin(float(bay.corridor_heading))],
+            dtype=np.float64,
+        )
+        inward_axis = np.asarray(
+            [math.cos(float(bay.inward_heading)), math.sin(float(bay.inward_heading))],
+            dtype=np.float64,
+        )
+        center = np.asarray((state.x_front, state.y_front), dtype=np.float64)
+        delta = center - mouth
+        along = abs(float(np.dot(delta, corridor_axis)))
+        inward = float(np.dot(delta, inward_axis))
+        mouth_a = np.asarray(bay.mouth_segment[0], dtype=np.float64)
+        mouth_b = np.asarray(bay.mouth_segment[1], dtype=np.float64)
+        mouth_half_width = 0.5 * float(np.linalg.norm(mouth_b - mouth_a))
+        bay_coords = np.asarray(bay.polygon.exterior.coords[:-1], dtype=np.float64)
+        bay_depth = float(np.max((bay_coords - mouth).dot(inward_axis)))
+        corridor_width = float(self.scene.metadata.get("corridor_width", 0.0))
+        along_limit = mouth_half_width + float(self.config.stage_lateral_ranges[3]) + 0.75
+        inward_min = -corridor_width - 0.75
+        inward_max = bay_depth + 0.75
+        valid = bool(along <= along_limit and inward_min <= inward <= inward_max)
+        return valid, {
+            "target_access_along_m": float(along),
+            "target_access_inward_m": float(inward),
+            "target_access_along_limit_m": float(along_limit),
+            "target_access_inward_min_m": float(inward_min),
+            "target_access_inward_max_m": float(inward_max),
+        }
+
     def _reset_candidate_viability(self, state, stage):
         if self._state_collides(state):
             return False, "collision", {}
 
+        target_access_metrics = {}
+        if int(stage) == 4:
+            target_access_valid, target_access_metrics = (
+                self._stage4_target_access_metrics(state)
+            )
+            if not target_access_valid:
+                return False, "target_access", target_access_metrics
+
         metrics = self._reset_candidate_metrics(state, stage)
+        metrics.update(target_access_metrics)
         if float(metrics["mask_max"]) <= float(metrics["mask_required"]):
             return False, "mask", metrics
 
@@ -452,6 +496,7 @@ class LocalParkingEnv:
             "clearance": 0,
             "recovery_clearance": 0,
             "recovery_lidar": 0,
+            "target_access": 0,
         }
 
     @staticmethod
@@ -792,6 +837,9 @@ class LocalParkingEnv:
                 "reset_candidate_reject_recovery_lidar_count": int(
                     reject_counts.get("recovery_lidar", 0)
                 ),
+                "reset_candidate_reject_target_access_count": int(
+                    reject_counts.get("target_access", 0)
+                ),
                 "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
                 "reset_initial_mask_degenerate": bool(
                     metrics.get("mask_degenerate", False)
@@ -853,6 +901,7 @@ class LocalParkingEnv:
             "clearance": 0,
             "recovery_clearance": 0,
             "recovery_lidar": 0,
+            "target_access": 0,
         }
         last_reason = ""
         last_metrics = {}
@@ -932,6 +981,9 @@ class LocalParkingEnv:
                     ),
                     "reset_candidate_reject_recovery_lidar_count": int(
                         reject_counts.get("recovery_lidar", 0)
+                    ),
+                    "reset_candidate_reject_target_access_count": int(
+                        reject_counts.get("target_access", 0)
                     ),
                     "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
                     "reset_initial_mask_degenerate": bool(
@@ -1248,33 +1300,6 @@ class LocalParkingEnv:
             for lateral in mouth_laterals:
                 for heading_deg, phi_deg in toward_goal_modes + recovery_modes:
                     add_offset_candidate(distance, lateral, heading_deg, phi_deg)
-
-        if int(self.scene.metadata.get("stage", 0)) >= 4:
-            corridor_heading = float(self.scene.metadata.get("corridor_heading", goal.theta_goal))
-            corridor_axis = np.asarray(
-                [math.cos(corridor_heading), math.sin(corridor_heading)],
-                dtype=np.float64,
-            )
-            corridor_normal = np.asarray([-corridor_axis[1], corridor_axis[0]], dtype=np.float64)
-            corridor_origin = np.asarray(
-                self.scene.metadata.get("corridor_origin", (0.0, 0.0)),
-                dtype=np.float64,
-            )
-            target_along = float(self.scene.metadata.get("target_bay_along", 0.0))
-            for along in unique_sorted((target_along - 4.0, target_along, target_along + 4.0, 2.0)):
-                for lateral in (-9.5, -11.5, -13.5):
-                    center = corridor_origin + corridor_axis * float(along) + corridor_normal * lateral
-                    for heading_deg, phi_deg in recovery_modes:
-                        theta_front = wrap_to_pi(goal.theta_goal + math.radians(heading_deg))
-                        state = ArticulatedState(
-                            x_front=float(center[0]),
-                            y_front=float(center[1]),
-                            theta_front=float(theta_front),
-                            theta_rear=float(
-                                wrap_to_pi(theta_front - math.radians(float(phi_deg)))
-                            ),
-                        )
-                        candidates.append((state, "recovery"))
 
         return candidates
 
