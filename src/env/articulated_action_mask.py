@@ -206,6 +206,51 @@ class ArticulatedActionMask:
         alpha = 0.5 * (float(normalized_phi_dot) + 1.0)
         return float(lower + alpha * (upper - lower))
 
+    def encode_phi_dot_to_raw(self, phi_dot, phi, dt):
+        p = self.vehicle_params
+        duration = p.dt if dt is None else float(dt)
+        if duration <= 0.0:
+            raise ValueError("dt must be positive")
+
+        phi_value = float(phi)
+        rate_limit = float(p.phi_dot_max)
+        angle_limit = float(p.phi_max)
+        lower = max(
+            -rate_limit,
+            (-angle_limit - phi_value) / duration,
+        )
+        upper = min(
+            rate_limit,
+            (angle_limit - phi_value) / duration,
+        )
+        if lower > upper:
+            recovery_rate = math.copysign(rate_limit, -phi_value)
+            lower = recovery_rate
+            upper = recovery_rate
+        if abs(upper - lower) <= 1e-12:
+            return 0.0
+
+        clipped = float(np.clip(float(phi_dot), lower, upper))
+        normalized = 2.0 * (clipped - lower) / (upper - lower) - 1.0
+        return float(np.clip(normalized, -1.0, 1.0))
+
+    def encode_action_to_raw(self, v, phi_dot, phi, dt):
+        p = self.vehicle_params
+        velocity = float(v)
+        if velocity >= 0.0:
+            vmax = float(p.parking_v_forward_max)
+            raw_v = velocity / max(vmax, 1e-12)
+        else:
+            vmax = float(p.parking_v_reverse_max)
+            raw_v = velocity / max(vmax, 1e-12)
+        return np.asarray(
+            [
+                float(np.clip(raw_v, -1.0, 1.0)),
+                self.encode_phi_dot_to_raw(phi_dot, phi, dt),
+            ],
+            dtype=np.float32,
+        )
+
     def _r_raw_at_gear_phi_dot(self, mask, gear, phi_dot_executed):
         return float(
             np.interp(
@@ -265,7 +310,7 @@ class ArticulatedActionMask:
                 v_exec = float(v_decoded)
         clip_ratio = 0.0
 
-        r_max = self._r_max_overall(mask) if gear != STOP_GEAR else 0.0
+        r_max = self._r_max_overall(mask)
         r_min = float(self.min_safe_ratio)
         tau_safe = float(getattr(config, "mask_cost_safe_threshold", 0.15))
         delta_rel = float(getattr(config, "mask_cost_rel_delta", 0.05))

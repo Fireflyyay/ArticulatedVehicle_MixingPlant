@@ -204,6 +204,19 @@ class LocalParkingEnvConfig:
     mask_floor_value: float = 0.01
     apply_floor_only_when_all_zero: bool = False
 
+    # --- Strict-mask local DWA deadlock recovery ---
+    enable_dwa_recovery: bool = True
+    dwa_override_policy_action: bool = True
+    dwa_enable_deadlock_termination: bool = False
+    dwa_all_zero_eps: float = 1e-3
+    dwa_low_safe_ratio: float = 0.05
+    dwa_unlock_safe_ratio: float = 0.08
+    dwa_forced_stop_patience: int = 3
+    dwa_no_progress_patience: int = 6
+    dwa_deadlock_patience: int = 8
+    dwa_horizon_steps: int = 4
+    dwa_speed_ratios: Tuple[float, ...] = (0.25, 0.5, 1.0)
+
     # --- Training-only HOPE teacher guidance ---
     enable_hope_teacher: bool = False
     hope_code_dir: str = "../HOPE"

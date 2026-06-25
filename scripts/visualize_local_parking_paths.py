@@ -276,6 +276,8 @@ def _status_label(info):
         return "success"
     if bool(info.get("collision", False)):
         return "collision"
+    if bool(info.get("deadlock", False)):
+        return "deadlock"
     if bool(info.get("out_of_bounds", False)):
         return "out_of_bounds"
     if bool(info.get("articulation_limit_violation", False)):
@@ -489,17 +491,24 @@ def _plot_scene_and_path(
     checkpoint_name = os.path.basename(checkpoint_path)
     policy_mode = "deterministic" if deterministic else "stochastic"
     status = _status_label(rollout.final_info)
+    info = rollout.final_info
+    dwa_tag = "dwa={} used={} mode={} unlock={}".format(
+        int(bool(info.get("dwa_triggered", False))),
+        int(bool(info.get("dwa_used", False))),
+        str(info.get("dwa_mode", "none")),
+        int(bool(info.get("dwa_unlock_success", False))),
+    )
     ax.set_title(
-        "Local parking policy path {} / {} | stage={} | {} | {}".format(
+        "Local parking policy path {} / {} | stage={} | {} | {} | {}".format(
             path_index + 1,
             total_paths,
             stage,
             status,
             policy_mode,
+            dwa_tag,
         )
     )
 
-    info = rollout.final_info
     rs_info = rollout.rs_guide_info or {}
     summary_lines = [
         "checkpoint: {}".format(checkpoint_name),
@@ -512,6 +521,18 @@ def _plot_scene_and_path(
             rollout.total_reward,
         )
     ]
+    if bool(info.get("dwa_triggered", False)):
+        summary_lines.append(
+            "dwa: mode={} override={} unlock={} deadlock={} valid={}/{} r={:.3f}".format(
+                str(info.get("dwa_mode", "none")),
+                int(bool(info.get("dwa_override_policy_action", False))),
+                int(bool(info.get("dwa_unlock_success", False))),
+                int(bool(info.get("deadlock", False))),
+                int(info.get("dwa_valid_candidate_count", 0)),
+                int(info.get("dwa_candidate_count", 0)),
+                float(info.get("dwa_final_max_safe_ratio", 0.0)),
+            )
+        )
     if bool(rs_info.get("valid", False)):
         summary_lines.append(
             "rs_guide: {} step={} len={:.1f} samples={}".format(
@@ -610,6 +631,21 @@ def main():
             "omit to render the actual RS potential latch when it occurs"
         ),
     )
+    parser.add_argument(
+        "--enable-dwa-recovery",
+        action="store_true",
+        help="Enable strict-mask DWA recovery diagnostics during rollout",
+    )
+    parser.add_argument(
+        "--dwa-override-policy-action",
+        action="store_true",
+        help="Allow DWA recovery to replace the policy action",
+    )
+    parser.add_argument(
+        "--dwa-deadlock-termination",
+        action="store_true",
+        help="Terminate repeated DWA no-candidate deadlocks",
+    )
     args = parser.parse_args()
 
     if args.num_paths <= 0:
@@ -649,6 +685,9 @@ def main():
         scene_pool_size=1,
         scene_family_schedule=(args.task_family,),
         use_hybrid_astar=False,
+        enable_dwa_recovery=bool(args.enable_dwa_recovery),
+        dwa_override_policy_action=bool(args.dwa_override_policy_action),
+        dwa_enable_deadlock_termination=bool(args.dwa_deadlock_termination),
     )
     env = LocalParkingEnv(config=env_config, seed=int(args.seed))
     deterministic = not bool(args.stochastic)
@@ -678,12 +717,17 @@ def main():
                 rs_info.get("reason", "unknown"),
             )
         print(
-            "path={} seed={} status={} steps={} reward={:.3f} {}".format(
+            "path={} seed={} status={} steps={} reward={:.3f} "
+            "dwa_triggered={} dwa_override={} dwa_mode={} unlock={} {}".format(
                 index + 1,
                 rollout_seed,
                 _status_label(rollout.final_info),
                 max(0, len(rollout.states) - 1),
                 rollout.total_reward,
+                int(bool(rollout.final_info.get("dwa_triggered", False))),
+                int(bool(rollout.final_info.get("dwa_override_policy_action", False))),
+                str(rollout.final_info.get("dwa_mode", "none")),
+                int(bool(rollout.final_info.get("dwa_unlock_success", False))),
                 rs_text,
             )
         )
@@ -707,12 +751,20 @@ def main():
         stype = rollout.reset_info.get("scenario_type", "unknown")
         status = _status_label(rollout.final_info)
         if stype not in scenarios:
-            scenarios[stype] = {"total": 0, "success": 0, "collision": 0, "timeout": 0}
+            scenarios[stype] = {
+                "total": 0,
+                "success": 0,
+                "collision": 0,
+                "timeout": 0,
+                "deadlock": 0,
+            }
         scenarios[stype]["total"] += 1
         if status == "success":
             scenarios[stype]["success"] += 1
         elif status == "collision":
             scenarios[stype]["collision"] += 1
+        elif status == "deadlock":
+            scenarios[stype]["deadlock"] += 1
         elif status == "timeout":
             scenarios[stype]["timeout"] += 1
     if len(scenarios) > 1:
@@ -720,12 +772,13 @@ def main():
         for stype in sorted(scenarios):
             s = scenarios[stype]
             print(
-                "  {}: total={} success={} collision={} timeout={}".format(
+                "  {}: total={} success={} collision={} timeout={} deadlock={}".format(
                     stype,
                     s["total"],
                     s["success"],
                     s["collision"],
                     s["timeout"],
+                    s["deadlock"],
                 )
             )
 

@@ -31,8 +31,12 @@ def _eval_config_for_mode(
     hope_weight_path,
     hope_cache_dir,
     use_teacher_reward,
+    enable_dwa_recovery=False,
+    dwa_override_policy_action=False,
+    dwa_deadlock_termination=False,
 ):
     enable_teacher = eval_mode == "guided"
+    enable_dwa = bool(eval_mode == "dwa_assisted_eval" or enable_dwa_recovery)
     return replace(
         DEFAULT_ENV_CONFIG,
         use_hybrid_astar=False,
@@ -44,6 +48,9 @@ def _eval_config_for_mode(
         use_teacher_reward=bool(use_teacher_reward and enable_teacher),
         enable_offpath_reset=False,
         enable_failure_aggregation=False,
+        enable_dwa_recovery=bool(enable_dwa),
+        dwa_override_policy_action=bool(dwa_override_policy_action or eval_mode == "dwa_assisted_eval"),
+        dwa_enable_deadlock_termination=bool(dwa_deadlock_termination),
     )
 
 
@@ -71,6 +78,9 @@ def evaluate_checkpoint(
     hope_weight_path=DEFAULT_ENV_CONFIG.hope_weight_path,
     hope_cache_dir=DEFAULT_ENV_CONFIG.hope_cache_dir,
     use_teacher_reward=False,
+    enable_dwa_recovery=False,
+    dwa_override_policy_action=False,
+    dwa_deadlock_termination=False,
 ):
     episodes_per_family = int(episodes_per_family)
     if episodes_per_family < 20:
@@ -101,6 +111,9 @@ def evaluate_checkpoint(
             hope_weight_path=hope_weight_path,
             hope_cache_dir=hope_cache_dir,
             use_teacher_reward=use_teacher_reward,
+            enable_dwa_recovery=enable_dwa_recovery,
+            dwa_override_policy_action=dwa_override_policy_action,
+            dwa_deadlock_termination=dwa_deadlock_termination,
         )
         multi_pool = MultiStageScenePool(
             pool_size=mode_config.scene_pool_size,
@@ -143,6 +156,7 @@ def evaluate_checkpoint(
                 success = bool(final_info["success"])
                 collision = bool(final_info["collision"])
                 timeout = bool(final_info["timeout"])
+                deadlock = bool(final_info.get("deadlock", False))
                 articulation = bool(final_info.get("articulation_limit_violation", False))
                 out_of_bounds = bool(final_info.get("out_of_bounds", False))
                 fallback = bool(reset_info.get("fallback_used", False))
@@ -152,11 +166,19 @@ def evaluate_checkpoint(
                         "success": success,
                         "collision": collision,
                         "timeout": timeout,
+                        "deadlock": deadlock,
+                        "failure_type": str(final_info.get("failure_type", "")),
                         "articulation": articulation,
                         "out_of_bounds": out_of_bounds,
                         "fallback": fallback,
                         "scenario": scenario,
                         "task_family": family,
+                        "dwa_triggered": bool(final_info.get("dwa_triggered", False)),
+                        "dwa_used": bool(final_info.get("dwa_used", False)),
+                        "dwa_unlock_success": bool(
+                            final_info.get("dwa_unlock_success", False)
+                        ),
+                        "dwa_deadlock": bool(final_info.get("dwa_deadlock", False)),
                         "front_overlap": float(final_info["front_overlap"]),
                         "heading_error_deg": float(final_info["heading_error_deg"]),
                         "distance_to_goal": float(final_info["distance_to_goal"]),
@@ -189,9 +211,12 @@ def evaluate_checkpoint(
             success_rate = sum(1 for o in outcomes if o["success"]) / n
             collision_rate = sum(1 for o in outcomes if o["collision"]) / n
             timeout_rate = sum(1 for o in outcomes if o["timeout"]) / n
+            deadlock_rate = sum(1 for o in outcomes if o["deadlock"]) / n
             articulation_rate = sum(1 for o in outcomes if o["articulation"]) / n
             oob_rate = sum(1 for o in outcomes if o["out_of_bounds"]) / n
             fallback_rate = sum(1 for o in outcomes if o["fallback"]) / n
+            dwa_trigger_rate = sum(1 for o in outcomes if o["dwa_triggered"]) / n
+            dwa_used_rate = sum(1 for o in outcomes if o["dwa_used"]) / n
             avg_overlap = float(np.mean([o["front_overlap"] for o in outcomes]))
             avg_heading = float(np.mean([o["heading_error_deg"] for o in outcomes]))
             avg_distance = float(np.mean([o["distance_to_goal"] for o in outcomes]))
@@ -219,9 +244,12 @@ def evaluate_checkpoint(
                 "success_rate": success_rate,
                 "collision_rate": collision_rate,
                 "timeout_rate": timeout_rate,
+                "deadlock_rate": deadlock_rate,
                 "articulation_rate": articulation_rate,
                 "out_of_bounds_rate": oob_rate,
                 "fallback_rate": fallback_rate,
+                "dwa_trigger_rate": dwa_trigger_rate,
+                "dwa_used_rate": dwa_used_rate,
                 "avg_front_overlap": avg_overlap,
                 "avg_heading_error_deg": avg_heading,
                 "avg_distance": avg_distance,
@@ -243,15 +271,17 @@ def print_summary_table(stage_summaries):
             print_summary_table(summaries)
         return
     header = (
-        "{:<2}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}".format(
+        "{:<2}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}".format(
             "S",
             "eps",
             "succ%",
             "coll%",
             "tout%",
+            "dead%",
             "art%",
             "oob%",
             "fb%",
+            "dwa%",
             "ovlp",
             "head",
         )
@@ -262,15 +292,17 @@ def print_summary_table(stage_summaries):
     for stage in sorted(stage_summaries.keys()):
         s = stage_summaries[stage]
         print(
-            "{:<2}  {:>8}  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.3f}  {:>7.1f}".format(
+            "{:<2}  {:>8}  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.1f}%  {:>7.3f}  {:>7.1f}".format(
                 stage,
                 s["episodes"],
                 s["success_rate"] * 100,
                 s["collision_rate"] * 100,
                 s["timeout_rate"] * 100,
+                s.get("deadlock_rate", 0.0) * 100,
                 s["articulation_rate"] * 100,
                 s["out_of_bounds_rate"] * 100,
                 s["fallback_rate"] * 100,
+                s.get("dwa_trigger_rate", 0.0) * 100,
                 s["avg_front_overlap"],
                 s["avg_heading_error_deg"],
             )
@@ -347,9 +379,16 @@ def main():
     )
     parser.add_argument(
         "--eval-mode",
-        choices=["guided", "no_guide", "deployment", "both"],
+        choices=[
+            "guided",
+            "no_guide",
+            "deployment",
+            "pure_policy_eval",
+            "dwa_assisted_eval",
+            "both",
+        ],
         default="deployment",
-        help="guided may call HOPE; no_guide/deployment never call HOPE",
+        help="guided may call HOPE; pure/no_guide/deployment keep DWA off unless DWA flags are passed",
     )
     parser.add_argument("--hope-code-dir", default=DEFAULT_ENV_CONFIG.hope_code_dir)
     parser.add_argument("--hope-weight-path", default=DEFAULT_ENV_CONFIG.hope_weight_path)
@@ -358,6 +397,21 @@ def main():
         "--use-teacher-reward",
         action="store_true",
         help="In guided eval, compute teacher reward diagnostics",
+    )
+    parser.add_argument(
+        "--enable-dwa-recovery",
+        action="store_true",
+        help="Enable strict-mask DWA recovery diagnostics for this eval mode",
+    )
+    parser.add_argument(
+        "--dwa-override-policy-action",
+        action="store_true",
+        help="Allow DWA to replace the policy action during evaluation",
+    )
+    parser.add_argument(
+        "--dwa-deadlock-termination",
+        action="store_true",
+        help="Terminate repeated DWA no-candidate deadlocks during evaluation",
     )
     args = parser.parse_args()
 
@@ -377,6 +431,9 @@ def main():
         hope_weight_path=args.hope_weight_path,
         hope_cache_dir=args.hope_cache_dir,
         use_teacher_reward=args.use_teacher_reward,
+        enable_dwa_recovery=args.enable_dwa_recovery,
+        dwa_override_policy_action=args.dwa_override_policy_action,
+        dwa_deadlock_termination=args.dwa_deadlock_termination,
     )
     print_summary_table(summaries)
 

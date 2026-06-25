@@ -40,6 +40,25 @@ TASK_FAMILIES = SCENE_TASK_FAMILIES
 MIN_EVAL_EPISODES_PER_FAMILY = 20
 
 
+def _add_config_bool_argument(parser, name, default, help_enable, help_disable):
+    group = parser.add_mutually_exclusive_group()
+    dest = name.replace("-", "_")
+    disable_name = name[len("enable-") :] if name.startswith("enable-") else name
+    group.add_argument(
+        "--{}".format(name),
+        dest=dest,
+        action="store_true",
+        default=bool(default),
+        help=help_enable,
+    )
+    group.add_argument(
+        "--disable-{}".format(disable_name),
+        dest=dest,
+        action="store_false",
+        help=help_disable,
+    )
+
+
 def _safe_mean(values):
     return float(np.mean(values)) if values else 0.0
 
@@ -65,6 +84,17 @@ def _task_family(reset_info, scene_metadata):
 
 def _parse_family_schedule(value):
     return normalize_family_schedule(value)
+
+
+def _parse_float_tuple(value):
+    if isinstance(value, (tuple, list)):
+        items = value
+    else:
+        items = str(value).split(",")
+    result = tuple(float(item) for item in items if str(item).strip())
+    if not result:
+        raise ValueError("expected at least one numeric value")
+    return result
 
 
 def _success_by_family(completed):
@@ -186,12 +216,15 @@ class HardCaseReplayBuffer:
             return 0
         collision = bool(final_info.get("collision", False))
         timeout = bool(final_info.get("timeout", False))
-        if not (collision or timeout):
+        deadlock = bool(final_info.get("deadlock", False))
+        if not (collision or timeout or deadlock):
             return 0
         selected_states = list(tail_states)[-self.tail_steps:]
         if not selected_states:
             return 0
-        failure_type = "collision" if collision else "timeout"
+        failure_type = str(final_info.get("failure_type", ""))
+        if not failure_type:
+            failure_type = "collision" if collision else ("deadlock" if deadlock else "timeout")
         count = 0
         for state in selected_states:
             self._append(
@@ -295,6 +328,12 @@ def _build_update_record(
     family_success = _success_by_family(completed)
     no_guide_success = _eval_mode_success_mean(latest_evaluation, "no_guide")
     guided_success = _eval_mode_success_mean(latest_evaluation, "guided")
+    dwa_triggered_infos = [
+        item for item in infos if bool(item.get("dwa_triggered", False))
+    ]
+    failure_types = sorted(
+        set(str(item.get("failure_type", "")) for item in completed)
+    )
     return {
         "global_step": global_step,
         "episode": episode_index,
@@ -333,6 +372,10 @@ def _build_update_record(
         ),
         "eval_collision_rate": float(latest_evaluation.get("collision_rate", 0.0)),
         "eval_timeout_rate": float(latest_evaluation.get("timeout_rate", 0.0)),
+        "eval_deadlock_rate": float(latest_evaluation.get("deadlock_rate", 0.0)),
+        "dwa_assisted_eval_success_rate": float(
+            latest_evaluation.get("dwa_assisted_success_rate", 0.0)
+        ),
         "raw_action_mean": raw_actions.mean(axis=0).tolist(),
         "raw_action_std": raw_actions.std(axis=0).tolist(),
         "executed_action_mean": executed_actions.mean(axis=0).tolist(),
@@ -371,6 +414,21 @@ def _build_update_record(
             [float(item["collision"]) for item in completed]
         ),
         "timeout_rate": _safe_mean([float(item["timeout"]) for item in completed]),
+        "deadlock_rate": _safe_mean(
+            [float(item.get("deadlock", False)) for item in completed]
+        ),
+        "failure_type_distribution": dict(
+            (
+                failure_type,
+                sum(
+                    1
+                    for item in completed
+                    if str(item.get("failure_type", "")) == failure_type
+                ),
+            )
+            for failure_type in failure_types
+            if failure_type
+        ),
         "hybrid_astar_valid_rate": _safe_mean(
             [item["hybrid_astar_valid_rate"] for item in infos]
         ),
@@ -437,6 +495,37 @@ def _build_update_record(
         "rs_by_goal_orientation_mode": _rs_metrics_by_mode(infos),
         "forced_stop_rate": _safe_mean(
             [float(item.get("forced_stop", False)) for item in infos]
+        ),
+        "dwa_trigger_rate": _safe_mean(
+            [float(item.get("dwa_triggered", False)) for item in infos]
+        ),
+        "dwa_used_rate": _safe_mean(
+            [float(item.get("dwa_used", False)) for item in infos]
+        ),
+        "dwa_override_policy_action_rate": _safe_mean(
+            [float(item.get("dwa_override_policy_action", False)) for item in infos]
+        ),
+        "dwa_unlock_success_rate": _conditional_rate(
+            infos,
+            "dwa_unlock_success",
+            "dwa_triggered",
+        ),
+        "dwa_deadlock_rate": _conditional_rate(
+            infos,
+            "dwa_deadlock",
+            "dwa_triggered",
+        ),
+        "dwa_valid_candidate_count_mean": _safe_mean(
+            [
+                float(item.get("dwa_valid_candidate_count", 0))
+                for item in dwa_triggered_infos
+            ]
+        ),
+        "dwa_final_max_safe_ratio_mean": _safe_mean(
+            [
+                float(item.get("dwa_final_max_safe_ratio", 0.0))
+                for item in dwa_triggered_infos
+            ]
         ),
         "degenerate_mask_rate": _safe_mean(
             [float(item.get("degenerate_mask", False)) for item in infos]
@@ -618,6 +707,12 @@ def _summarize_eval_outcomes(outcomes):
     no_latch = [
         item for item in outcomes if not bool(item.get("rs_latched", False))
     ]
+    dwa_triggered = [
+        item for item in outcomes if bool(item.get("dwa_triggered", False))
+    ]
+    failure_types = sorted(
+        set(str(item.get("failure_type", "")) for item in outcomes)
+    )
     scenario_success = {}
     scenario_counts = {}
     for scenario in sorted(set(str(item.get("scenario_type", "")) for item in outcomes)):
@@ -642,6 +737,49 @@ def _summarize_eval_outcomes(outcomes):
         ),
         "timeout_rate": _safe_mean(
             [float(item.get("timeout", False)) for item in outcomes]
+        ),
+        "deadlock_rate": _safe_mean(
+            [float(item.get("deadlock", False)) for item in outcomes]
+        ),
+        "failure_type_distribution": dict(
+            (
+                failure_type,
+                sum(
+                    1
+                    for item in outcomes
+                    if str(item.get("failure_type", "")) == failure_type
+                ),
+            )
+            for failure_type in failure_types
+            if failure_type
+        ),
+        "dwa_trigger_rate": _safe_mean(
+            [float(item.get("dwa_triggered", False)) for item in outcomes]
+        ),
+        "dwa_used_rate": _safe_mean(
+            [float(item.get("dwa_used", False)) for item in outcomes]
+        ),
+        "dwa_unlock_success_rate": _conditional_rate(
+            outcomes,
+            "dwa_unlock_success",
+            "dwa_triggered",
+        ),
+        "dwa_deadlock_rate": _conditional_rate(
+            outcomes,
+            "dwa_deadlock",
+            "dwa_triggered",
+        ),
+        "dwa_valid_candidate_count_mean": _safe_mean(
+            [
+                float(item.get("dwa_valid_candidate_count", 0))
+                for item in dwa_triggered
+            ]
+        ),
+        "dwa_final_max_safe_ratio_mean": _safe_mean(
+            [
+                float(item.get("dwa_final_max_safe_ratio", 0.0))
+                for item in dwa_triggered
+            ]
         ),
         "rs_latched_rate": _safe_mean(
             [float(item.get("rs_latched", False)) for item in outcomes]
@@ -684,6 +822,15 @@ def _aggregate_eval_summaries(stage_results, policy_mode):
         ),
         "timeout_rate": _safe_mean(
             [float(item.get("timeout_rate", 0.0)) for item in summaries]
+        ),
+        "deadlock_rate": _safe_mean(
+            [float(item.get("deadlock_rate", 0.0)) for item in summaries]
+        ),
+        "dwa_trigger_rate": _safe_mean(
+            [float(item.get("dwa_trigger_rate", 0.0)) for item in summaries]
+        ),
+        "dwa_used_rate": _safe_mean(
+            [float(item.get("dwa_used_rate", 0.0)) for item in summaries]
         ),
         "rs_latched_rate": _safe_mean(
             [float(item.get("rs_latched_rate", 0.0)) for item in summaries]
@@ -734,6 +881,7 @@ def _evaluate_policy_by_family(
     def make_eval_config(eval_mode):
         enable_teacher = eval_mode == "guided" and bool(env_config.enable_hope_teacher)
         use_teacher_reward = enable_teacher and bool(env_config.use_teacher_reward)
+        enable_dwa = eval_mode == "dwa_assisted_eval"
         return replace(
             env_config,
             curriculum_stage=int(stage),
@@ -744,6 +892,8 @@ def _evaluate_policy_by_family(
             use_teacher_reward=use_teacher_reward,
             enable_offpath_reset=False,
             enable_failure_aggregation=False,
+            enable_dwa_recovery=bool(enable_dwa),
+            dwa_override_policy_action=bool(enable_dwa),
         )
 
     def run_mode(eval_mode):
@@ -779,7 +929,21 @@ def _evaluate_policy_by_family(
                         "success": bool(final_info["success"]),
                         "collision": bool(final_info["collision"]),
                         "timeout": bool(final_info["timeout"]),
+                        "deadlock": bool(final_info.get("deadlock", False)),
+                        "failure_type": str(final_info.get("failure_type", "")),
                         "rs_latched": bool(final_info.get("rs_latched", False)),
+                        "dwa_triggered": bool(final_info.get("dwa_triggered", False)),
+                        "dwa_used": bool(final_info.get("dwa_used", False)),
+                        "dwa_unlock_success": bool(
+                            final_info.get("dwa_unlock_success", False)
+                        ),
+                        "dwa_deadlock": bool(final_info.get("dwa_deadlock", False)),
+                        "dwa_valid_candidate_count": int(
+                            final_info.get("dwa_valid_candidate_count", 0)
+                        ),
+                        "dwa_final_max_safe_ratio": float(
+                            final_info.get("dwa_final_max_safe_ratio", 0.0)
+                        ),
                         "scenario_type": str(reset_info.get("scenario_type", "")),
                         "task_family": family,
                     }
@@ -822,12 +986,17 @@ def _evaluate_policy_by_family(
     )
     results["guided_success_rate"] = _eval_mode_success_mean(results, "guided")
     results["no_guide_success_rate"] = _eval_mode_success_mean(results, "no_guide")
+    results["dwa_assisted_success_rate"] = _eval_mode_success_mean(
+        results,
+        "dwa_assisted_eval",
+    )
     results["success_gap_guided_minus_noguide"] = (
         results["guided_success_rate"] - results["no_guide_success_rate"]
     )
     deterministic_summary = results.get("deterministic_summary", {})
     results["collision_rate"] = float(deterministic_summary.get("collision_rate", 0.0))
     results["timeout_rate"] = float(deterministic_summary.get("timeout_rate", 0.0))
+    results["deadlock_rate"] = float(deterministic_summary.get("deadlock_rate", 0.0))
     results["stage"] = int(stage)
     results["episodes_per_family"] = episodes_per_family
     results["eval_modes"] = list(eval_modes)
@@ -909,6 +1078,24 @@ def _evaluate_policy_across_stages(
                 },
                 "stochastic",
             ),
+            "deterministic_summary": _aggregate_eval_summaries(
+                {
+                    stage: result[eval_mode]
+                    if eval_mode in result
+                    else result
+                    for stage, result in stage_results.items()
+                },
+                "deterministic",
+            ),
+            "stochastic_summary": _aggregate_eval_summaries(
+                {
+                    stage: result[eval_mode]
+                    if eval_mode in result
+                    else result
+                    for stage, result in stage_results.items()
+                },
+                "stochastic",
+            ),
         }
 
     stage3 = stage_results.get("3", {})
@@ -933,6 +1120,9 @@ def _evaluate_policy_across_stages(
     aggregate["timeout_rate"] = float(
         aggregate["deterministic_summary"].get("timeout_rate", 0.0)
     )
+    aggregate["deadlock_rate"] = float(
+        aggregate["deterministic_summary"].get("deadlock_rate", 0.0)
+    )
     aggregate["family_weighted_score"] = _weighted_checkpoint_score(
         aggregate["deterministic"],
         agent.config,
@@ -941,6 +1131,10 @@ def _evaluate_policy_across_stages(
     aggregate["weighted_score"] = float(aggregate["checkpoint_selection_score"])
     aggregate["guided_success_rate"] = _eval_mode_success_mean(aggregate, "guided")
     aggregate["no_guide_success_rate"] = _eval_mode_success_mean(aggregate, "no_guide")
+    aggregate["dwa_assisted_success_rate"] = _eval_mode_success_mean(
+        aggregate,
+        "dwa_assisted_eval",
+    )
     aggregate["success_gap_guided_minus_noguide"] = (
         aggregate["guided_success_rate"] - aggregate["no_guide_success_rate"]
     )
@@ -1046,6 +1240,23 @@ def train(args):
         raise ValueError("--mask-degenerate-eps must be non-negative")
     if not 0.0 < args.mask_floor_value <= 1.0:
         raise ValueError("--mask-floor-value must be inside (0, 1]")
+    if args.dwa_all_zero_eps < 0.0:
+        raise ValueError("--dwa-all-zero-eps must be non-negative")
+    if args.dwa_low_safe_ratio < 0.0:
+        raise ValueError("--dwa-low-safe-ratio must be non-negative")
+    if args.dwa_unlock_safe_ratio < 0.0:
+        raise ValueError("--dwa-unlock-safe-ratio must be non-negative")
+    if args.dwa_forced_stop_patience < 0:
+        raise ValueError("--dwa-forced-stop-patience must be non-negative")
+    if args.dwa_no_progress_patience < 0:
+        raise ValueError("--dwa-no-progress-patience must be non-negative")
+    if args.dwa_deadlock_patience <= 0:
+        raise ValueError("--dwa-deadlock-patience must be positive")
+    if args.dwa_horizon_steps <= 0:
+        raise ValueError("--dwa-horizon-steps must be positive")
+    dwa_speed_ratios = _parse_float_tuple(args.dwa_speed_ratios)
+    if any(float(ratio) <= 0.0 or float(ratio) > 1.0 for ratio in dwa_speed_ratios):
+        raise ValueError("--dwa-speed-ratios entries must be inside (0, 1]")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env_config = replace(
@@ -1084,10 +1295,22 @@ def train(args):
         hard_case_replay_xy_std=args.hard_case_replay_xy_std,
         hard_case_replay_heading_std_deg=args.hard_case_replay_heading_std_deg,
         hard_case_replay_phi_std_deg=args.hard_case_replay_phi_std_deg,
-        enable_mask_floor_fallback=not bool(args.disable_mask_floor_fallback),
+        enable_mask_floor_fallback=bool(args.enable_mask_floor_fallback)
+        and not bool(args.disable_mask_floor_fallback),
         mask_degenerate_eps=args.mask_degenerate_eps,
         mask_floor_value=args.mask_floor_value,
         apply_floor_only_when_all_zero=bool(args.apply_floor_only_when_all_zero),
+        enable_dwa_recovery=bool(args.enable_dwa_recovery),
+        dwa_override_policy_action=bool(args.dwa_override_policy_action),
+        dwa_enable_deadlock_termination=bool(args.dwa_deadlock_termination),
+        dwa_all_zero_eps=args.dwa_all_zero_eps,
+        dwa_low_safe_ratio=args.dwa_low_safe_ratio,
+        dwa_unlock_safe_ratio=args.dwa_unlock_safe_ratio,
+        dwa_forced_stop_patience=args.dwa_forced_stop_patience,
+        dwa_no_progress_patience=args.dwa_no_progress_patience,
+        dwa_deadlock_patience=args.dwa_deadlock_patience,
+        dwa_horizon_steps=args.dwa_horizon_steps,
+        dwa_speed_ratios=dwa_speed_ratios,
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -1305,6 +1528,8 @@ def train(args):
             "success": bool(final_info["success"]),
             "collision": bool(final_info["collision"]),
             "timeout": bool(final_info["timeout"]),
+            "deadlock": bool(final_info.get("deadlock", False)),
+            "failure_type": str(final_info.get("failure_type", "")),
             "front_overlap": float(final_info["front_overlap"]),
             "best_front_overlap": float(final_info["best_front_overlap"]),
             "heading_error_deg": float(final_info["heading_error_deg"]),
@@ -1488,6 +1713,25 @@ def train(args):
             ),
             "mask_cost": float(final_info.get("mask_cost", 0.0)),
             "forced_stop": int(final_info.get("forced_stop", False)),
+            "dwa_enabled": bool(final_info.get("dwa_enabled", False)),
+            "dwa_triggered": bool(final_info.get("dwa_triggered", False)),
+            "dwa_used": bool(final_info.get("dwa_used", False)),
+            "dwa_mode": str(final_info.get("dwa_mode", "none")),
+            "dwa_reason": str(final_info.get("dwa_reason", "")),
+            "dwa_candidate_count": int(final_info.get("dwa_candidate_count", 0)),
+            "dwa_valid_candidate_count": int(
+                final_info.get("dwa_valid_candidate_count", 0)
+            ),
+            "dwa_unlock_success": bool(
+                final_info.get("dwa_unlock_success", False)
+            ),
+            "dwa_deadlock": bool(final_info.get("dwa_deadlock", False)),
+            "dwa_final_max_safe_ratio": float(
+                final_info.get("dwa_final_max_safe_ratio", 0.0)
+            ),
+            "dwa_override_policy_action": bool(
+                final_info.get("dwa_override_policy_action", False)
+            ),
             "degenerate_mask": bool(final_info.get("degenerate_mask", False)),
             "mask_floor_applied": bool(final_info.get("mask_floor_applied", False)),
             "mask_max_before_floor": float(
@@ -1535,7 +1779,7 @@ def train(args):
 
         print(
             "episode={}/{} reward={:.3f} episode_steps={} global_step={} "
-            "success={} collision={} timeout={}".format(
+            "success={} collision={} timeout={} deadlock={}".format(
                 episode_index,
                 args.total_episodes,
                 episode_reward,
@@ -1544,6 +1788,7 @@ def train(args):
                 int(final_info["success"]),
                 int(final_info["collision"]),
                 int(final_info["timeout"]),
+                int(final_info.get("deadlock", False)),
             )
         )
 
@@ -1567,16 +1812,18 @@ def train(args):
             update_index += 1
 
         if evaluation_due:
-            eval_modes = ("no_guide",)
+            eval_modes = ["no_guide"]
             if bool(env_config.enable_hope_teacher):
-                eval_modes = ("guided", "no_guide")
+                eval_modes = ["guided", "no_guide"]
+            if bool(env_config.enable_dwa_recovery):
+                eval_modes.append("dwa_assisted_eval")
             latest_evaluation = _evaluate_policy_across_stages(
                 agent=agent,
                 env_config=env_config,
                 stages=(1, 2, 3, 4),
                 seed=args.seed,
                 episodes_per_family=args.eval_episodes_per_family,
-                eval_modes=eval_modes,
+                eval_modes=tuple(eval_modes),
             )
             evaluation_record = {
                 "episode": episode_index,
@@ -1774,9 +2021,14 @@ def main():
         help="Disable near-goal Reeds-Shepp potential shaping",
     )
     parser.add_argument(
+        "--enable-mask-floor-fallback",
+        action="store_true",
+        help="Enable degenerate action-mask floor fallback",
+    )
+    parser.add_argument(
         "--disable-mask-floor-fallback",
         action="store_true",
-        help="Disable degenerate action-mask floor fallback",
+        help="Keep degenerate action-mask floor fallback disabled",
     )
     parser.add_argument(
         "--mask-degenerate-eps",
@@ -1794,6 +2046,67 @@ def main():
         "--apply-floor-only-when-all-zero",
         action="store_true",
         help="Only apply mask floor fallback when every mask entry is zero",
+    )
+    _add_config_bool_argument(
+        parser,
+        "enable-dwa-recovery",
+        DEFAULT_ENV_CONFIG.enable_dwa_recovery,
+        "Enable strict-mask DWA recovery diagnostics",
+        "Disable strict-mask DWA recovery diagnostics",
+    )
+    _add_config_bool_argument(
+        parser,
+        "dwa-override-policy-action",
+        DEFAULT_ENV_CONFIG.dwa_override_policy_action,
+        "Allow DWA recovery to replace the policy action when it finds a candidate",
+        "Keep DWA diagnostic-only and do not replace policy actions",
+    )
+    _add_config_bool_argument(
+        parser,
+        "dwa-deadlock-termination",
+        DEFAULT_ENV_CONFIG.dwa_enable_deadlock_termination,
+        "Terminate episodes after repeated DWA no-candidate deadlocks",
+        "Disable DWA deadlock termination",
+    )
+    parser.add_argument(
+        "--dwa-all-zero-eps",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.dwa_all_zero_eps,
+    )
+    parser.add_argument(
+        "--dwa-low-safe-ratio",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.dwa_low_safe_ratio,
+    )
+    parser.add_argument(
+        "--dwa-unlock-safe-ratio",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.dwa_unlock_safe_ratio,
+    )
+    parser.add_argument(
+        "--dwa-forced-stop-patience",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.dwa_forced_stop_patience,
+    )
+    parser.add_argument(
+        "--dwa-no-progress-patience",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.dwa_no_progress_patience,
+    )
+    parser.add_argument(
+        "--dwa-deadlock-patience",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.dwa_deadlock_patience,
+    )
+    parser.add_argument(
+        "--dwa-horizon-steps",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.dwa_horizon_steps,
+    )
+    parser.add_argument(
+        "--dwa-speed-ratios",
+        default=",".join(str(item) for item in DEFAULT_ENV_CONFIG.dwa_speed_ratios),
+        help="Comma-separated local DWA speed ratios, each inside (0, 1]",
     )
     parser.add_argument(
         "--enable-hope-teacher",

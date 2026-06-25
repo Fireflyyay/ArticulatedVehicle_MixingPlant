@@ -11,6 +11,7 @@ from config import (
     LocalParkingEnvConfig,
 )
 from env.articulated_action_mask import ArticulatedActionMask
+from env.dwa_recovery import DWARecoveryController, DWAResult
 from env.geometry import overlap_ratio, wrap_to_pi
 from env.hybrid_astar_reward import OptionalHybridAStarReward
 from env.lidar import DualBodyLidar
@@ -72,6 +73,11 @@ class LocalParkingEnv:
             action_mask
             if action_mask is not None
             else ArticulatedActionMask.load(action_mask_path, vehicle_params=vehicle_params)
+        )
+        self.dwa_recovery = (
+            DWARecoveryController(config)
+            if bool(getattr(config, "enable_dwa_recovery", False))
+            else None
         )
         if self.action_mask.feature_dim != self.MASK_FEATURE_DIM:
             raise ValueError("LocalParkingEnv currently requires 11 phi_dot mask bins")
@@ -158,6 +164,11 @@ class LocalParkingEnv:
         self.last_rear_lidar_m = None
         self.prev_motion_gear = None
         self.prev_gear_in_obs = 0.0
+        self.dwa_forced_stop_streak = 0
+        self.dwa_no_progress_streak = 0
+        self.dwa_deadlock_streak = 0
+        self.last_dwa_info = self._empty_dwa_info()
+        self._last_progress_metrics = None
         self.scenario_type = ""
         self.initial_sampling_diagnostics = {}
         self.hope_teacher_trajectory = None
@@ -219,6 +230,132 @@ class LocalParkingEnv:
             "mask_all_zero_before_floor": False,
             "mask_max_before_floor": 0.0,
         }
+
+    @staticmethod
+    def _score_to_info(score):
+        if score is None:
+            return ()
+        if isinstance(score, tuple):
+            return tuple(
+                bool(item) if isinstance(item, (bool, np.bool_)) else float(item)
+                for item in score
+            )
+        return score
+
+    def _empty_dwa_info(self):
+        return {
+            "dwa_enabled": bool(getattr(self.config, "enable_dwa_recovery", False)),
+            "dwa_triggered": False,
+            "dwa_used": False,
+            "dwa_mode": "none",
+            "dwa_reason": "",
+            "dwa_candidate_count": 0,
+            "dwa_valid_candidate_count": 0,
+            "dwa_unlock_success": False,
+            "dwa_deadlock": False,
+            "dwa_final_max_safe_ratio": 0.0,
+            "dwa_best_score": (),
+            "dwa_override_policy_action": False,
+            "dwa_policy_invalid_trigger": False,
+            "dwa_low_safe_trigger": False,
+            "dwa_all_zero_trigger": False,
+            "dwa_policy_raw_action": np.zeros(2, dtype=np.float32),
+            "dwa_raw_action": np.zeros(2, dtype=np.float32),
+            "dwa_executed_action_preview": np.zeros(2, dtype=np.float32),
+            "deadlock": False,
+        }
+
+    def _dwa_info_from_result(
+        self,
+        result,
+        triggered=False,
+        override_applied=False,
+        policy_invalid_trigger=False,
+        low_safe_trigger=False,
+        all_zero_trigger=False,
+        policy_raw_action=None,
+    ):
+        info = self._empty_dwa_info()
+        if result is None:
+            result = DWAResult()
+        policy_raw = (
+            np.zeros(2, dtype=np.float32)
+            if policy_raw_action is None
+            else np.clip(np.asarray(policy_raw_action, dtype=np.float32), -1.0, 1.0)
+        )
+        raw_action = result.raw_action
+        if raw_action is None:
+            raw_action = np.zeros(2, dtype=np.float32)
+        preview = result.executed_action_preview
+        if preview is None:
+            preview = np.zeros(2, dtype=np.float32)
+        info.update(
+            {
+                "dwa_triggered": bool(triggered),
+                "dwa_used": bool(result.used),
+                "dwa_mode": str(result.mode),
+                "dwa_reason": str(result.reason),
+                "dwa_candidate_count": int(result.candidate_count),
+                "dwa_valid_candidate_count": int(result.valid_candidate_count),
+                "dwa_unlock_success": bool(result.unlock_success),
+                "dwa_deadlock": bool(result.deadlock),
+                "dwa_final_max_safe_ratio": float(result.final_max_safe_ratio),
+                "dwa_best_score": self._score_to_info(result.best_score),
+                "dwa_override_policy_action": bool(override_applied),
+                "dwa_policy_invalid_trigger": bool(policy_invalid_trigger),
+                "dwa_low_safe_trigger": bool(low_safe_trigger),
+                "dwa_all_zero_trigger": bool(all_zero_trigger),
+                "dwa_policy_raw_action": policy_raw,
+                "dwa_raw_action": np.clip(
+                    np.asarray(raw_action, dtype=np.float32),
+                    -1.0,
+                    1.0,
+                ),
+                "dwa_executed_action_preview": np.asarray(
+                    preview,
+                    dtype=np.float32,
+                ),
+            }
+        )
+        return info
+
+    @staticmethod
+    def _progress_metrics(metrics):
+        heading_score = math.cos(abs(float(metrics["heading_error"])))
+        return {
+            "distance_to_goal": float(metrics["distance_to_goal"]),
+            "front_overlap": float(metrics["front_overlap"]),
+            "heading_score": float(heading_score),
+        }
+
+    def _update_dwa_stuck_counters(self, decoded, metrics):
+        if bool(decoded.get("forced_stop", False)):
+            self.dwa_forced_stop_streak += 1
+        else:
+            self.dwa_forced_stop_streak = 0
+
+        current = self._progress_metrics(metrics)
+        previous = self._last_progress_metrics
+        if previous is None:
+            self.dwa_no_progress_streak = 0
+        else:
+            distance_no_better = (
+                current["distance_to_goal"]
+                >= previous["distance_to_goal"] - 1e-3
+            )
+            overlap_no_better = (
+                current["front_overlap"]
+                <= previous["front_overlap"] + 1e-4
+            )
+            heading_no_better = (
+                current["heading_score"]
+                <= previous["heading_score"] + 1e-4
+            )
+            if distance_no_better and overlap_no_better and heading_no_better:
+                self.dwa_no_progress_streak += 1
+            else:
+                self.dwa_no_progress_streak = 0
+        self._last_progress_metrics = current
 
     def _mask_floor_state(self, mask):
         mask_array = np.asarray(mask, dtype=np.float32)
@@ -1552,8 +1689,13 @@ class LocalParkingEnv:
         self.scenario_type = str(scenario_type)
         self.prev_motion_gear = None
         self.prev_gear_in_obs = 0.0
+        self.dwa_forced_stop_streak = 0
+        self.dwa_no_progress_streak = 0
+        self.dwa_deadlock_streak = 0
+        self.last_dwa_info = self._empty_dwa_info()
         self._reset_hope_teacher()
         metrics = self._boxes_and_metrics()
+        self._last_progress_metrics = self._progress_metrics(metrics)
         self.reward_model.reset(
             initial_distance=metrics["distance_to_goal"],
             initial_overlap=metrics["front_overlap"],
@@ -1653,6 +1795,7 @@ class LocalParkingEnv:
             "mask_cost": 0.0,
             "gear": 0,
         }
+        info.update(self.last_dwa_info if self.last_dwa_info else self._empty_dwa_info())
         info.update(
             {
                 key: value
@@ -1669,16 +1812,134 @@ class LocalParkingEnv:
         if self.state is None:
             raise RuntimeError("reset() must be called before step()")
         previous_state = self.state
+        policy_raw_action = np.clip(
+            np.asarray(raw_action, dtype=np.float32),
+            -1.0,
+            1.0,
+        )
+        execution_raw_action = policy_raw_action.copy()
         mask_for_action = np.asarray(self.current_mask, dtype=np.float32).copy()
         mask_floor_info = dict(self.current_mask_floor_info)
-        decoded = self.action_mask.decode_safe_speed_and_cost(
-            raw_action,
+        policy_decoded = self.action_mask.decode_safe_speed_and_cost(
+            policy_raw_action,
             mask_for_action,
             self.state.phi,
             dt=self.vehicle_params.dt,
             prev_motion_gear=self.prev_motion_gear,
             config=self.config,
         )
+        rmax_now = float(np.max(mask_for_action)) if mask_for_action.size else 0.0
+        all_zero_trigger = False
+        low_safe_trigger = False
+        policy_invalid_trigger = False
+        dwa_triggered = False
+        dwa_override_applied = False
+        dwa_result = DWAResult(reason="disabled")
+        if bool(getattr(self.config, "enable_dwa_recovery", False)):
+            if self.dwa_recovery is None:
+                self.dwa_recovery = DWARecoveryController(self.config)
+            all_zero_trigger = bool(
+                mask_floor_info.get("mask_all_zero_before_floor", False)
+                or rmax_now <= float(getattr(self.config, "dwa_all_zero_eps", 1e-3))
+            )
+            low_safe_trigger = bool(
+                rmax_now < float(getattr(self.config, "dwa_low_safe_ratio", 0.05))
+                and (
+                    self.dwa_forced_stop_streak
+                    >= int(getattr(self.config, "dwa_forced_stop_patience", 3))
+                    or self.dwa_no_progress_streak
+                    >= int(getattr(self.config, "dwa_no_progress_patience", 6))
+                )
+            )
+            policy_invalid_trigger = bool(
+                policy_decoded["forced_stop"]
+                and rmax_now > float(getattr(self.config, "dwa_low_safe_ratio", 0.05))
+            )
+            if all_zero_trigger:
+                dwa_triggered = True
+                dwa_result = self.dwa_recovery.run(
+                    "unlock",
+                    self.state,
+                    self.slot,
+                    self.scene,
+                    self.vehicle_model,
+                    self.lidar,
+                    self.action_mask,
+                    mask_for_action,
+                    self.last_front_lidar_m,
+                    self.last_rear_lidar_m,
+                    self.prev_motion_gear,
+                    self.config,
+                    reason="all_zero_mask",
+                )
+            elif low_safe_trigger:
+                dwa_triggered = True
+                dwa_result = self.dwa_recovery.run(
+                    "local",
+                    self.state,
+                    self.slot,
+                    self.scene,
+                    self.vehicle_model,
+                    self.lidar,
+                    self.action_mask,
+                    mask_for_action,
+                    self.last_front_lidar_m,
+                    self.last_rear_lidar_m,
+                    self.prev_motion_gear,
+                    self.config,
+                    reason="low_safe_stuck",
+                )
+            elif policy_invalid_trigger:
+                dwa_triggered = True
+                if bool(getattr(self.config, "dwa_override_policy_action", False)):
+                    dwa_result = self.dwa_recovery.run(
+                        "local",
+                        self.state,
+                        self.slot,
+                        self.scene,
+                        self.vehicle_model,
+                        self.lidar,
+                        self.action_mask,
+                        mask_for_action,
+                        self.last_front_lidar_m,
+                        self.last_rear_lidar_m,
+                        self.prev_motion_gear,
+                        self.config,
+                        reason="policy_forced_stop",
+                    )
+                else:
+                    dwa_result = DWAResult(
+                        used=False,
+                        mode="none",
+                        reason="policy_forced_stop_no_override",
+                    )
+            if (
+                bool(getattr(self.config, "dwa_override_policy_action", False))
+                and bool(dwa_result.used)
+                and dwa_result.raw_action is not None
+            ):
+                execution_raw_action = np.clip(
+                    np.asarray(dwa_result.raw_action, dtype=np.float32),
+                    -1.0,
+                    1.0,
+                )
+                dwa_override_applied = True
+
+        decode_prev_motion_gear = self.prev_motion_gear
+        decode_prev_gear_in_obs = self.prev_gear_in_obs
+        if dwa_override_applied and str(dwa_result.mode) == "unlock":
+            decode_prev_motion_gear = None
+        decoded = self.action_mask.decode_safe_speed_and_cost(
+            execution_raw_action,
+            mask_for_action,
+            self.state.phi,
+            dt=self.vehicle_params.dt,
+            prev_motion_gear=decode_prev_motion_gear,
+            config=self.config,
+        )
+        if dwa_override_applied and str(dwa_result.mode) == "unlock":
+            decoded["prev_motion_gear"] = self.prev_motion_gear
+            decoded["prev_gear_in_obs"] = float(decode_prev_gear_in_obs)
         executed_action = np.asarray(
             [decoded["v_exec"], decoded["phi_dot_exec"]],
             dtype=np.float32,
@@ -1703,19 +1964,58 @@ class LocalParkingEnv:
             and abs(metrics["heading_error"]) <= self.config.success_heading_error
         )
         timeout = self.step_count >= self.config.max_steps
+        self._update_dwa_stuck_counters(decoded, metrics)
+        if bool(dwa_triggered and dwa_result.deadlock):
+            self.dwa_deadlock_streak += 1
+        else:
+            self.dwa_deadlock_streak = 0
+        deadlock = bool(
+            bool(getattr(self.config, "enable_dwa_recovery", False))
+            and bool(getattr(self.config, "dwa_enable_deadlock_termination", False))
+            and self.dwa_deadlock_streak
+            >= int(getattr(self.config, "dwa_deadlock_patience", 8))
+        )
         failure = (
             collision
             or out_of_bounds
             or articulation_violation
+            or deadlock
             or (timeout and not success)
         )
         if failure:
             success = False
-        terminated = bool(success or collision or out_of_bounds or articulation_violation)
+        terminated = bool(
+            success or collision or out_of_bounds or articulation_violation or deadlock
+        )
         truncated = bool(timeout and not terminated)
+        if success:
+            failure_type = "success"
+        elif collision:
+            failure_type = "collision"
+        elif deadlock:
+            failure_type = "deadlock"
+        elif timeout:
+            failure_type = "timeout"
+        elif out_of_bounds:
+            failure_type = "out_of_bounds"
+        elif articulation_violation:
+            failure_type = "articulation"
+        else:
+            failure_type = ""
         mask_floor_applied = bool(mask_floor_info.get("mask_floor_applied", False))
         collision_after_mask_floor = bool(mask_floor_applied and collision)
         success_after_mask_floor = bool(mask_floor_applied and success)
+        dwa_info = self._dwa_info_from_result(
+            dwa_result,
+            triggered=dwa_triggered,
+            override_applied=dwa_override_applied,
+            policy_invalid_trigger=policy_invalid_trigger,
+            low_safe_trigger=low_safe_trigger,
+            all_zero_trigger=all_zero_trigger,
+            policy_raw_action=policy_raw_action,
+        )
+        dwa_info["deadlock"] = bool(deadlock)
+        self.last_dwa_info = dwa_info
 
         rs_value, rs_info = self.rs_potential.step(
             self.scene,
@@ -1802,8 +2102,11 @@ class LocalParkingEnv:
                 "collision": bool(collision),
                 "out_of_bounds": bool(out_of_bounds),
                 "timeout": bool(timeout),
+                "deadlock": bool(deadlock),
+                "failure_type": str(failure_type),
                 "articulation_limit_violation": bool(articulation_violation),
-                "raw_action": np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0),
+                "policy_raw_action": policy_raw_action,
+                "raw_action": execution_raw_action,
                 "executed_action": executed_action,
                 "mask_safe_ratio": float(decoded["r_raw"]),
                 "mask_safe_ratio_mean": float(np.mean(mask_for_action)),
@@ -1816,6 +2119,9 @@ class LocalParkingEnv:
                 "speed_clip_rate": 1.0 if decoded["clip_ratio"] > 0.01 else 0.0,
                 "reward_components": reward_components,
                 "gear": int(decoded["gear"]),
+                "policy_gear": int(policy_decoded["gear"]),
+                "policy_forced_stop": bool(policy_decoded["forced_stop"]),
+                "policy_raw_safe_ratio": float(policy_decoded["r_raw"]),
                 "raw_safe_ratio": float(decoded["r_raw"]),
                 "exec_safe_ratio": float(decoded["r_exec"]),
                 "max_safe_ratio": float(decoded["r_max"]),

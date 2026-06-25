@@ -8,6 +8,7 @@ from env.local_parking_env import LocalParkingEnv
 from train.train_local_parking import (
     HardCaseReplayBuffer,
     REPO_ROOT,
+    _add_config_bool_argument,
     _checkpoint_selection_score,
     _resolve_output_dir,
     _update_reward_plot,
@@ -54,6 +55,39 @@ def test_training_config_snapshot_contains_effective_sections(tmp_path):
     assert "[environment]" in contents
     assert "curriculum_stage = 2" in contents
     assert "[ppo]" in contents
+
+
+def test_dwa_cli_booleans_inherit_config_defaults():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    _add_config_bool_argument(
+        parser,
+        "enable-dwa-recovery",
+        DEFAULT_ENV_CONFIG.enable_dwa_recovery,
+        "enable",
+        "disable",
+    )
+    _add_config_bool_argument(
+        parser,
+        "dwa-override-policy-action",
+        DEFAULT_ENV_CONFIG.dwa_override_policy_action,
+        "enable",
+        "disable",
+    )
+
+    defaults = parser.parse_args([])
+    assert defaults.enable_dwa_recovery is DEFAULT_ENV_CONFIG.enable_dwa_recovery
+    assert (
+        defaults.dwa_override_policy_action
+        is DEFAULT_ENV_CONFIG.dwa_override_policy_action
+    )
+
+    disabled = parser.parse_args(
+        ["--disable-dwa-recovery", "--disable-dwa-override-policy-action"]
+    )
+    assert disabled.enable_dwa_recovery is False
+    assert disabled.dwa_override_policy_action is False
 
 
 def test_reward_plot_is_written_from_episode_rewards(tmp_path):

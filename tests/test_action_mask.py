@@ -5,6 +5,7 @@ from env.articulated_action_mask import (
     ArticulatedActionMask,
     FORWARD_GEAR,
     REVERSE_GEAR,
+    STOP_GEAR,
     default_action_mask_path,
     generate_sweep_tables,
     save_sweep_tables,
@@ -116,6 +117,47 @@ def test_decode_uses_mapped_phi_dot_for_action_mask_lookup(synthetic_action_mask
         decoded["v_exec"],
         expected_ratio * p.parking_v_forward_max,
     )
+
+
+def test_decode_stop_gear_reports_global_r_max(synthetic_action_mask):
+    p = DEFAULT_VEHICLE_PARAMS
+    mask = np.asarray(
+        [
+            np.linspace(0.05, 0.40, 11),
+            np.linspace(0.02, 0.30, 11),
+        ],
+        dtype=np.float32,
+    )
+
+    decoded = synthetic_action_mask.decode_safe_speed_and_cost(
+        [0.0, 0.0],
+        mask,
+        0.0,
+        dt=p.dt,
+        prev_motion_gear=None,
+        config=DEFAULT_ENV_CONFIG,
+    )
+
+    assert decoded["gear"] == STOP_GEAR
+    assert decoded["r_raw"] == 0.0
+    assert np.isclose(decoded["r_max"], float(np.max(mask)))
+
+
+def test_encode_phi_dot_to_raw_round_trips_decode(synthetic_action_mask):
+    p = DEFAULT_VEHICLE_PARAMS
+    for phi in (-0.2, 0.0, 0.2):
+        for phi_dot in (-0.25, 0.0, 0.25):
+            raw_phi_dot = synthetic_action_mask.encode_phi_dot_to_raw(
+                phi_dot,
+                phi,
+                p.dt,
+            )
+            decoded_phi_dot = synthetic_action_mask._decode_phi_dot(
+                raw_phi_dot,
+                phi,
+                p.dt,
+            )
+            assert np.isclose(decoded_phi_dot, phi_dot, atol=1e-6)
 
 
 def test_decode_forced_stop_freezes_speed_and_articulation(synthetic_action_mask):
