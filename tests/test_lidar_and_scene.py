@@ -3,6 +3,8 @@ import math
 
 import numpy as np
 import pytest
+from shapely.errors import GEOSException
+from shapely.geometry import Point
 
 from config import DEFAULT_SCENE_CONFIG, DEFAULT_VEHICLE_PARAMS
 from dataclasses import replace
@@ -13,6 +15,7 @@ from env.local_parking_env import LocalParkingEnv, ResetInitialStateError
 from env.mixing_plant_scene import (
     CachedScenePool,
     TASK_FAMILIES,
+    derive_scene_seed,
     generate_cached_mixing_plant_scene,
 )
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
@@ -201,6 +204,197 @@ def test_scene_pool_expands_default_schedule_to_balanced_family_counts():
     assert families.count("head_in") == 16
 
 
+def test_rule_scene_generators_are_seed_reproducible():
+    for scene_type in (
+        "mixing_station_bay_corridor",
+        "loading_truck_rectangle_space",
+    ):
+        cfg = replace(DEFAULT_SCENE_CONFIG, scene_type=scene_type)
+        first = generate_cached_mixing_plant_scene(
+            stage=1,
+            seed=101,
+            scene_config=cfg,
+            task_family="head_in",
+        )
+        second = generate_cached_mixing_plant_scene(
+            stage=1,
+            seed=101,
+            scene_config=cfg,
+            task_family="head_in",
+        )
+        assert np.array_equal(first.occupancy_grid, second.occupancy_grid)
+        assert first.world_bounds == second.world_bounds
+        assert (
+            round(first.slot.x_goal, 6),
+            round(first.slot.y_goal, 6),
+            round(first.slot.theta_goal, 6),
+        ) == (
+            round(second.slot.x_goal, 6),
+            round(second.slot.y_goal, 6),
+            round(second.slot.theta_goal, 6),
+        )
+        assert first.metadata["scene_type"] == scene_type
+
+
+def test_mixing_station_bay_corridor_geometry_and_reset(synthetic_action_mask):
+    cfg = replace(
+        DEFAULT_SCENE_CONFIG,
+        scene_type="mixing_station_bay_corridor",
+        target_bay_sampling_mode="fixed",
+        fixed_target_bay_index=1,
+        initial_spawn_mode="bay",
+        fixed_initial_bay_index=2,
+    )
+    scene = generate_cached_mixing_plant_scene(
+        stage=1,
+        seed=202,
+        scene_config=cfg,
+        task_family="head_in",
+    )
+    assert scene.metadata["bay_count"] == cfg.bay_count
+    assert scene.metadata["partition_wall_count"] == cfg.bay_count - 1
+    assert scene.metadata["bottom_wall_exists"] is True
+    assert scene.metadata["corridor_ends_open"] is True
+    assert scene.metadata["corridor_end_wall_count"] == 0
+    assert scene.metadata["corridor_outer_wall_exists"] is True
+    assert float(scene.metadata["corridor_width"]) == cfg.corridor_width
+    assert scene.metadata["target_bay_index"] == 1
+    assert scene.metadata["requested_initial_spawn_mode"] == "bay"
+    assert scene.metadata["initial_spawn_mode"] == "corridor"
+    assert {
+        str(candidate[0]) for candidate in scene.metadata["initial_pose_candidates"]
+    } == {"corridor"}
+
+    target_state = ArticulatedState(
+        scene.slot.x_goal,
+        scene.slot.y_goal,
+        scene.slot.theta_goal,
+        scene.slot.theta_goal,
+    )
+    model = ArticulatedVehicleModel(DEFAULT_VEHICLE_PARAMS)
+    front_box, rear_box = model.body_boxes(target_state)
+    assert scene.target_bay.polygon.covers(front_box)
+    assert scene.target_bay.polygon.covers(rear_box)
+    target_direction = np.asarray(
+        [math.cos(scene.slot.theta_goal), math.sin(scene.slot.theta_goal)]
+    )
+    inward = np.asarray(
+        [math.cos(scene.target_bay.inward_heading), math.sin(scene.target_bay.inward_heading)]
+    )
+    assert float(np.dot(target_direction, inward)) > 0.999
+
+    corridor_y0 = float(scene.metadata["corridor_region_bounds"][1])
+    for wall in scene.obstacle_polygons[2:]:
+        assert wall.bounds[3] <= corridor_y0 + 1e-8
+    for partition in scene.obstacle_polygons[4:]:
+        assert partition.bounds[3] <= corridor_y0 + 1e-8
+
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, scene_pool_size=1),
+        scene_config=cfg,
+        action_mask=synthetic_action_mask,
+        seed=202,
+    )
+    _, info = env.reset(seed=202)
+    assert info["scene_type"] == "mixing_station_bay_corridor"
+    assert info["requested_initial_spawn_mode"] == "bay"
+    assert info["initial_spawn_mode"] == "corridor"
+    assert info["initial_spawn_region"] == "corridor"
+    assert info["initial_bay_index"] == -1
+    assert info["reset_feasible_mask_available"] is True
+    assert not info["initial_collision"]
+
+
+def test_loading_truck_rectangle_space_geometry_and_obstacle_exclusion(
+    synthetic_action_mask,
+):
+    cfg = replace(
+        DEFAULT_SCENE_CONFIG,
+        scene_type="loading_truck_rectangle_space",
+        discrete_obstacle_count=4,
+    )
+    scene = generate_cached_mixing_plant_scene(
+        stage=1,
+        seed=303,
+        scene_config=cfg,
+        task_family="head_in",
+    )
+    assert scene.metadata["boundary_wall_count"] == 0
+    assert scene.metadata["constructed_wall_feature_count"] == 0
+    assert len(scene.obstacle_polygons) >= 1
+    assert len(scene.obstacle_polygons) == 1 + scene.metadata["discrete_obstacle_count"]
+    assert scene.metadata["truck_in_front"] is True
+    assert scene.metadata["truck_perpendicular"] is True
+    assert scene.metadata["discrete_obstacle_count"] <= cfg.discrete_obstacle_count
+
+    initial_xys = tuple(
+        np.asarray((candidate[2], candidate[3]), dtype=np.float64)
+        for candidate in scene.metadata["initial_pose_candidates"]
+    )
+    target_xy = np.asarray(scene.slot.center, dtype=np.float64)
+    truck = scene.obstacle_polygons[0]
+    initial_radius = float(cfg.obstacle_exclusion_radius_around_initial)
+    target_radius = float(cfg.obstacle_exclusion_radius_around_target)
+    truck_radius = float(cfg.obstacle_exclusion_radius_around_truck)
+    target_exclusion = Point(float(target_xy[0]), float(target_xy[1])).buffer(
+        target_radius,
+        resolution=16,
+    )
+    for obstacle in scene.obstacle_polygons[1:]:
+        center = np.asarray(obstacle.centroid.coords[0], dtype=np.float64)
+        assert all(
+            float(np.linalg.norm(center - initial_xy)) >= initial_radius
+            for initial_xy in initial_xys
+        )
+        assert float(np.linalg.norm(center - target_xy)) >= target_radius
+        assert not obstacle.intersects(target_exclusion)
+        assert obstacle.distance(truck) >= truck_radius - 1e-8
+
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, scene_pool_size=1),
+        scene_config=cfg,
+        action_mask=synthetic_action_mask,
+        seed=303,
+    )
+    obs, info = env.reset(seed=303)
+    assert obs.shape == (LocalParkingEnv.OBS_DIM,)
+    assert env.last_front_lidar_m.shape == (DEFAULT_VEHICLE_PARAMS.lidar_beams,)
+    assert env.current_mask.shape == (2, 11)
+    assert info["scene_type"] == "loading_truck_rectangle_space"
+    assert info["truck_in_front"] is True
+    assert info["reset_feasible_mask_available"] is True
+    assert not info["initial_collision"]
+
+
+def test_rule_scenes_reset_all_curriculum_stages(synthetic_action_mask):
+    for scene_type in (
+        "mixing_station_bay_corridor",
+        "loading_truck_rectangle_space",
+    ):
+        scene_config = replace(DEFAULT_SCENE_CONFIG, scene_type=scene_type)
+        for stage in (1, 2, 3, 4):
+            env = LocalParkingEnv(
+                config=replace(
+                    DEFAULT_ENV_CONFIG,
+                    curriculum_stage=stage,
+                    scene_pool_size=1,
+                ),
+                scene_config=scene_config,
+                action_mask=synthetic_action_mask,
+                seed=700 + stage,
+            )
+            obs, info = env.reset(seed=700 + stage)
+            assert obs.shape == (LocalParkingEnv.OBS_DIM,)
+            assert info["scene_type"] == scene_type
+            assert info["reset_feasible_mask_available"] is True
+            _, _, terminated, truncated, step_info = env.step(
+                np.array([0.0, 0.0], dtype=np.float32)
+            )
+            assert isinstance(terminated, bool)
+            assert isinstance(truncated, bool)
+            assert "collision" in step_info
+
+
 def test_target_slot_is_inside_bay_with_supported_orientation_modes():
     model = ArticulatedVehicleModel(DEFAULT_VEHICLE_PARAMS)
     modes = set()
@@ -371,6 +565,44 @@ def test_deprecated_parallel_families_are_rejected():
             base_seed=23,
             family_schedule=("parallel_rev",),
         )
+
+
+def test_cached_scene_pool_retries_after_shapely_generation_failure(monkeypatch):
+    original_generate_scene = CachedScenePool._generate_scene
+    calls = {"count": 0, "indices": []}
+
+    def fail_first_scene_then_generate(self, pool_index, task_family=None, scene_type=None):
+        calls["count"] += 1
+        calls["indices"].append(int(pool_index))
+        if calls["count"] == 1:
+            raise GEOSException("TopologyException: side location conflict")
+        return original_generate_scene(
+            self,
+            pool_index,
+            task_family=task_family,
+            scene_type=scene_type,
+        )
+
+    monkeypatch.setattr(
+        CachedScenePool,
+        "_generate_scene",
+        fail_first_scene_then_generate,
+    )
+
+    pool = CachedScenePool(
+        stage=1,
+        pool_size=1,
+        base_seed=31,
+        family_schedule=("head_in",),
+    )
+    scene = pool.get(0)
+    failed_seed = derive_scene_seed(31, 0, "head_in", 1)
+    success_seed = derive_scene_seed(31, 1, "head_in", 1)
+
+    assert calls["indices"] == [0, 1]
+    assert scene.metadata["scene_generation_attempt_count"] == 2
+    assert int(scene.metadata["seed"]) == success_seed
+    assert int(scene.metadata["seed"]) != failed_seed
 
 
 def test_reset_rejects_collision_free_state_without_executable_mask():

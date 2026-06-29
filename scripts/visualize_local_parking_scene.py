@@ -3,11 +3,14 @@ import argparse
 import os
 import sys
 
+os.environ.setdefault("MPLCONFIGDIR", os.path.join("/tmp", "matplotlib"))
+
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from shapely.geometry import box
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,9 +18,10 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from config import DEFAULT_ENV_CONFIG  # noqa: E402
+from config import DEFAULT_ENV_CONFIG, DEFAULT_SCENE_CONFIG  # noqa: E402
 from dataclasses import replace  # noqa: E402
 from env.local_parking_env import LocalParkingEnv  # noqa: E402
+from env.mixing_plant_scene import SUPPORTED_SCENE_TYPES  # noqa: E402
 
 
 def _plot_polygon(ax, polygon, facecolor, edgecolor, alpha=1.0, linewidth=1.0):
@@ -69,10 +73,47 @@ def _plot_bay(ax, bay):
     )
 
 
+def _plot_obstacles(ax, scene):
+    scene_type = str(scene.metadata.get("scene_type", ""))
+    if scene_type == "loading_truck_rectangle_space":
+        labels = tuple(scene.metadata.get("constructed_obstacle_labels", ()))
+        for index, obstacle in enumerate(scene.obstacle_polygons):
+            label = str(labels[index]) if index < len(labels) else ""
+            if label == "truck_obstacle":
+                _plot_polygon(ax, obstacle, "#d95f02", "#8c2d04", alpha=0.85)
+            else:
+                _plot_polygon(ax, obstacle, "#7a7a7a", "#555555", alpha=0.90)
+        return
+    for obstacle in scene.obstacle_polygons:
+        _plot_polygon(ax, obstacle, "#777777", "#555555")
+
+
+def _plot_scene_regions(ax, scene):
+    if str(scene.metadata.get("scene_type", "")) != "mixing_station_bay_corridor":
+        return
+    bounds = scene.metadata.get("corridor_region_bounds")
+    if not bounds:
+        return
+    x0, y0, x1, y1 = tuple(float(value) for value in bounds)
+    _plot_polygon(
+        ax,
+        box(x0, y0, x1, y1),
+        "#b7e4c7",
+        "#2d6a4f",
+        alpha=0.20,
+        linewidth=1.4,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Render a cached local parking scene.")
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--scene-type",
+        choices=SUPPORTED_SCENE_TYPES,
+        default=DEFAULT_SCENE_CONFIG.scene_type,
+    )
     parser.add_argument(
         "--task-family",
         choices=["head_in"],
@@ -86,7 +127,8 @@ def main():
         REPO_ROOT,
         "outputs",
         "scenes",
-        "local_parking_stage{}_{}_seed{}.png".format(
+        "local_parking_{}_stage{}_{}_seed{}.png".format(
+            args.scene_type,
             args.stage,
             args.task_family,
             args.seed,
@@ -100,6 +142,7 @@ def main():
             scene_pool_size=1,
             scene_family_schedule=(args.task_family,),
         ),
+        scene_config=replace(DEFAULT_SCENE_CONFIG, scene_type=args.scene_type),
         seed=args.seed,
     )
     _, info = env.reset(seed=args.seed)
@@ -107,8 +150,8 @@ def main():
     target = env.slot.front_box()
 
     fig, ax = plt.subplots(figsize=(9, 9))
-    for obstacle in env.scene.obstacle_polygons:
-        _plot_polygon(ax, obstacle, "#777777", "#555555")
+    _plot_scene_regions(ax, env.scene)
+    _plot_obstacles(ax, env.scene)
     for bay in env.scene.parking_bays:
         _plot_bay(ax, bay)
     _plot_polygon(ax, target, "#8fd175", "#207020", alpha=0.55, linewidth=2.0)
@@ -140,12 +183,13 @@ def main():
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.2)
     ax.set_title(
-        "Local articulated parking | stage={} | {} | goal={} | overlap={:.3f}".format(
+        "{} | stage={} | {} | overlap={:.3f}".format(
+            env.scene.metadata.get("scene_type", ""),
             args.stage,
             info["scenario_type"],
-            env.scene.metadata["goal_orientation_mode"],
             info["front_overlap"],
-        )
+        ),
+        fontsize=10,
     )
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")

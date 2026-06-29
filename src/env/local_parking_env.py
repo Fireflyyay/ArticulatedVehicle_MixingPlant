@@ -15,7 +15,7 @@ from env.dwa_recovery import DWARecoveryController, DWAResult
 from env.geometry import overlap_ratio, wrap_to_pi
 from env.hybrid_astar_reward import OptionalHybridAStarReward
 from env.lidar import DualBodyLidar
-from env.mixing_plant_scene import CachedScenePool, TASK_FAMILIES
+from env.mixing_plant_scene import CachedScenePool, RULE_SCENE_TYPES, TASK_FAMILIES
 from env.reward import LocalParkingReward
 from env.rs_potential import RSPotentialOracle, RSPotentialPlanner
 from env.vehicle import ArticulatedState, ArticulatedVehicleModel
@@ -459,8 +459,9 @@ class LocalParkingEnv:
         if self._state_collides(state):
             return False, "collision", {}
 
+        rule_scene = self._is_rule_scene()
         target_access_metrics = {}
-        if int(stage) == 4:
+        if int(stage) == 4 and not rule_scene:
             target_access_valid, target_access_metrics = (
                 self._stage4_target_access_metrics(state)
             )
@@ -479,6 +480,8 @@ class LocalParkingEnv:
             metrics["stage4_min_body_clearance"] = min_clearance
             if min_clearance > 0.0 and float(metrics["body_clearance"]) < min_clearance:
                 return False, "clearance", metrics
+            if rule_scene:
+                return True, "", metrics
             if float(metrics["body_clearance"]) > float(
                 self.config.recovery_max_body_clearance
             ):
@@ -1303,7 +1306,206 @@ class LocalParkingEnv:
 
         return candidates
 
+    def _is_rule_scene(self):
+        scene_type = str(self.scene.metadata.get("scene_type", ""))
+        return scene_type in RULE_SCENE_TYPES
+
+    def _rule_scene_candidate_state(self, candidate, attempt_index):
+        region = str(candidate[0])
+        bay_index = int(candidate[1]) if len(candidate) > 1 else -1
+        x = float(candidate[2])
+        y = float(candidate[3])
+        theta = float(candidate[4])
+        phi = float(candidate[5]) if len(candidate) > 5 else 0.0
+        noise = self.scene.metadata.get(
+            "initial_pose_noise",
+            getattr(self.scene_pool.scene_config, "initial_pose_noise", (0.0, 0.0, 0.0, 0.0))
+            if hasattr(self.scene_pool, "scene_config")
+            else (0.0, 0.0, 0.0, 0.0),
+        )
+        noise = tuple(float(item) for item in noise)
+        if len(noise) < 4:
+            noise = noise + (0.0,) * (4 - len(noise))
+        if int(attempt_index) > 0:
+            x += float(self.rng.uniform(-noise[0], noise[0]))
+            y += float(self.rng.uniform(-noise[1], noise[1]))
+            theta = float(wrap_to_pi(theta + self.rng.uniform(-noise[2], noise[2])))
+            phi = float(
+                np.clip(
+                    phi + self.rng.uniform(-noise[3], noise[3]),
+                    -self.vehicle_params.phi_max,
+                    self.vehicle_params.phi_max,
+                )
+            )
+        if region == "bay":
+            theta = float(-0.5 * math.pi)
+        return (
+            ArticulatedState(
+                x_front=float(x),
+                y_front=float(y),
+                theta_front=float(wrap_to_pi(theta)),
+                theta_rear=float(wrap_to_pi(theta - phi)),
+            ),
+            region,
+            bay_index,
+        )
+
+    def _rule_scene_heading_valid(self, state, region):
+        scene_type = str(self.scene.metadata.get("scene_type", ""))
+        if scene_type == "mixing_station_bay_corridor":
+            if region == "bay":
+                return bool(
+                    math.cos(wrap_to_pi(state.theta_front + 0.5 * math.pi)) > 0.995
+                )
+            if region == "corridor":
+                mode = str(
+                    self.scene.metadata.get(
+                        "corridor_initial_heading_mode",
+                        "mixed",
+                    )
+                )
+                along = abs(math.sin(float(state.theta_front))) < 0.20
+                face_bay = math.cos(wrap_to_pi(state.theta_front + 0.5 * math.pi)) > 0.95
+                if mode == "along_corridor":
+                    return bool(along)
+                if mode == "face_bay":
+                    return bool(face_bay)
+                return bool(along or face_bay)
+        return True
+
+    def _rule_scene_separation_valid(self, state):
+        min_sep = float(self.scene.metadata.get("min_initial_target_separation", 0.0))
+        max_sep = float(self.scene.metadata.get("max_initial_target_separation", 1e9))
+        distance = math.hypot(
+            float(state.x_front) - float(self.slot.x_goal),
+            float(state.y_front) - float(self.slot.y_goal),
+        )
+        return bool(min_sep <= distance <= max_sep), float(distance)
+
+    def _sample_rule_scene_initial_state(self):
+        stage = int(np.clip(self._active_stage, 1, 4))
+        task_family = self._task_family_from_scene()
+        candidates = tuple(self.scene.metadata.get("initial_pose_candidates", ()))
+        if not candidates:
+            raise ResetInitialStateError(
+                "no rule-scene initial candidates for scene seed {}".format(
+                    self.scene.metadata["seed"]
+                )
+            )
+        max_attempts = max(
+            1,
+            int(self.scene.metadata.get("max_pose_sampling_attempts", 32)),
+        )
+        ensure_feasible = bool(
+            self.scene.metadata.get("ensure_feasible_reset", True)
+        )
+        reject_counts = self._reset_reject_counts()
+        reject_counts["separation"] = 0
+        reject_counts["heading"] = 0
+        last_reason = ""
+        last_metrics = {}
+        self.initial_sampling_diagnostics = {
+            "initial_task_family": str(task_family),
+            "initial_candidate_count": int(len(candidates)),
+            "initial_distance_min": float(
+                self.scene.metadata.get("min_initial_target_separation", 0.0)
+            ),
+            "initial_distance_max": float(
+                self.scene.metadata.get("max_initial_target_separation", 0.0)
+            ),
+            "initial_lateral_range": 0.0,
+            "initial_heading_range_deg": 0.0,
+            "initial_phi_range_deg": 0.0,
+            "reset_candidate_bank_size": int(len(candidates)),
+            "reset_candidate_bank_valid_count": 0,
+            "reset_candidate_bank_empty": False,
+            "reset_candidate_selected_clearance_bucket": "",
+            "reset_candidate_selected_pose_bucket": "",
+            "reset_candidate_selected_mask_max": 0.0,
+            "reset_feasible_mask_available": False,
+        }
+        order = list(self.rng.permutation(len(candidates)))
+        attempt_count = 0
+        selected_region = ""
+        selected_bay_index = -1
+        for attempt_index in range(max_attempts):
+            candidate = candidates[order[attempt_index % len(order)]]
+            state, region, bay_index = self._rule_scene_candidate_state(
+                candidate,
+                attempt_index,
+            )
+            attempt_count += 1
+            if not self._rule_scene_heading_valid(state, region):
+                reject_counts["heading"] += 1
+                last_reason = "heading"
+                continue
+            separation_valid, distance = self._rule_scene_separation_valid(state)
+            if not separation_valid:
+                reject_counts["separation"] += 1
+                last_reason = "separation"
+                continue
+            if ensure_feasible:
+                valid, reject_reason, metrics = self._reset_candidate_viability(
+                    state,
+                    stage=stage,
+                )
+            else:
+                if self._state_collides(state):
+                    valid, reject_reason, metrics = False, "collision", {}
+                else:
+                    valid = True
+                    reject_reason = ""
+                    metrics = self._reset_candidate_metrics(state, stage)
+            if not valid:
+                reject_counts[reject_reason] = reject_counts.get(reject_reason, 0) + 1
+                last_reason = str(reject_reason)
+                last_metrics = metrics
+                continue
+            metrics = dict(metrics)
+            metrics["initial_target_distance"] = float(distance)
+            selected_region = str(region)
+            selected_bay_index = int(bay_index)
+            self.initial_sampling_diagnostics.update(
+                {
+                    "initial_spawn_region": selected_region,
+                    "initial_bay_index": selected_bay_index,
+                    "initial_target_distance": float(distance),
+                    "reset_rule_pose_attempt_count": int(attempt_count),
+                    "reset_candidate_bank_valid_count": 1,
+                    "reset_feasible_mask_available": bool(
+                        float(metrics.get("mask_max", 0.0))
+                        > float(metrics.get("mask_required", self._reset_mask_threshold(stage)))
+                    ),
+                    "reset_candidate_reject_separation_count": int(
+                        reject_counts.get("separation", 0)
+                    ),
+                    "reset_candidate_reject_heading_count": int(
+                        reject_counts.get("heading", 0)
+                    ),
+                }
+            )
+            return self._finalize_reset_candidate(
+                state,
+                "{}_initial".format(selected_region),
+                False,
+                stage,
+                task_family,
+                metrics,
+                reject_counts,
+            )
+        raise ResetInitialStateError(
+            "no reset-viable rule-scene initial state for scene seed {} after {} attempts; "
+            "last reason {} mask {:.3f}".format(
+                self.scene.metadata["seed"],
+                attempt_count,
+                last_reason,
+                float(last_metrics.get("mask_max", 0.0)),
+            )
+        )
+
     def _sample_initial_state(self):
+        if self._is_rule_scene():
+            return self._sample_rule_scene_initial_state()
         stage = int(np.clip(self._active_stage, 1, 4))
         goal = self.slot
         index = stage - 1
@@ -1655,6 +1857,9 @@ class LocalParkingEnv:
                         {
                             "seed": failed_seed,
                             "task_family": failed_family,
+                            "requested_scene_type": str(
+                                self.scene.metadata.get("requested_scene_type", "")
+                            ),
                             "reason": str(exc),
                         }
                     )
@@ -1753,11 +1958,42 @@ class LocalParkingEnv:
         )
         info.update(self.initial_sampling_diagnostics)
         for key in (
+            "scene_type",
+            "requested_scene_type",
             "clearance_bucket",
             "approach_side_bucket",
             "scene_complexity_bucket",
             "difficulty_label",
             "corridor_width",
+            "bay_count",
+            "bay_width",
+            "bay_depth",
+            "wall_thickness",
+            "initial_spawn_mode",
+            "requested_initial_spawn_mode",
+            "target_bay_index",
+            "target_heading_into_bay",
+            "corridor_outer_wall_exists",
+            "bottom_wall_exists",
+            "partition_wall_count",
+            "side_wall_count",
+            "world_length",
+            "world_width",
+            "boundary_wall_thickness",
+            "boundary_wall_count",
+            "truck_length",
+            "truck_width",
+            "truck_center",
+            "truck_heading",
+            "truck_in_front",
+            "truck_perpendicular",
+            "discrete_obstacle_count_requested",
+            "discrete_obstacle_count",
+            "obstacle_candidate_count",
+            "obstacle_sampling_checks",
+            "obstacle_exclusion_valid",
+            "obstacle_count",
+            "scene_generation_attempts",
             "nominal_target_collision",
             "nominal_target_front_in_bay",
             "nominal_target_rear_in_bay",

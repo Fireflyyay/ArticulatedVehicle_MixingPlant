@@ -76,6 +76,7 @@ class ActionMaskConfig:
 class MixingPlantSceneConfig:
     """Constructive corridor, wall, obstacle, and bay scene geometry in meters."""
 
+    scene_type: str = "default"
     world_half_extent: float = 40.0
     resolution: float = 1.0
     boundary_margin: float = 4.0
@@ -111,7 +112,68 @@ class MixingPlantSceneConfig:
     equipment_obstacle_length: float = 3.0
     equipment_obstacle_width: float = 2.0
 
-    def corridor_width(self, stage: int) -> float:
+    # --- Rule-based mixing-station bay corridor scene ---
+    bay_count: int = 5
+    bay_width: float = 8.0
+    bay_depth: float = 10.0
+    wall_thickness: float = 0.50
+    corridor_width: float = 7.0
+    world_margin: float = 4.0
+    world_margin_x: float = 14.5
+    initial_spawn_mode: str = "mixed"
+    corridor_initial_heading_mode: str = "mixed"
+    target_bay_sampling_mode: str = "uniform"
+    fixed_target_bay_index: int = 0
+    fixed_initial_bay_index: int = 0
+    min_initial_target_separation: float = 8.0
+    max_initial_target_separation: float = 30.0
+    target_pose_noise: Tuple[float, float, float, float] = (
+        0.25,
+        0.25,
+        math.radians(3.0),
+        0.0,
+    )
+    initial_pose_noise: Tuple[float, float, float, float] = (
+        0.50,
+        0.40,
+        math.radians(8.0),
+        math.radians(5.0),
+    )
+    ensure_feasible_reset: bool = True
+    max_pose_sampling_attempts: int = 32
+
+    # --- Rule-based loading-truck rectangle scene ---
+    world_length: float = 42.0
+    world_width: float = 30.0
+    boundary_wall_thickness: float = 0.50
+    target_pose_sampling_region: Tuple[float, float, float, float] = (
+        0.0,
+        -4.0,
+        8.0,
+        4.0,
+    )
+    initial_pose_sampling_region: Tuple[float, float, float, float] = (
+        -16.0,
+        -6.0,
+        -8.0,
+        6.0,
+    )
+    truck_length: float = 9.0
+    truck_width: float = 2.8
+    truck_offset_ahead_of_target: float = 5.0
+    truck_lateral_offset_range: Tuple[float, float] = (-1.0, 1.0)
+    truck_heading_mode: str = "perpendicular_to_target"
+    discrete_obstacle_count: int = 7
+    discrete_obstacle_shape: str = "mixed"
+    discrete_obstacle_size_range: Tuple[float, float] = (1.25, 3.0)
+    obstacle_exclusion_radius_around_initial: float = 8.0
+    obstacle_exclusion_radius_around_target: float = 8.0
+    obstacle_exclusion_radius_around_truck: float = 4.0
+    obstacle_min_pairwise_distance: float = 3.0
+    obstacle_candidate_grid_resolution: float = 3.0
+    max_obstacle_sampling_attempts: int = 64
+
+    def corridor_width_for_stage(self, stage: int) -> float:
         index = max(0, min(3, int(stage) - 1))
         return float(self.corridor_width_by_stage[index])
 
@@ -205,14 +267,14 @@ class LocalParkingEnvConfig:
     apply_floor_only_when_all_zero: bool = False
 
     # --- Strict-mask local DWA deadlock recovery ---
-    enable_dwa_recovery: bool = True
+    enable_dwa_recovery: bool = False
     dwa_override_policy_action: bool = True
     dwa_enable_deadlock_termination: bool = False
     dwa_all_zero_eps: float = 1e-3
-    dwa_low_safe_ratio: float = 0.05
+    dwa_low_safe_ratio: float = 0.12
     dwa_unlock_safe_ratio: float = 0.08
     dwa_forced_stop_patience: int = 3
-    dwa_no_progress_patience: int = 6
+    dwa_no_progress_patience: int = 3
     dwa_deadlock_patience: int = 8
     dwa_horizon_steps: int = 4
     dwa_speed_ratios: Tuple[float, ...] = (0.25, 0.5, 1.0)

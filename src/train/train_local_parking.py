@@ -21,6 +21,7 @@ from config import (
 )
 from env.local_parking_env import LocalParkingEnv
 from env.mixing_plant_scene import (
+    SUPPORTED_SCENE_TYPES,
     TASK_FAMILIES as SCENE_TASK_FAMILIES,
     normalize_family_schedule,
 )
@@ -80,6 +81,21 @@ def _task_family(reset_info, scene_metadata):
     if mode == "head_in":
         return "head_in"
     raise ValueError("unsupported goal orientation mode: {}".format(mode))
+
+
+def _scene_type_key(reset_info, scene_metadata):
+    requested = str(
+        reset_info.get(
+            "requested_scene_type",
+            scene_metadata.get("requested_scene_type", ""),
+        )
+    )
+    if requested:
+        return requested
+    actual = str(reset_info.get("scene_type", scene_metadata.get("scene_type", "")))
+    if actual:
+        return actual
+    return str(DEFAULT_SCENE_CONFIG.scene_type)
 
 
 def _parse_family_schedule(value):
@@ -265,12 +281,25 @@ def _resolve_output_dir(output_dir, seed, timestamp=None):
     return os.path.join(REPO_ROOT, "runs", run_name)
 
 
-def _write_config_snapshot(path, args, env_config, ppo_config):
+def _write_config_snapshot(
+    path,
+    args,
+    scene_config_or_env_config,
+    env_config_or_ppo_config,
+    ppo_config=None,
+):
+    if ppo_config is None:
+        scene_config = DEFAULT_SCENE_CONFIG
+        env_config = scene_config_or_env_config
+        ppo_config = env_config_or_ppo_config
+    else:
+        scene_config = scene_config_or_env_config
+        env_config = env_config_or_ppo_config
     sections = (
         ("training_arguments", vars(args)),
         ("vehicle", asdict(DEFAULT_VEHICLE_PARAMS)),
         ("action_mask", asdict(DEFAULT_MASK_CONFIG)),
-        ("scene", asdict(DEFAULT_SCENE_CONFIG)),
+        ("scene", asdict(scene_config)),
         ("environment", asdict(env_config)),
         ("ppo", asdict(ppo_config)),
     )
@@ -727,10 +756,47 @@ def _summarize_eval_outcomes(outcomes):
             [float(item.get("success", False)) for item in selected]
         )
         scenario_counts[scenario] = len(selected)
+    scene_type_success = {}
+    scene_type_counts = {}
+    scene_type_no_latch_success = {}
+    scene_type_scenario_success = {}
+    for scene_type in sorted(set(str(item.get("scene_type", "")) for item in outcomes)):
+        selected = [
+            item
+            for item in outcomes
+            if str(item.get("scene_type", "")) == scene_type
+        ]
+        if not selected:
+            continue
+        selected_no_latch = [
+            item for item in selected if not bool(item.get("rs_latched", False))
+        ]
+        scene_type_success[scene_type] = _safe_mean(
+            [float(item.get("success", False)) for item in selected]
+        )
+        scene_type_counts[scene_type] = len(selected)
+        scene_type_no_latch_success[scene_type] = _safe_mean(
+            [float(item.get("success", False)) for item in selected_no_latch]
+        )
+        scenario_rates = {}
+        for scenario in sorted(set(str(item.get("scenario_type", "")) for item in selected)):
+            scenario_selected = [
+                item
+                for item in selected
+                if str(item.get("scenario_type", "")) == scenario
+            ]
+            if scenario_selected:
+                scenario_rates[scenario] = _safe_mean(
+                    [float(item.get("success", False)) for item in scenario_selected]
+                )
+        scene_type_scenario_success[scene_type] = scenario_rates
     return {
         "episode_count": len(outcomes),
         "success_rate": _safe_mean(
             [float(item.get("success", False)) for item in outcomes]
+        ),
+        "scene_type_equal_success_rate": _safe_mean(
+            [float(value) for value in scene_type_success.values()]
         ),
         "collision_rate": _safe_mean(
             [float(item.get("collision", False)) for item in outcomes]
@@ -788,6 +854,10 @@ def _summarize_eval_outcomes(outcomes):
         "no_latch_success_rate": _safe_mean(
             [float(item.get("success", False)) for item in no_latch]
         ),
+        "scene_type_success": scene_type_success,
+        "scene_type_counts": scene_type_counts,
+        "scene_type_no_latch_success": scene_type_no_latch_success,
+        "scene_type_scenario_success": scene_type_scenario_success,
         "scenario_success": scenario_success,
         "scenario_counts": scenario_counts,
     }
@@ -805,6 +875,52 @@ def _aggregate_success_by_family(stage_results, policy_mode):
     return aggregate
 
 
+def _aggregate_success_by_scene_type(stage_results, policy_mode):
+    key = "{}_by_scene_type".format(policy_mode)
+    scene_types = sorted(
+        {
+            str(scene_type)
+            for result in stage_results.values()
+            for scene_type in result.get(key, {}).keys()
+        }
+    )
+    return dict(
+        (
+            scene_type,
+            _safe_mean(
+                [
+                    float(result.get(key, {}).get(scene_type, 0.0))
+                    for result in stage_results.values()
+                ]
+            ),
+        )
+        for scene_type in scene_types
+    )
+
+
+def _scene_type_equal_from_summary(summary, per_scene_key, fallback_key):
+    per_scene = summary.get(per_scene_key, {})
+    if isinstance(per_scene, dict) and per_scene:
+        return _safe_mean([float(value) for value in per_scene.values()])
+    return float(summary.get(fallback_key, 0.0))
+
+
+def _scene_type_equal_scenario_from_summary(summary, scenario, fallback_key):
+    scene_type_scenario = summary.get("scene_type_scenario_success", {})
+    scene_type_success = summary.get("scene_type_success", {})
+    values = []
+    if isinstance(scene_type_scenario, dict):
+        for scene_type in sorted(scene_type_scenario.keys()):
+            scenario_rates = scene_type_scenario.get(scene_type, {})
+            if isinstance(scenario_rates, dict) and scenario in scenario_rates:
+                values.append(float(scenario_rates[scenario]))
+            elif isinstance(scene_type_success, dict) and scene_type in scene_type_success:
+                values.append(float(scene_type_success[scene_type]))
+    if values:
+        return _safe_mean(values)
+    return float(summary.get(fallback_key, 0.0))
+
+
 def _aggregate_eval_summaries(stage_results, policy_mode):
     summary_key = "{}_summary".format(policy_mode)
     summaries = [
@@ -812,10 +928,49 @@ def _aggregate_eval_summaries(stage_results, policy_mode):
         for result in stage_results.values()
         if isinstance(result.get(summary_key, {}), dict)
     ]
+    scene_types = sorted(
+        {
+            str(scene_type)
+            for summary in summaries
+            for scene_type in summary.get("scene_type_success", {}).keys()
+        }
+    )
+    scene_type_success = dict(
+        (
+            scene_type,
+            _safe_mean(
+                [
+                    float(summary.get("scene_type_success", {}).get(scene_type, 0.0))
+                    for summary in summaries
+                ]
+            ),
+        )
+        for scene_type in scene_types
+    )
+    scene_type_no_latch_success = dict(
+        (
+            scene_type,
+            _safe_mean(
+                [
+                    float(
+                        summary.get("scene_type_no_latch_success", {}).get(
+                            scene_type,
+                            0.0,
+                        )
+                    )
+                    for summary in summaries
+                ]
+            ),
+        )
+        for scene_type in scene_types
+    )
     return {
         "episode_count": int(sum(int(item.get("episode_count", 0)) for item in summaries)),
         "success_rate": _safe_mean(
             [float(item.get("success_rate", 0.0)) for item in summaries]
+        ),
+        "scene_type_equal_success_rate": _safe_mean(
+            [float(value) for value in scene_type_success.values()]
         ),
         "collision_rate": _safe_mean(
             [float(item.get("collision_rate", 0.0)) for item in summaries]
@@ -838,22 +993,36 @@ def _aggregate_eval_summaries(stage_results, policy_mode):
         "no_latch_success_rate": _safe_mean(
             [float(item.get("no_latch_success_rate", 0.0)) for item in summaries]
         ),
+        "scene_type_success": scene_type_success,
+        "scene_type_no_latch_success": scene_type_no_latch_success,
     }
 
 
 def _checkpoint_selection_score(evaluation):
-    stage3 = float(evaluation.get("stage3_no_latch_success", 0.0))
-    stage4 = float(evaluation.get("stage4_recovery_success", 0.0))
+    stage3 = float(
+        evaluation.get(
+            "stage3_scene_type_equal_no_latch_success",
+            evaluation.get("stage3_no_latch_success", 0.0),
+        )
+    )
+    stage4 = float(
+        evaluation.get(
+            "stage4_scene_type_equal_recovery_success",
+            evaluation.get("stage4_recovery_success", 0.0),
+        )
+    )
     return min(stage3, stage4)
 
 
 def _evaluate_policy_by_family(
     agent,
     env_config,
+    scene_config,
     stage,
     seed,
     episodes_per_family,
     eval_modes=("no_guide",),
+    scene_type_schedule=None,
 ):
     episodes_per_family = int(episodes_per_family)
     if episodes_per_family < MIN_EVAL_EPISODES_PER_FAMILY:
@@ -863,8 +1032,16 @@ def _evaluate_policy_by_family(
             )
         )
     eval_modes = tuple(eval_modes or ("no_guide",))
+    scene_type_schedule = tuple(scene_type_schedule or ())
+    if not scene_type_schedule:
+        scene_type_schedule = (
+            str(getattr(scene_config, "scene_type", DEFAULT_SCENE_CONFIG.scene_type)),
+        )
     eval_pool_size = max(1, int(env_config.scene_pool_size))
-    schedule_size = max(1, len(tuple(env_config.scene_family_schedule)))
+    schedule_size = max(
+        1,
+        len(tuple(env_config.scene_family_schedule)) * len(scene_type_schedule),
+    )
     if schedule_size > 1:
         remainder = eval_pool_size % schedule_size
         if remainder:
@@ -900,18 +1077,43 @@ def _evaluate_policy_by_family(
         eval_config = make_eval_config(eval_mode)
         mode_results = {}
         for deterministic in (True, False):
+            multi_pool = None
+            if len(scene_type_schedule) > 1:
+                multi_pool = MultiStageScenePool(
+                    pool_size=eval_pool_size,
+                    base_seed=base_seed,
+                    scene_config=scene_config,
+                    family_schedule=TASK_FAMILIES,
+                    scene_type_schedule=scene_type_schedule,
+                )
             env = LocalParkingEnv(
                 config=eval_config,
+                scene_config=scene_config,
                 seed=base_seed,
+                multi_stage_pool=multi_pool,
             )
-            outcomes_by_family = dict((family, []) for family in TASK_FAMILIES)
-            while (
-                min(len(values) for values in outcomes_by_family.values())
-                < episodes_per_family
-            ):
+            if multi_pool is not None:
+                env.set_active_stage(stage)
+            group_keys = [
+                (scene_type, family)
+                for scene_type in scene_type_schedule
+                for family in TASK_FAMILIES
+            ]
+            outcomes_by_group = dict((key, []) for key in group_keys)
+            while min(len(values) for values in outcomes_by_group.values()) < episodes_per_family:
                 observation, reset_info = env.reset()
                 family = _task_family(reset_info, env.scene.metadata)
-                if len(outcomes_by_family[family]) >= episodes_per_family:
+                scene_type = _scene_type_key(reset_info, env.scene.metadata)
+                group_key = (scene_type, family)
+                if group_key not in outcomes_by_group:
+                    raise RuntimeError(
+                        "unexpected eval group scene_type={} family={}; expected {}".format(
+                            scene_type,
+                            family,
+                            group_keys,
+                        )
+                    )
+                if len(outcomes_by_group[group_key]) >= episodes_per_family:
                     continue
                 done = False
                 final_info = None
@@ -924,7 +1126,7 @@ def _evaluate_policy_by_family(
                         raw_action
                     )
                     done = terminated or truncated
-                outcomes_by_family[family].append(
+                outcomes_by_group[group_key].append(
                     {
                         "success": bool(final_info["success"]),
                         "collision": bool(final_info["collision"]),
@@ -946,6 +1148,10 @@ def _evaluate_policy_by_family(
                             final_info.get("dwa_final_max_safe_ratio", 0.0)
                         ),
                         "scenario_type": str(reset_info.get("scenario_type", "")),
+                        "scene_type": str(scene_type),
+                        "requested_scene_type": str(
+                            reset_info.get("requested_scene_type", scene_type)
+                        ),
                         "task_family": family,
                     }
                 )
@@ -955,16 +1161,57 @@ def _evaluate_policy_by_family(
                     family,
                     _safe_mean(
                         [
-                            float(item.get("success", False))
-                            for item in outcomes_by_family[family]
+                            _safe_mean(
+                                [
+                                    float(item.get("success", False))
+                                    for item in outcomes_by_group.get(
+                                        (scene_type, family),
+                                        (),
+                                    )
+                                ]
+                            )
+                            for scene_type in scene_type_schedule
                         ]
                     ),
                 )
                 for family in TASK_FAMILIES
             )
+            mode_results["{}_by_scene_type".format(mode)] = dict(
+                (
+                    scene_type,
+                    _safe_mean(
+                        [
+                            _safe_mean(
+                                [
+                                    float(item.get("success", False))
+                                    for item in outcomes_by_group.get(
+                                        (scene_type, family),
+                                        (),
+                                    )
+                                ]
+                            )
+                            for family in TASK_FAMILIES
+                        ]
+                    ),
+                )
+                for scene_type in scene_type_schedule
+            )
+            mode_results["{}_by_scene_type_family".format(mode)] = dict(
+                (
+                    "{}|{}".format(scene_type, family),
+                    _safe_mean(
+                        [
+                            float(item.get("success", False))
+                            for item in outcomes_by_group.get((scene_type, family), ())
+                        ]
+                    ),
+                )
+                for scene_type in scene_type_schedule
+                for family in TASK_FAMILIES
+            )
             all_outcomes = []
-            for family in TASK_FAMILIES:
-                all_outcomes.extend(outcomes_by_family[family])
+            for scene_type, family in group_keys:
+                all_outcomes.extend(outcomes_by_group.get((scene_type, family), ()))
             mode_results["{}_summary".format(mode)] = _summarize_eval_outcomes(
                 all_outcomes
             )
@@ -1001,26 +1248,36 @@ def _evaluate_policy_by_family(
     results["stage"] = int(stage)
     results["episodes_per_family"] = episodes_per_family
     results["eval_modes"] = list(eval_modes)
+    results["scene_type_schedule"] = list(scene_type_schedule)
     return results
 
 
 def _evaluate_policy_across_stages(
     agent,
     env_config,
+    scene_config,
     stages,
     seed,
     episodes_per_family,
     eval_modes=("no_guide",),
+    scene_type_schedule=None,
 ):
+    scene_type_schedule = tuple(scene_type_schedule or ())
+    if not scene_type_schedule:
+        scene_type_schedule = (
+            str(getattr(scene_config, "scene_type", DEFAULT_SCENE_CONFIG.scene_type)),
+        )
     stage_results = {}
     for stage in stages:
         result = _evaluate_policy_by_family(
             agent=agent,
             env_config=env_config,
+            scene_config=scene_config,
             stage=int(stage),
             seed=int(seed) + 10_000 * int(stage),
             episodes_per_family=episodes_per_family,
             eval_modes=eval_modes,
+            scene_type_schedule=scene_type_schedule,
         )
         stage_results[str(int(stage))] = result
 
@@ -1034,11 +1291,20 @@ def _evaluate_policy_across_stages(
         "eval_stages": [int(stage) for stage in stages],
         "episodes_per_family": int(episodes_per_family),
         "eval_modes": list(eval_modes),
+        "scene_type_schedule": list(scene_type_schedule),
         "deterministic": _aggregate_success_by_family(
             primary_stage_results,
             "deterministic",
         ),
         "stochastic": _aggregate_success_by_family(
+            primary_stage_results,
+            "stochastic",
+        ),
+        "deterministic_by_scene_type": _aggregate_success_by_scene_type(
+            primary_stage_results,
+            "deterministic",
+        ),
+        "stochastic_by_scene_type": _aggregate_success_by_scene_type(
             primary_stage_results,
             "stochastic",
         ),
@@ -1054,47 +1320,41 @@ def _evaluate_policy_across_stages(
     aggregate[primary_mode] = {
         "deterministic": dict(aggregate["deterministic"]),
         "stochastic": dict(aggregate["stochastic"]),
+        "deterministic_by_scene_type": dict(aggregate["deterministic_by_scene_type"]),
+        "stochastic_by_scene_type": dict(aggregate["stochastic_by_scene_type"]),
         "deterministic_summary": dict(aggregate["deterministic_summary"]),
         "stochastic_summary": dict(aggregate["stochastic_summary"]),
     }
     for eval_mode in eval_modes:
         if eval_mode == primary_mode:
             continue
+        eval_stage_results = {
+            stage: result[eval_mode] if eval_mode in result else result
+            for stage, result in stage_results.items()
+        }
         aggregate[eval_mode] = {
             "deterministic": _aggregate_success_by_family(
-                {
-                    stage: result[eval_mode]
-                    if eval_mode in result
-                    else result
-                    for stage, result in stage_results.items()
-                },
+                eval_stage_results,
                 "deterministic",
             ),
             "stochastic": _aggregate_success_by_family(
-                {
-                    stage: result[eval_mode]
-                    if eval_mode in result
-                    else result
-                    for stage, result in stage_results.items()
-                },
+                eval_stage_results,
+                "stochastic",
+            ),
+            "deterministic_by_scene_type": _aggregate_success_by_scene_type(
+                eval_stage_results,
+                "deterministic",
+            ),
+            "stochastic_by_scene_type": _aggregate_success_by_scene_type(
+                eval_stage_results,
                 "stochastic",
             ),
             "deterministic_summary": _aggregate_eval_summaries(
-                {
-                    stage: result[eval_mode]
-                    if eval_mode in result
-                    else result
-                    for stage, result in stage_results.items()
-                },
+                eval_stage_results,
                 "deterministic",
             ),
             "stochastic_summary": _aggregate_eval_summaries(
-                {
-                    stage: result[eval_mode]
-                    if eval_mode in result
-                    else result
-                    for stage, result in stage_results.items()
-                },
+                eval_stage_results,
                 "stochastic",
             ),
         }
@@ -1103,17 +1363,35 @@ def _evaluate_policy_across_stages(
     stage4 = stage_results.get("4", {})
     stage3_summary = stage3.get("deterministic_summary", {})
     stage4_summary = stage4.get("deterministic_summary", {})
-    stage4_scenario_success = stage4_summary.get("scenario_success", {})
-    aggregate["stage3_success"] = float(stage3_summary.get("success_rate", 0.0))
-    aggregate["stage4_success"] = float(stage4_summary.get("success_rate", 0.0))
+    aggregate["stage3_success"] = _scene_type_equal_from_summary(
+        stage3_summary,
+        "scene_type_success",
+        "success_rate",
+    )
+    aggregate["stage4_success"] = _scene_type_equal_from_summary(
+        stage4_summary,
+        "scene_type_success",
+        "success_rate",
+    )
+    aggregate["stage3_scene_type_equal_no_latch_success"] = (
+        _scene_type_equal_from_summary(
+            stage3_summary,
+            "scene_type_no_latch_success",
+            "no_latch_success_rate",
+        )
+    )
+    aggregate["stage4_scene_type_equal_recovery_success"] = (
+        _scene_type_equal_scenario_from_summary(
+            stage4_summary,
+            "recovery",
+            "success_rate",
+        )
+    )
     aggregate["stage3_no_latch_success"] = float(
-        stage3_summary.get("no_latch_success_rate", 0.0)
+        aggregate["stage3_scene_type_equal_no_latch_success"]
     )
     aggregate["stage4_recovery_success"] = float(
-        stage4_scenario_success.get(
-            "recovery",
-            stage4_summary.get("success_rate", 0.0),
-        )
+        aggregate["stage4_scene_type_equal_recovery_success"]
     )
     aggregate["collision_rate"] = float(
         aggregate["deterministic_summary"].get("collision_rate", 0.0)
@@ -1159,6 +1437,12 @@ def _save_best_checkpoints(
     )
     metrics["stage4_recovery_success"] = float(
         evaluation.get("stage4_recovery_success", 0.0)
+    )
+    metrics["stage3_scene_type_equal_no_latch_success"] = float(
+        evaluation.get("stage3_scene_type_equal_no_latch_success", 0.0)
+    )
+    metrics["stage4_scene_type_equal_recovery_success"] = float(
+        evaluation.get("stage4_scene_type_equal_recovery_success", 0.0)
     )
     for name, score in metrics.items():
         if name not in best_scores:
@@ -1260,6 +1544,16 @@ def train(args):
         raise ValueError("--dwa-speed-ratios entries must be inside (0, 1]")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    scene_config = replace(
+        DEFAULT_SCENE_CONFIG,
+        scene_type=str(args.scene_type),
+    )
+    curriculum_scene_types = (
+        tuple(SUPPORTED_SCENE_TYPES)
+        if bool(args.curriculum)
+        else (str(args.scene_type),)
+    )
+    args.curriculum_scene_types = ",".join(curriculum_scene_types)
     env_config = replace(
         DEFAULT_ENV_CONFIG,
         curriculum_stage=args.stage,
@@ -1336,6 +1630,7 @@ def train(args):
     _write_config_snapshot(
         os.path.join(output_dir, "config.txt"),
         args,
+        scene_config,
         env_config,
         ppo_config,
     )
@@ -1347,8 +1642,9 @@ def train(args):
         multi_pool = MultiStageScenePool(
             pool_size=env_config.scene_pool_size,
             base_seed=args.seed,
-            scene_config=DEFAULT_SCENE_CONFIG,
+            scene_config=scene_config,
             family_schedule=env_config.scene_family_schedule,
+            scene_type_schedule=curriculum_scene_types,
         )
         stage_selector = CurriculumStageSelector(
             target_success_rate=float(args.curriculum_target_success),
@@ -1361,6 +1657,7 @@ def train(args):
     env = LocalParkingEnv(
         config=env_config,
         hybrid_planner=planner,
+        scene_config=scene_config,
         seed=args.seed,
         multi_stage_pool=multi_pool,
     )
@@ -1537,8 +1834,38 @@ def train(args):
             "distance_to_goal": float(final_info["distance_to_goal"]),
             "scenario_type": reset_info.get("scenario_type", ""),
             "scene_seed": int(reset_info.get("scene_seed", -1)),
+            "scene_type": str(reset_info.get("scene_type", "")),
+            "requested_scene_type": str(
+                reset_info.get("requested_scene_type", reset_info.get("scene_type", ""))
+            ),
             "goal_orientation_mode": str(reset_info.get("goal_orientation_mode", "")),
             "task_family": task_family,
+            "bay_count": int(reset_info.get("bay_count", 0)),
+            "bay_width": float(reset_info.get("bay_width", 0.0)),
+            "bay_depth": float(reset_info.get("bay_depth", 0.0)),
+            "corridor_width": float(reset_info.get("corridor_width", 0.0)),
+            "target_bay_index": int(reset_info.get("target_bay_index", -1)),
+            "initial_bay_index": int(reset_info.get("initial_bay_index", -1)),
+            "initial_spawn_region": str(reset_info.get("initial_spawn_region", "")),
+            "corridor_outer_wall_exists": bool(
+                reset_info.get("corridor_outer_wall_exists", False)
+            ),
+            "reset_feasible_mask_available": bool(
+                reset_info.get("reset_feasible_mask_available", False)
+            ),
+            "world_length": float(reset_info.get("world_length", 0.0)),
+            "world_width": float(reset_info.get("world_width", 0.0)),
+            "truck_in_front": bool(reset_info.get("truck_in_front", False)),
+            "truck_perpendicular": bool(
+                reset_info.get("truck_perpendicular", False)
+            ),
+            "discrete_obstacle_count": int(
+                reset_info.get("discrete_obstacle_count", 0)
+            ),
+            "obstacle_count": int(reset_info.get("obstacle_count", 0)),
+            "obstacle_exclusion_valid": bool(
+                reset_info.get("obstacle_exclusion_valid", False)
+            ),
             "clearance_bucket": str(reset_info.get("clearance_bucket", "")),
             "approach_side_bucket": str(reset_info.get("approach_side_bucket", "")),
             "scene_complexity_bucket": str(
@@ -1579,6 +1906,12 @@ def train(args):
             ),
             "scene_generation_attempt_count": int(
                 reset_info.get("scene_generation_attempt_count", 1)
+            ),
+            "scene_generation_attempts": int(
+                reset_info.get(
+                    "scene_generation_attempts",
+                    reset_info.get("scene_generation_attempt_count", 1),
+                )
             ),
             "initial_distance_min": float(
                 reset_info.get("initial_distance_min", 0.0)
@@ -1822,10 +2155,12 @@ def train(args):
             latest_evaluation = _evaluate_policy_across_stages(
                 agent=agent,
                 env_config=env_config,
+                scene_config=scene_config,
                 stages=(1, 2, 3, 4),
                 seed=args.seed,
                 episodes_per_family=args.eval_episodes_per_family,
                 eval_modes=tuple(eval_modes),
+                scene_type_schedule=curriculum_scene_types if curriculum else None,
             )
             evaluation_record = {
                 "episode": episode_index,
@@ -1838,6 +2173,7 @@ def train(args):
                 "episode": episode_index,
                 "stage": args.stage,
                 "eval_stages": [1, 2, 3, 4],
+                "scene_type_schedule": list(curriculum_scene_types),
             }
             _save_best_checkpoints(
                 agent=agent,
@@ -1909,6 +2245,7 @@ def train(args):
                     "stage": args.stage,
                     "latest_evaluation": dict(latest_evaluation),
                     "best_scores": dict(best_scores),
+                    "scene_type_schedule": list(curriculum_scene_types),
                 },
             )
         if curriculum:
@@ -1937,6 +2274,7 @@ def train(args):
             "stage": args.stage,
             "latest_evaluation": dict(latest_evaluation),
             "best_scores": dict(best_scores),
+            "scene_type_schedule": list(curriculum_scene_types),
         },
     )
     if writer is not None:
@@ -2011,6 +2349,15 @@ def main():
         default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_head_in,
     )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
+    parser.add_argument(
+        "--scene-type",
+        choices=SUPPORTED_SCENE_TYPES,
+        default=DEFAULT_SCENE_CONFIG.scene_type,
+        help=(
+            "Scene generator type for non-curriculum training; --curriculum "
+            "uses all supported scene types"
+        ),
+    )
     parser.add_argument(
         "--scene-family-schedule",
         default=",".join(DEFAULT_ENV_CONFIG.scene_family_schedule),

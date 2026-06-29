@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from config import DEFAULT_ENV_CONFIG, DEFAULT_SCENE_CONFIG, DEFAULT_VEHICLE_PARAMS
 from env.local_parking_env import LocalParkingEnv
+from env.mixing_plant_scene import SUPPORTED_SCENE_TYPES
 from model.continuous_ppo import ContinuousPPOAgent
 from train.curriculum import MultiStageScenePool
 
@@ -81,6 +82,7 @@ def evaluate_checkpoint(
     enable_dwa_recovery=False,
     dwa_override_policy_action=False,
     dwa_deadlock_termination=False,
+    scene_type=DEFAULT_SCENE_CONFIG.scene_type,
 ):
     episodes_per_family = int(episodes_per_family)
     if episodes_per_family < 20:
@@ -103,6 +105,7 @@ def evaluate_checkpoint(
         eval_modes = (eval_mode,)
 
     summaries_by_mode = {}
+    scene_config = replace(DEFAULT_SCENE_CONFIG, scene_type=str(scene_type))
 
     for mode_name in eval_modes:
         mode_config = _eval_config_for_mode(
@@ -118,11 +121,12 @@ def evaluate_checkpoint(
         multi_pool = MultiStageScenePool(
             pool_size=mode_config.scene_pool_size,
             base_seed=int(seed),
-            scene_config=DEFAULT_SCENE_CONFIG,
+            scene_config=scene_config,
             family_schedule=mode_config.scene_family_schedule,
         )
         env = LocalParkingEnv(
             config=mode_config,
+            scene_config=scene_config,
             multi_stage_pool=multi_pool,
             seed=int(seed),
         )
@@ -369,6 +373,11 @@ def main():
         help="Deterministic episodes per family per stage (default: 20)",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--scene-type",
+        choices=SUPPORTED_SCENE_TYPES,
+        default=DEFAULT_SCENE_CONFIG.scene_type,
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--stages",
@@ -435,6 +444,7 @@ def main():
         enable_dwa_recovery=args.enable_dwa_recovery,
         dwa_override_policy_action=args.dwa_override_policy_action,
         dwa_deadlock_termination=args.dwa_deadlock_termination,
+        scene_type=args.scene_type,
     )
     print_summary_table(summaries)
 

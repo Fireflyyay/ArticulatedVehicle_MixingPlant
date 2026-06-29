@@ -118,6 +118,19 @@ def test_checkpoint_selection_score_uses_stage3_and_stage4_failure_slices():
     assert score == 0.61
 
 
+def test_checkpoint_selection_score_prefers_scene_type_equal_slices():
+    score = _checkpoint_selection_score(
+        {
+            "stage3_no_latch_success": 0.95,
+            "stage4_recovery_success": 0.94,
+            "stage3_scene_type_equal_no_latch_success": 0.66,
+            "stage4_scene_type_equal_recovery_success": 0.58,
+        }
+    )
+
+    assert score == 0.58
+
+
 def test_hard_case_replay_buffer_records_no_rs_collision_tail(synthetic_action_mask):
     env = LocalParkingEnv(
         config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=3),

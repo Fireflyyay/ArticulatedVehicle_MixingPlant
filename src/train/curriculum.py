@@ -10,12 +10,14 @@ class MultiStageScenePool:
         base_seed=0,
         scene_config=None,
         family_schedule=None,
+        scene_type_schedule=None,
     ):
         self._pools = {}
         self._pool_size = int(pool_size)
         self._base_seed = int(base_seed)
         self._scene_config = scene_config
         self._family_schedule = family_schedule
+        self._scene_type_schedule = scene_type_schedule
 
     def pool_for(self, stage):
         stage = int(stage)
@@ -26,6 +28,7 @@ class MultiStageScenePool:
                 base_seed=self._base_seed,
                 scene_config=self._scene_config,
                 family_schedule=self._family_schedule,
+                scene_type_schedule=self._scene_type_schedule,
             )
         return self._pools[stage]
 

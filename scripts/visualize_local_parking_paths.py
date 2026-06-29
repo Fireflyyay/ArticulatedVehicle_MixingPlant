@@ -11,6 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from shapely.geometry import box
 import torch
 
 
@@ -19,8 +20,9 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from config import DEFAULT_ENV_CONFIG  # noqa: E402
+from config import DEFAULT_ENV_CONFIG, DEFAULT_SCENE_CONFIG  # noqa: E402
 from env.local_parking_env import LocalParkingEnv  # noqa: E402
+from env.mixing_plant_scene import SUPPORTED_SCENE_TYPES  # noqa: E402
 from model.continuous_ppo import ContinuousPPOAgent  # noqa: E402
 
 
@@ -84,6 +86,39 @@ def _plot_bay(ax, bay):
         linewidth=3.0 if is_target else 1.3,
         linestyle="--",
         zorder=4,
+    )
+
+
+def _plot_obstacles(ax, scene):
+    scene_type = str(scene.metadata.get("scene_type", ""))
+    if scene_type == "loading_truck_rectangle_space":
+        labels = tuple(scene.metadata.get("constructed_obstacle_labels", ()))
+        for index, obstacle in enumerate(scene.obstacle_polygons):
+            label = str(labels[index]) if index < len(labels) else ""
+            if label == "truck_obstacle":
+                _plot_polygon(ax, obstacle, "#d95f02", "#8c2d04", alpha=0.85, zorder=2)
+            else:
+                _plot_polygon(ax, obstacle, "#777777", "#555555", alpha=0.90, zorder=1)
+        return
+    for obstacle in scene.obstacle_polygons:
+        _plot_polygon(ax, obstacle, "#777777", "#555555", alpha=0.95, zorder=1)
+
+
+def _plot_scene_regions(ax, scene):
+    if str(scene.metadata.get("scene_type", "")) != "mixing_station_bay_corridor":
+        return
+    bounds = scene.metadata.get("corridor_region_bounds")
+    if not bounds:
+        return
+    x0, y0, x1, y1 = tuple(float(value) for value in bounds)
+    _plot_polygon(
+        ax,
+        box(x0, y0, x1, y1),
+        "#b7e4c7",
+        "#2d6a4f",
+        alpha=0.20,
+        linewidth=1.4,
+        zorder=0,
     )
 
 
@@ -446,8 +481,8 @@ def _plot_scene_and_path(
     fig, ax = plt.subplots(figsize=(10, 10))
     scene = rollout.scene
     slot = rollout.slot
-    for obstacle in scene.obstacle_polygons:
-        _plot_polygon(ax, obstacle, "#777777", "#555555", alpha=0.95, zorder=1)
+    _plot_scene_regions(ax, scene)
+    _plot_obstacles(ax, scene)
     for bay in scene.parking_bays:
         _plot_bay(ax, bay)
 
@@ -576,9 +611,10 @@ def _path_output_path(base_output, path_index, total_paths):
     return "{}_path{:03d}{}".format(stem, path_index + 1, extension)
 
 
-def _default_output_path(stage, task_family, seed, checkpoint_path):
+def _default_output_path(stage, scene_type, task_family, seed, checkpoint_path):
     checkpoint_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    filename = "local_parking_paths_stage{}_{}_seed{}_{}.png".format(
+    filename = "local_parking_paths_{}_stage{}_{}_seed{}_{}.png".format(
+        str(scene_type),
         int(stage),
         str(task_family),
         int(seed),
@@ -592,6 +628,11 @@ def main():
         description="Roll out a PPO checkpoint and render local parking paths."
     )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=3)
+    parser.add_argument(
+        "--scene-type",
+        choices=SUPPORTED_SCENE_TYPES,
+        default=DEFAULT_SCENE_CONFIG.scene_type,
+    )
     parser.add_argument(
         "--task-family",
         choices=["head_in"],
@@ -659,6 +700,7 @@ def main():
 
     output = args.output or _default_output_path(
         args.stage,
+        args.scene_type,
         args.task_family,
         args.seed,
         checkpoint_path,
@@ -690,7 +732,11 @@ def main():
         dwa_override_policy_action=bool(args.dwa_override_policy_action),
         dwa_enable_deadlock_termination=bool(args.dwa_deadlock_termination),
     )
-    env = LocalParkingEnv(config=env_config, seed=int(args.seed))
+    env = LocalParkingEnv(
+        config=env_config,
+        scene_config=replace(DEFAULT_SCENE_CONFIG, scene_type=args.scene_type),
+        seed=int(args.seed),
+    )
     deterministic = not bool(args.stochastic)
 
     rollouts = []
