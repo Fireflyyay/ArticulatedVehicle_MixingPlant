@@ -10,7 +10,12 @@ from config import (
     DEFAULT_VEHICLE_PARAMS,
     LocalParkingEnvConfig,
 )
-from env.articulated_action_mask import ArticulatedActionMask
+from env.articulated_action_mask import (
+    FORWARD_GEAR,
+    REVERSE_GEAR,
+    STOP_GEAR,
+    ArticulatedActionMask,
+)
 from env.dwa_recovery import DWARecoveryController, DWAResult
 from env.geometry import overlap_ratio, wrap_to_pi
 from env.hybrid_astar_reward import OptionalHybridAStarReward
@@ -159,7 +164,10 @@ class LocalParkingEnv:
         self.scene = None
         self.slot = None
         self.current_mask = None
+        self.current_normal_mask = None
+        self.current_recovery_mask = None
         self.current_mask_floor_info = self._empty_mask_floor_info()
+        self.current_dwa_recovery_result = DWAResult(reason="not_triggered")
         self.last_front_lidar_m = None
         self.last_rear_lidar_m = None
         self.prev_motion_gear = None
@@ -257,12 +265,19 @@ class LocalParkingEnv:
             "dwa_final_max_safe_ratio": 0.0,
             "dwa_best_score": (),
             "dwa_override_policy_action": False,
+            "dwa_teacher_action_valid": False,
+            "dwa_policy_loss_weight": 1.0,
             "dwa_policy_invalid_trigger": False,
             "dwa_low_safe_trigger": False,
             "dwa_all_zero_trigger": False,
             "dwa_policy_raw_action": np.zeros(2, dtype=np.float32),
             "dwa_raw_action": np.zeros(2, dtype=np.float32),
             "dwa_executed_action_preview": np.zeros(2, dtype=np.float32),
+            "normal_mask_max": 0.0,
+            "recovery_mask_applied": False,
+            "recovery_mask_nonzero_count": 0,
+            "recovery_mask_max": 0.0,
+            "effective_mask_max": 0.0,
             "deadlock": False,
         }
 
@@ -275,6 +290,10 @@ class LocalParkingEnv:
         low_safe_trigger=False,
         all_zero_trigger=False,
         policy_raw_action=None,
+        normal_mask_max=0.0,
+        recovery_mask=None,
+        effective_mask=None,
+        dwa_policy_loss_weight=1.0,
     ):
         info = self._empty_dwa_info()
         if result is None:
@@ -290,6 +309,19 @@ class LocalParkingEnv:
         preview = result.executed_action_preview
         if preview is None:
             preview = np.zeros(2, dtype=np.float32)
+        recovery = (
+            np.zeros((2, self.action_mask.phi_dot_bins.size), dtype=np.float32)
+            if recovery_mask is None
+            else np.asarray(recovery_mask, dtype=np.float32)
+        )
+        effective = (
+            np.zeros_like(recovery, dtype=np.float32)
+            if effective_mask is None
+            else np.asarray(effective_mask, dtype=np.float32)
+        )
+        recovery_nonzero = int(
+            np.count_nonzero(recovery > float(getattr(self.action_mask, "min_safe_ratio", 1e-3)))
+        )
         info.update(
             {
                 "dwa_triggered": bool(triggered),
@@ -304,6 +336,13 @@ class LocalParkingEnv:
                 "dwa_final_max_safe_ratio": float(result.final_max_safe_ratio),
                 "dwa_best_score": self._score_to_info(result.best_score),
                 "dwa_override_policy_action": bool(override_applied),
+                "dwa_teacher_action_valid": bool(
+                    getattr(result, "teacher_action_valid", False)
+                    and result.raw_action is not None
+                ),
+                "dwa_policy_loss_weight": float(
+                    np.clip(float(dwa_policy_loss_weight), 0.0, 1.0)
+                ),
                 "dwa_policy_invalid_trigger": bool(policy_invalid_trigger),
                 "dwa_low_safe_trigger": bool(low_safe_trigger),
                 "dwa_all_zero_trigger": bool(all_zero_trigger),
@@ -317,6 +356,11 @@ class LocalParkingEnv:
                     preview,
                     dtype=np.float32,
                 ),
+                "normal_mask_max": float(normal_mask_max),
+                "recovery_mask_applied": bool(recovery_nonzero > 0),
+                "recovery_mask_nonzero_count": int(recovery_nonzero),
+                "recovery_mask_max": float(np.max(recovery)) if recovery.size else 0.0,
+                "effective_mask_max": float(np.max(effective)) if effective.size else 0.0,
             }
         )
         return info
@@ -359,7 +403,7 @@ class LocalParkingEnv:
                 self.dwa_no_progress_streak = 0
         self._last_progress_metrics = current
 
-    def _mask_floor_state(self, mask):
+    def _mask_floor_state(self, mask, allow_floor=True):
         mask_array = np.asarray(mask, dtype=np.float32)
         if mask_array.size == 0:
             raise ValueError("action mask must not be empty")
@@ -380,6 +424,7 @@ class LocalParkingEnv:
 
         floor_applied = bool(
             degenerate
+            and bool(allow_floor)
             and bool(getattr(self.config, "enable_mask_floor_fallback", False))
         )
         if floor_applied:
@@ -397,6 +442,57 @@ class LocalParkingEnv:
             "mask_all_zero_before_floor": bool(all_zero),
             "mask_max_before_floor": float(mask_max),
         }
+
+    def _dwa_mask_triggers(self, normal_mask, mask_floor_info):
+        mask = np.asarray(normal_mask, dtype=np.float32)
+        normal_max = float(np.max(mask)) if mask.size else 0.0
+        all_zero = bool(
+            mask_floor_info.get("mask_all_zero_before_floor", False)
+            or normal_max <= float(getattr(self.config, "dwa_all_zero_eps", 1e-3))
+        )
+        low_safe = bool(
+            normal_max < float(getattr(self.config, "dwa_low_safe_ratio", 0.05))
+        )
+        return bool(all_zero), bool(low_safe), float(normal_max)
+
+    def _empty_recovery_mask(self, reference_mask):
+        return np.zeros_like(
+            np.asarray(reference_mask, dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    def _effective_mask_from_recovery(self, normal_mask, mask_floor_info):
+        normal = np.asarray(normal_mask, dtype=np.float32)
+        recovery_mask = self._empty_recovery_mask(normal)
+        result = DWAResult(reason="not_triggered")
+        if not bool(getattr(self.config, "enable_dwa_recovery", False)):
+            return normal.copy(), recovery_mask, result
+        all_zero, low_safe, _ = self._dwa_mask_triggers(normal, mask_floor_info)
+        if not (all_zero or low_safe):
+            return normal.copy(), recovery_mask, result
+        if self.dwa_recovery is None:
+            self.dwa_recovery = DWARecoveryController(self.config)
+        result = self.dwa_recovery.run(
+            "unlock",
+            self.state,
+            self.slot,
+            self.scene,
+            self.vehicle_model,
+            self.lidar,
+            self.action_mask,
+            normal,
+            self.last_front_lidar_m,
+            self.last_rear_lidar_m,
+            self.prev_motion_gear,
+            self.config,
+            reason="all_zero_mask" if all_zero else "low_safe_mask",
+        )
+        if result.recovery_mask is not None:
+            recovery_mask = np.asarray(result.recovery_mask, dtype=np.float32)
+            if recovery_mask.shape != normal.shape:
+                recovery_mask = self._empty_recovery_mask(normal)
+        effective_mask = np.maximum(normal, recovery_mask).astype(np.float32, copy=False)
+        return effective_mask, recovery_mask, result
 
     def _reset_candidate_metrics(self, state, stage):
         front_lidar, rear_lidar = self.lidar.observe(
@@ -1757,8 +1853,20 @@ class LocalParkingEnv:
             front_m,
             rear_m,
         )
-        self.current_mask, self.current_mask_floor_info = self._mask_floor_state(
-            self.current_mask
+        normal_mask = np.asarray(self.current_mask, dtype=np.float32)
+        dwa_enabled = bool(getattr(self.config, "enable_dwa_recovery", False))
+        normal_or_floor_mask, self.current_mask_floor_info = self._mask_floor_state(
+            normal_mask,
+            allow_floor=not dwa_enabled,
+        )
+        self.current_normal_mask = normal_mask
+        (
+            self.current_mask,
+            self.current_recovery_mask,
+            self.current_dwa_recovery_result,
+        ) = self._effective_mask_from_recovery(
+            normal_mask if dwa_enabled else normal_or_floor_mask,
+            self.current_mask_floor_info,
         )
 
     def _observation(self, metrics=None):
@@ -1801,23 +1909,85 @@ class LocalParkingEnv:
             ],
             dtype=np.float32,
         )
+        rear_lidar = self.last_rear_lidar_m
+        if str(getattr(self.config, "rear_lidar_observation_mode", "normal")) == "zero":
+            rear_lidar = np.zeros_like(self.last_rear_lidar_m)
         lidar_features = np.concatenate(
             [
                 self.last_front_lidar_m / p.lidar_range,
-                self.last_rear_lidar_m / p.lidar_range,
+                rear_lidar / p.lidar_range,
             ]
         ).astype(np.float32)
+        mask_features = self.current_mask.reshape(-1).astype(np.float32)
+        if bool(getattr(self.config, "disable_mask_observation", False)):
+            mask_features = np.zeros_like(mask_features)
         observation = np.concatenate(
             [
                 slot_features.astype(np.float32),
                 vehicle_features,
                 lidar_features,
-                self.current_mask.reshape(-1).astype(np.float32),
+                mask_features,
             ]
         )
         if observation.shape != (self.OBS_DIM,):
             raise RuntimeError("unexpected observation shape {}".format(observation.shape))
         return observation
+
+    def _decode_action_without_mask_execution(
+        self,
+        raw_action,
+        policy_decoded,
+        prev_motion_gear,
+        prev_gear_in_obs,
+        mask_for_action,
+    ):
+        raw = np.clip(np.asarray(raw_action, dtype=np.float32), -1.0, 1.0)
+        p = self.vehicle_params
+        deadband = float(getattr(self.config, "gear_deadband", 0.10))
+        phi_dot_exec = self.action_mask._decode_phi_dot(
+            raw[1],
+            self.state.phi,
+            p.dt,
+        )
+        if abs(raw[0]) < deadband:
+            gear = STOP_GEAR if prev_motion_gear is None else prev_motion_gear
+            rho = 0.0
+            v_exec = 0.0
+        elif raw[0] >= 0.0:
+            gear = FORWARD_GEAR
+            rho = abs(float(raw[0]))
+            v_exec = rho * float(p.parking_v_forward_max)
+        else:
+            gear = REVERSE_GEAR
+            rho = abs(float(raw[0]))
+            v_exec = -rho * float(p.parking_v_reverse_max)
+
+        motion_eps = 1e-8
+        if abs(v_exec) > motion_eps:
+            new_motion_gear = FORWARD_GEAR if v_exec > 0.0 else REVERSE_GEAR
+        else:
+            new_motion_gear = prev_motion_gear
+        if new_motion_gear is None:
+            new_prev_gear_in_obs = 0.0
+        elif new_motion_gear == FORWARD_GEAR:
+            new_prev_gear_in_obs = 1.0
+        else:
+            new_prev_gear_in_obs = -1.0
+
+        return {
+            "v_exec": float(v_exec),
+            "phi_dot_exec": float(phi_dot_exec),
+            "gear": int(gear),
+            "rho": float(rho),
+            "r_raw": float(policy_decoded.get("r_raw", 0.0)),
+            "r_exec": float(policy_decoded.get("r_raw", 0.0)),
+            "r_max": float(np.max(mask_for_action)) if mask_for_action.size else 0.0,
+            "forced_stop": False,
+            "clip_ratio": 0.0,
+            "mask_cost": float(policy_decoded.get("mask_cost", 0.0)),
+            "prev_motion_gear": new_motion_gear,
+            "prev_gear_in_obs": float(new_prev_gear_in_obs),
+        }
 
     def reset(self, seed=None, replay_case=None):
         if seed is not None:
@@ -2080,7 +2250,24 @@ class LocalParkingEnv:
         )
         execution_raw_action = policy_raw_action.copy()
         mask_for_action = np.asarray(self.current_mask, dtype=np.float32).copy()
+        normal_mask_for_action = (
+            np.asarray(self.current_normal_mask, dtype=np.float32).copy()
+            if self.current_normal_mask is not None
+            else mask_for_action.copy()
+        )
+        recovery_mask_for_action = (
+            np.asarray(self.current_recovery_mask, dtype=np.float32).copy()
+            if self.current_recovery_mask is not None
+            else self._empty_recovery_mask(mask_for_action)
+        )
         mask_floor_info = dict(self.current_mask_floor_info)
+        if (
+            bool(mask_floor_info.get("mask_all_zero_before_floor", False))
+            and mask_for_action.size
+            and float(np.max(mask_for_action))
+            <= float(getattr(self.config, "dwa_all_zero_eps", 1e-3))
+        ):
+            normal_mask_for_action = mask_for_action.copy()
         policy_decoded = self.action_mask.decode_safe_speed_and_cost(
             policy_raw_action,
             mask_for_action,
@@ -2089,35 +2276,28 @@ class LocalParkingEnv:
             prev_motion_gear=self.prev_motion_gear,
             config=self.config,
         )
-        rmax_now = float(np.max(mask_for_action)) if mask_for_action.size else 0.0
-        all_zero_trigger = False
-        low_safe_trigger = False
-        policy_invalid_trigger = False
+        all_zero_trigger, low_safe_trigger, normal_rmax_now = self._dwa_mask_triggers(
+            normal_mask_for_action,
+            mask_floor_info,
+        )
+        effective_rmax_now = float(np.max(mask_for_action)) if mask_for_action.size else 0.0
+        policy_invalid_trigger = bool(policy_decoded["forced_stop"])
         dwa_triggered = False
         dwa_override_applied = False
-        dwa_result = DWAResult(reason="disabled")
-        if bool(getattr(self.config, "enable_dwa_recovery", False)):
+        dwa_result = (
+            self.current_dwa_recovery_result
+            if self.current_dwa_recovery_result is not None
+            else DWAResult(reason="not_triggered")
+        )
+        dwa_enabled = bool(getattr(self.config, "enable_dwa_recovery", False))
+        if dwa_enabled:
             if self.dwa_recovery is None:
                 self.dwa_recovery = DWARecoveryController(self.config)
-            all_zero_trigger = bool(
-                mask_floor_info.get("mask_all_zero_before_floor", False)
-                or rmax_now <= float(getattr(self.config, "dwa_all_zero_eps", 1e-3))
-            )
-            low_safe_trigger = bool(
-                rmax_now < float(getattr(self.config, "dwa_low_safe_ratio", 0.05))
-                and (
-                    self.dwa_forced_stop_streak
-                    >= int(getattr(self.config, "dwa_forced_stop_patience", 3))
-                    or self.dwa_no_progress_streak
-                    >= int(getattr(self.config, "dwa_no_progress_patience", 6))
-                )
-            )
-            policy_invalid_trigger = bool(
-                policy_decoded["forced_stop"]
-                and rmax_now > float(getattr(self.config, "dwa_low_safe_ratio", 0.05))
-            )
-            if all_zero_trigger:
-                dwa_triggered = True
+            dwa_triggered = bool(all_zero_trigger or low_safe_trigger)
+            if (
+                dwa_triggered
+                and str(getattr(dwa_result, "reason", "")) in ("not_triggered", "disabled")
+            ):
                 dwa_result = self.dwa_recovery.run(
                     "unlock",
                     self.state,
@@ -2126,31 +2306,35 @@ class LocalParkingEnv:
                     self.vehicle_model,
                     self.lidar,
                     self.action_mask,
-                    mask_for_action,
+                    normal_mask_for_action,
                     self.last_front_lidar_m,
                     self.last_rear_lidar_m,
                     self.prev_motion_gear,
                     self.config,
-                    reason="all_zero_mask",
+                    reason="all_zero_mask" if all_zero_trigger else "low_safe_mask",
                 )
-            elif low_safe_trigger:
-                dwa_triggered = True
-                dwa_result = self.dwa_recovery.run(
-                    "local",
-                    self.state,
-                    self.slot,
-                    self.scene,
-                    self.vehicle_model,
-                    self.lidar,
-                    self.action_mask,
-                    mask_for_action,
-                    self.last_front_lidar_m,
-                    self.last_rear_lidar_m,
-                    self.prev_motion_gear,
-                    self.config,
-                    reason="low_safe_stuck",
-                )
-            elif policy_invalid_trigger:
+                if dwa_result.recovery_mask is not None:
+                    recovery_mask_for_action = np.asarray(
+                        dwa_result.recovery_mask,
+                        dtype=np.float32,
+                    )
+                    mask_for_action = np.maximum(
+                        normal_mask_for_action,
+                        recovery_mask_for_action,
+                    ).astype(np.float32, copy=False)
+                    policy_decoded = self.action_mask.decode_safe_speed_and_cost(
+                        policy_raw_action,
+                        mask_for_action,
+                        self.state.phi,
+                        dt=self.vehicle_params.dt,
+                        prev_motion_gear=self.prev_motion_gear,
+                        config=self.config,
+                    )
+                    effective_rmax_now = (
+                        float(np.max(mask_for_action)) if mask_for_action.size else 0.0
+                    )
+                    policy_invalid_trigger = bool(policy_decoded["forced_stop"])
+            if policy_invalid_trigger and not (all_zero_trigger or low_safe_trigger):
                 dwa_triggered = True
                 if bool(getattr(self.config, "dwa_override_policy_action", False)):
                     dwa_result = self.dwa_recovery.run(
@@ -2174,9 +2358,22 @@ class LocalParkingEnv:
                         mode="none",
                         reason="policy_forced_stop_no_override",
                     )
+            recovery_mode = str(
+                getattr(self.config, "dwa_recovery_mode", "teacher_override")
+            )
+            override_requested = False
+            if recovery_mode == "teacher_override":
+                override_requested = bool(dwa_result.used)
+            elif recovery_mode == "policy_with_recovery_mask":
+                override_requested = bool(
+                    policy_decoded["forced_stop"] and dwa_result.used
+                )
+            elif recovery_mode == "recovery_mask_only":
+                override_requested = False
             if (
                 bool(getattr(self.config, "dwa_override_policy_action", False))
-                and bool(dwa_result.used)
+                and bool(override_requested)
+                and bool(getattr(dwa_result, "teacher_action_valid", False))
                 and dwa_result.raw_action is not None
             ):
                 execution_raw_action = np.clip(
@@ -2185,22 +2382,38 @@ class LocalParkingEnv:
                     1.0,
                 )
                 dwa_override_applied = True
+        else:
+            all_zero_trigger = False
+            low_safe_trigger = False
+            policy_invalid_trigger = False
+            dwa_result = DWAResult(reason="disabled")
+
+        dwa_policy_loss_weight = 1.0
+        if dwa_override_applied:
+            dwa_policy_loss_weight = float(
+                getattr(self.config, "dwa_override_policy_loss_weight", 0.0)
+            )
+            dwa_policy_loss_weight = float(np.clip(dwa_policy_loss_weight, 0.0, 1.0))
 
         decode_prev_motion_gear = self.prev_motion_gear
         decode_prev_gear_in_obs = self.prev_gear_in_obs
-        if dwa_override_applied and str(dwa_result.mode) == "unlock":
-            decode_prev_motion_gear = None
-        decoded = self.action_mask.decode_safe_speed_and_cost(
-            execution_raw_action,
-            mask_for_action,
-            self.state.phi,
-            dt=self.vehicle_params.dt,
-            prev_motion_gear=decode_prev_motion_gear,
-            config=self.config,
-        )
-        if dwa_override_applied and str(dwa_result.mode) == "unlock":
-            decoded["prev_motion_gear"] = self.prev_motion_gear
-            decoded["prev_gear_in_obs"] = float(decode_prev_gear_in_obs)
+        if bool(getattr(self.config, "disable_action_mask_execution", False)):
+            decoded = self._decode_action_without_mask_execution(
+                execution_raw_action,
+                policy_decoded,
+                decode_prev_motion_gear,
+                decode_prev_gear_in_obs,
+                mask_for_action,
+            )
+        else:
+            decoded = self.action_mask.decode_safe_speed_and_cost(
+                execution_raw_action,
+                mask_for_action,
+                self.state.phi,
+                dt=self.vehicle_params.dt,
+                prev_motion_gear=decode_prev_motion_gear,
+                config=self.config,
+            )
         executed_action = np.asarray(
             [decoded["v_exec"], decoded["phi_dot_exec"]],
             dtype=np.float32,
@@ -2274,6 +2487,10 @@ class LocalParkingEnv:
             low_safe_trigger=low_safe_trigger,
             all_zero_trigger=all_zero_trigger,
             policy_raw_action=policy_raw_action,
+            normal_mask_max=normal_rmax_now,
+            recovery_mask=recovery_mask_for_action,
+            effective_mask=mask_for_action,
+            dwa_policy_loss_weight=dwa_policy_loss_weight,
         )
         dwa_info["deadlock"] = bool(deadlock)
         self.last_dwa_info = dwa_info
@@ -2386,6 +2603,8 @@ class LocalParkingEnv:
                 "raw_safe_ratio": float(decoded["r_raw"]),
                 "exec_safe_ratio": float(decoded["r_exec"]),
                 "max_safe_ratio": float(decoded["r_max"]),
+                "normal_mask_max": float(normal_rmax_now),
+                "effective_mask_max": float(effective_rmax_now),
                 "forced_stop": bool(decoded["forced_stop"]),
                 "degenerate_mask": bool(mask_floor_info.get("mask_degenerate", False)),
                 "mask_floor_applied": bool(mask_floor_applied),
@@ -2400,6 +2619,9 @@ class LocalParkingEnv:
                 "clip_ratio": float(decoded["clip_ratio"]),
                 "mask_cost": float(decoded["mask_cost"]),
                 "planner_source": planner_source,
+                "unsafe_no_action_mask_execution": bool(
+                    getattr(self.config, "disable_action_mask_execution", False)
+                ),
             }
         )
         if (

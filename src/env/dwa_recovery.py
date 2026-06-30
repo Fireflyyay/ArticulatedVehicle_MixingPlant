@@ -15,10 +15,12 @@ class DWAResult:
     reason: str = ""
     raw_action: Optional[np.ndarray] = None
     executed_action_preview: Optional[np.ndarray] = None
+    recovery_mask: Optional[np.ndarray] = None
     candidate_count: int = 0
     valid_candidate_count: int = 0
     final_max_safe_ratio: float = 0.0
     best_score: object = None
+    teacher_action_valid: bool = False
     unlock_success: bool = False
     unlock_step: int = -1
     deadlock: bool = False
@@ -47,6 +49,41 @@ class DWARecoveryController:
         bins = np.asarray(action_mask.phi_dot_bins, dtype=np.float64).reshape(-1)
         values = np.concatenate([bins, np.asarray([0.0], dtype=np.float64)])
         return np.unique(values).astype(np.float64)
+
+    def _unlock_speed_ratios(self):
+        ratios = tuple(
+            float(item)
+            for item in getattr(self.config, "dwa_unlock_speed_ratios", (0.05, 0.10, 0.15))
+        )
+        max_ratio = float(getattr(self.config, "dwa_recovery_max_speed_ratio", 0.15))
+        return tuple(
+            float(np.clip(ratio, 0.0, max_ratio))
+            for ratio in ratios
+            if float(ratio) > 0.0
+        )
+
+    def _recovery_mask_from_candidates(self, action_mask, mask_shape, candidates):
+        recovery_mask = np.zeros(tuple(mask_shape), dtype=np.float32)
+        if not candidates:
+            return recovery_mask
+        bins = np.asarray(action_mask.phi_dot_bins, dtype=np.float64).reshape(-1)
+        if bins.size == 0:
+            return recovery_mask
+        radius = max(0, int(getattr(self.config, "dwa_recovery_phi_bin_radius", 0)))
+        max_ratio = float(getattr(self.config, "dwa_recovery_max_speed_ratio", 0.15))
+        for candidate in candidates:
+            gear = int(candidate["gear"])
+            if gear < 0 or gear >= recovery_mask.shape[0]:
+                continue
+            index = int(np.argmin(np.abs(bins - float(candidate["phi_dot"]))))
+            start = max(0, index - radius)
+            end = min(recovery_mask.shape[1], index + radius + 1)
+            safe_ratio = float(np.clip(candidate["speed_ratio"], 0.0, max_ratio))
+            recovery_mask[gear, start:end] = np.maximum(
+                recovery_mask[gear, start:end],
+                np.float32(safe_ratio),
+            )
+        return np.clip(recovery_mask, 0.0, 1.0).astype(np.float32, copy=False)
 
     @staticmethod
     def _out_of_bounds(scene, front_box, rear_box):
@@ -230,91 +267,124 @@ class DWARecoveryController:
         best_future_ratio = 0.0
         candidate_count = 0
         valid_count = 0
+        valid_candidates = []
         threshold = float(getattr(self.config, "dwa_unlock_safe_ratio", 0.08))
+        improvement_eps = max(
+            0.0,
+            float(getattr(self.config, "dwa_unlock_min_safe_ratio_improvement", 1e-4)),
+        )
         current_ratio = self._max_safe_ratio(current_mask)
-        for phi_dot in self._phi_dot_candidates(action_mask):
-            candidate_count += 1
-            action = np.asarray([0.0, float(phi_dot)], dtype=np.float32)
-            if abs(float(phi_dot)) <= 1e-12:
-                rollout = {
-                    "valid": True,
-                    "state": state,
-                    "max_future_ratio": float(current_ratio),
-                    "final_ratio": float(current_ratio),
-                    "metrics": None,
-                    "success_reached": False,
-                    "step": 0,
-                    "unlock_step": 0 if current_ratio >= threshold else -1,
-                }
-            else:
-                rollout = self._simulate(
-                    state,
-                    action,
-                    slot,
-                    scene,
-                    vehicle_model,
-                    lidar,
-                    action_mask,
-                    need_metrics=False,
-                    track_success=False,
-                    stop_safe_ratio=threshold,
-                )
-            best_future_ratio = max(best_future_ratio, rollout["max_future_ratio"])
-            if not bool(rollout["valid"]):
-                continue
-            unlock_reached = bool(rollout["max_future_ratio"] >= threshold)
-            score = (
-                bool(unlock_reached),
-                float(rollout["max_future_ratio"]),
-                float(rollout["final_ratio"]),
-                -abs(float(phi_dot)),
+        speed_ratios = self._unlock_speed_ratios()
+        for gear in (FORWARD_GEAR, REVERSE_GEAR):
+            sign = 1.0 if gear == FORWARD_GEAR else -1.0
+            gear_vmax = (
+                vehicle_model.params.parking_v_forward_max
+                if gear == FORWARD_GEAR
+                else vehicle_model.params.parking_v_reverse_max
             )
-            if best_collision_free_score is None or score > best_collision_free_score:
-                best_collision_free_score = score
-            if not unlock_reached:
-                continue
-            valid_count += 1
-            raw_action = np.asarray(
-                [
-                    0.0,
-                    action_mask.encode_phi_dot_to_raw(
-                        phi_dot,
-                        state.phi,
-                        vehicle_model.params.dt,
-                    ),
-                ],
-                dtype=np.float32,
-            )
-            if best_score is None or score > best_score:
-                best = rollout
-                best_score = score
-                best_raw_action = raw_action
-                best_preview = action.copy()
+            for speed_ratio in speed_ratios:
+                for phi_dot in self._phi_dot_candidates(action_mask):
+                    candidate_count += 1
+                    action = np.asarray(
+                        [
+                            sign * float(speed_ratio) * float(gear_vmax),
+                            float(phi_dot),
+                        ],
+                        dtype=np.float32,
+                    )
+                    rollout = self._simulate(
+                        state,
+                        action,
+                        slot,
+                        scene,
+                        vehicle_model,
+                        lidar,
+                        action_mask,
+                        need_metrics=False,
+                        track_success=False,
+                        stop_safe_ratio=threshold,
+                    )
+                    best_future_ratio = max(best_future_ratio, rollout["max_future_ratio"])
+                    if not bool(rollout["valid"]):
+                        continue
+                    unlock_reached = bool(rollout["max_future_ratio"] >= threshold)
+                    improved = bool(
+                        rollout["max_future_ratio"] > current_ratio + improvement_eps
+                    )
+                    score = (
+                        bool(unlock_reached),
+                        float(rollout["max_future_ratio"]),
+                        float(rollout["final_ratio"]),
+                        -float(speed_ratio),
+                        -abs(float(phi_dot)),
+                    )
+                    if best_collision_free_score is None or score > best_collision_free_score:
+                        best_collision_free_score = score
+                    if not improved:
+                        continue
+                    valid_count += 1
+                    raw_action = np.asarray(
+                        [
+                            sign,
+                            action_mask.encode_phi_dot_to_raw(
+                                phi_dot,
+                                state.phi,
+                                vehicle_model.params.dt,
+                            ),
+                        ],
+                        dtype=np.float32,
+                    )
+                    valid_candidates.append(
+                        {
+                            "gear": int(gear),
+                            "phi_dot": float(phi_dot),
+                            "speed_ratio": float(speed_ratio),
+                            "raw_action": raw_action,
+                            "rollout": rollout,
+                            "score": score,
+                        }
+                    )
+                    if best_score is None or score > best_score:
+                        best = rollout
+                        best_score = score
+                        best_raw_action = raw_action
+                        best_preview = action.copy()
+
+        recovery_mask = self._recovery_mask_from_candidates(
+            action_mask,
+            np.asarray(current_mask, dtype=np.float32).shape,
+            valid_candidates,
+        )
 
         if best is None:
             return DWAResult(
                 used=False,
                 mode="unlock",
                 reason=str(reason),
+                recovery_mask=recovery_mask,
                 candidate_count=int(candidate_count),
                 valid_candidate_count=0,
                 final_max_safe_ratio=float(best_future_ratio),
                 best_score=best_collision_free_score,
+                teacher_action_valid=False,
                 unlock_success=False,
                 unlock_step=-1,
                 deadlock=True,
             )
+        unlock_success = bool(float(best["max_future_ratio"]) >= threshold)
         return DWAResult(
             used=True,
             mode="unlock",
             reason=str(reason),
             raw_action=best_raw_action,
             executed_action_preview=best_preview,
+            recovery_mask=recovery_mask,
             candidate_count=int(candidate_count),
             valid_candidate_count=int(valid_count),
-            final_max_safe_ratio=float(best["final_ratio"]),
+            final_max_safe_ratio=float(best["max_future_ratio"]),
             best_score=best_score,
-            unlock_success=True,
+            teacher_action_valid=True,
+            unlock_success=unlock_success,
             unlock_step=int(best.get("unlock_step", -1)),
             deadlock=False,
         )
@@ -448,6 +518,7 @@ class DWARecoveryController:
                 valid_candidate_count=0,
                 final_max_safe_ratio=0.0,
                 best_score=best_score,
+                teacher_action_valid=False,
                 unlock_success=False,
                 deadlock=True,
             )
@@ -461,6 +532,7 @@ class DWARecoveryController:
             valid_candidate_count=int(valid_count),
             final_max_safe_ratio=float(best["final_ratio"]),
             best_score=best_score,
+            teacher_action_valid=True,
             unlock_success=False,
             deadlock=False,
         )

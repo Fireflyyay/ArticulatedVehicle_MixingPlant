@@ -226,6 +226,57 @@ def test_ppo_early_stops_after_epoch_when_target_kl_is_exceeded():
     assert agent._policy_loss_weight("head_in") == 1.0
 
 
+def test_ppo_update_reports_dwa_bc_and_policy_weight():
+    config = replace(
+        DEFAULT_PPO_CONFIG,
+        batch_size=8,
+        ppo_epochs=1,
+        target_kl=10.0,
+    )
+    agent = ContinuousPPOAgent(config=config, device="cpu")
+    buffer = RolloutBuffer()
+    rng = np.random.default_rng(23)
+    teacher_count = 0
+    for index in range(8):
+        observation = rng.normal(size=149).astype(np.float32)
+        raw_action, pre_tanh_action, log_prob, value = agent.act_with_pre_tanh(
+            observation
+        )
+        teacher_valid = bool(index % 2 == 0)
+        if teacher_valid:
+            teacher_count += 1
+        buffer.add(
+            observation=observation,
+            raw_action=raw_action,
+            executed_action=np.zeros(2, dtype=np.float32),
+            log_prob=log_prob,
+            reward=float(index % 3),
+            done=index == 7,
+            value=value,
+            pre_tanh_action=pre_tanh_action,
+            task_family="head_in",
+            dwa_raw_action=np.asarray([1.0, 0.0], dtype=np.float32),
+            dwa_teacher_action_valid=teacher_valid,
+            dwa_used=teacher_valid,
+            dwa_policy_loss_weight=0.0 if teacher_valid else 1.0,
+            recovery_mask_applied=teacher_valid,
+            recovery_mask_nonzero_count=1 if teacher_valid else 0,
+            recovery_mask_max=0.1 if teacher_valid else 0.0,
+        )
+
+    stats = agent.update(
+        buffer,
+        last_observation=np.zeros(149, dtype=np.float32),
+        last_done=True,
+        dwa_bc_coef=0.5,
+    )
+
+    assert np.isclose(stats["dwa_teacher_fraction"], teacher_count / len(buffer))
+    assert stats["dwa_override_policy_weight_mean"] < 1.0
+    assert stats["dwa_bc_coef"] == 0.5
+    assert stats["dwa_bc_loss"] >= 0.0
+
+
 def test_checkpoint_preserves_log_std_bounds_and_ppo_config(tmp_path):
     config = replace(
         DEFAULT_PPO_CONFIG,

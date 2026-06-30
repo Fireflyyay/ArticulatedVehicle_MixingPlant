@@ -39,6 +39,7 @@ class CurriculumStageSelector:
         target_success_rate=0.75,
         history_window=2000,
         warmup_episodes=200,
+        seed=None,
     ):
         self.target_success_rate = float(target_success_rate)
         self.history_window = int(max(100, history_window))
@@ -49,7 +50,7 @@ class CurriculumStageSelector:
             for stage in (1, 2, 3, 4)
             for family in TASK_FAMILIES
         }
-        self._rng = np.random.default_rng()
+        self._rng = np.random.default_rng(seed)
 
     def _recent_rate(self, values):
         recent = values[-self.history_window:]
@@ -95,3 +96,16 @@ class CurriculumStageSelector:
             family = str(task_family or "")
             if (stage, family) in self._family_results:
                 self._family_results[(stage, family)].append(value)
+
+
+class UniformStageSelector:
+    """Uniformly sample curriculum stages while keeping the selector interface."""
+
+    def __init__(self, seed=None):
+        self._rng = np.random.default_rng(seed)
+
+    def select_stage(self, episode_index):
+        return int(self._rng.integers(1, 5))
+
+    def record(self, stage, success, task_family=None):
+        return None

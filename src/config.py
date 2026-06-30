@@ -261,23 +261,32 @@ class LocalParkingEnvConfig:
     mask_cost_safe_threshold: float = 0.15
     mask_cost_max: float = 3.0
     mask_cost_coef_final: float = 0.8
+    disable_mask_observation: bool = False
+    rear_lidar_observation_mode: str = "normal"
+    disable_action_mask_execution: bool = False
     enable_mask_floor_fallback: bool = False
     mask_degenerate_eps: float = 1e-3
     mask_floor_value: float = 0.01
     apply_floor_only_when_all_zero: bool = False
 
     # --- Strict-mask local DWA deadlock recovery ---
-    enable_dwa_recovery: bool = False
+    enable_dwa_recovery: bool = True
+    dwa_recovery_mode: str = "teacher_override"
     dwa_override_policy_action: bool = True
-    dwa_enable_deadlock_termination: bool = False
+    dwa_override_policy_loss_weight: float = 0.0
+    dwa_enable_deadlock_termination: bool = True
     dwa_all_zero_eps: float = 1e-3
     dwa_low_safe_ratio: float = 0.12
     dwa_unlock_safe_ratio: float = 0.08
+    dwa_unlock_min_safe_ratio_improvement: float = 1e-4
     dwa_forced_stop_patience: int = 3
     dwa_no_progress_patience: int = 3
     dwa_deadlock_patience: int = 8
     dwa_horizon_steps: int = 4
     dwa_speed_ratios: Tuple[float, ...] = (0.25, 0.5, 1.0)
+    dwa_unlock_speed_ratios: Tuple[float, ...] = (0.05, 0.10, 0.15)
+    dwa_recovery_max_speed_ratio: float = 0.15
+    dwa_recovery_phi_bin_radius: int = 0
 
     # --- Training-only HOPE teacher guidance ---
     enable_hope_teacher: bool = False
@@ -332,6 +341,10 @@ class PPOConfig:
     log_std_max: float = -0.3
     policy_loss_weight_head_in: float = 1.0
     checkpoint_score_weight_head_in: float = 1.0
+    dwa_bc_coef_initial: float = 0.2
+    dwa_bc_coef_final: float = 0.0
+    dwa_bc_anneal_start_episode: int = 0
+    dwa_bc_anneal_end_episode: int = 10_000
 
 
 DEFAULT_VEHICLE_PARAMS = ZL50GNVehicleParams()

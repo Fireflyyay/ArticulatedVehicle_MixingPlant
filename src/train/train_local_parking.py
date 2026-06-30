@@ -28,7 +28,11 @@ from env.mixing_plant_scene import (
 from env.vehicle import ArticulatedState
 from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
 from planning.passenger_hybrid_astar import PassengerHybridAStar
-from train.curriculum import CurriculumStageSelector, MultiStageScenePool
+from train.curriculum import (
+    CurriculumStageSelector,
+    MultiStageScenePool,
+    UniformStageSelector,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -62,6 +66,22 @@ def _add_config_bool_argument(parser, name, default, help_enable, help_disable):
 
 def _safe_mean(values):
     return float(np.mean(values)) if values else 0.0
+
+
+def _linear_schedule_value(initial, final, start_episode, end_episode, episode):
+    initial = float(initial)
+    final = float(final)
+    start_episode = int(start_episode)
+    end_episode = int(end_episode)
+    episode = int(episode)
+    if end_episode <= start_episode:
+        return final if episode >= end_episode else initial
+    if episode <= start_episode:
+        return initial
+    if episode >= end_episode:
+        return final
+    progress = (episode - start_episode) / float(end_episode - start_episode)
+    return float(initial + progress * (final - initial))
 
 
 def _conditional_rate(items, value_key, condition_key):
@@ -534,6 +554,12 @@ def _build_update_record(
         "dwa_override_policy_action_rate": _safe_mean(
             [float(item.get("dwa_override_policy_action", False)) for item in infos]
         ),
+        "dwa_teacher_action_valid_rate": _safe_mean(
+            [float(item.get("dwa_teacher_action_valid", False)) for item in infos]
+        ),
+        "dwa_policy_loss_weight_mean": _safe_mean(
+            [float(item.get("dwa_policy_loss_weight", 1.0)) for item in infos]
+        ),
         "dwa_unlock_success_rate": _conditional_rate(
             infos,
             "dwa_unlock_success",
@@ -555,6 +581,21 @@ def _build_update_record(
                 float(item.get("dwa_final_max_safe_ratio", 0.0))
                 for item in dwa_triggered_infos
             ]
+        ),
+        "normal_mask_max_mean": _safe_mean(
+            [float(item.get("normal_mask_max", 0.0)) for item in infos]
+        ),
+        "recovery_mask_applied_rate": _safe_mean(
+            [float(item.get("recovery_mask_applied", False)) for item in infos]
+        ),
+        "recovery_mask_nonzero_count_mean": _safe_mean(
+            [float(item.get("recovery_mask_nonzero_count", 0)) for item in infos]
+        ),
+        "recovery_mask_max_mean": _safe_mean(
+            [float(item.get("recovery_mask_max", 0.0)) for item in infos]
+        ),
+        "effective_mask_max_mean": _safe_mean(
+            [float(item.get("effective_mask_max", 0.0)) for item in infos]
         ),
         "degenerate_mask_rate": _safe_mean(
             [float(item.get("degenerate_mask", False)) for item in infos]
@@ -1070,6 +1111,7 @@ def _evaluate_policy_by_family(
             enable_offpath_reset=False,
             enable_failure_aggregation=False,
             enable_dwa_recovery=bool(enable_dwa),
+            dwa_recovery_mode="teacher_override",
             dwa_override_policy_action=bool(enable_dwa),
         )
 
@@ -1467,6 +1509,8 @@ def _save_best_checkpoints(
 def train(args):
     if args.total_episodes <= 0:
         raise ValueError("--total-episodes must be positive")
+    if args.max_steps <= 0:
+        raise ValueError("--max-steps must be positive")
     if args.rollout_steps <= 0:
         raise ValueError("--rollout-steps must be positive")
     if args.batch_size <= 0:
@@ -1494,6 +1538,10 @@ def train(args):
     )
     if any(float(weight) < 0.0 for weight in policy_weights):
         raise ValueError("policy loss weights must be non-negative")
+    if args.dwa_bc_coef_initial < 0.0 or args.dwa_bc_coef_final < 0.0:
+        raise ValueError("DWA BC coefficients must be non-negative")
+    if args.dwa_bc_anneal_end_episode < args.dwa_bc_anneal_start_episode:
+        raise ValueError("--dwa-bc-anneal-end-episode must be >= start episode")
     family_schedule = _parse_family_schedule(args.scene_family_schedule)
     if args.guide_anneal_end_episode < args.guide_anneal_start_episode:
         raise ValueError("--guide-anneal-end-episode must be >= start episode")
@@ -1521,6 +1569,10 @@ def train(args):
         raise ValueError("--hard-case-replay-heading-std-deg must be non-negative")
     if args.hard_case_replay_phi_std_deg < 0.0:
         raise ValueError("--hard-case-replay-phi-std-deg must be non-negative")
+    if args.scene_pool_size <= 0:
+        raise ValueError("--scene-pool-size must be positive")
+    if args.mask_cost_coef_final < 0.0:
+        raise ValueError("--mask-cost-coef-final must be non-negative")
     if args.mask_degenerate_eps < 0.0:
         raise ValueError("--mask-degenerate-eps must be non-negative")
     if not 0.0 < args.mask_floor_value <= 1.0:
@@ -1531,6 +1583,10 @@ def train(args):
         raise ValueError("--dwa-low-safe-ratio must be non-negative")
     if args.dwa_unlock_safe_ratio < 0.0:
         raise ValueError("--dwa-unlock-safe-ratio must be non-negative")
+    if args.dwa_unlock_min_safe_ratio_improvement < 0.0:
+        raise ValueError("--dwa-unlock-min-safe-ratio-improvement must be non-negative")
+    if not 0.0 <= args.dwa_override_policy_loss_weight <= 1.0:
+        raise ValueError("--dwa-override-policy-loss-weight must be inside [0, 1]")
     if args.dwa_forced_stop_patience < 0:
         raise ValueError("--dwa-forced-stop-patience must be non-negative")
     if args.dwa_no_progress_patience < 0:
@@ -1542,6 +1598,19 @@ def train(args):
     dwa_speed_ratios = _parse_float_tuple(args.dwa_speed_ratios)
     if any(float(ratio) <= 0.0 or float(ratio) > 1.0 for ratio in dwa_speed_ratios):
         raise ValueError("--dwa-speed-ratios entries must be inside (0, 1]")
+    if not 0.0 < args.dwa_recovery_max_speed_ratio <= 1.0:
+        raise ValueError("--dwa-recovery-max-speed-ratio must be inside (0, 1]")
+    if args.dwa_recovery_phi_bin_radius < 0:
+        raise ValueError("--dwa-recovery-phi-bin-radius must be non-negative")
+    dwa_unlock_speed_ratios = _parse_float_tuple(args.dwa_unlock_speed_ratios)
+    if any(
+        float(ratio) <= 0.0 or float(ratio) > args.dwa_recovery_max_speed_ratio
+        for ratio in dwa_unlock_speed_ratios
+    ):
+        raise ValueError(
+            "--dwa-unlock-speed-ratios entries must be inside "
+            "(0, --dwa-recovery-max-speed-ratio]"
+        )
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     scene_config = replace(
@@ -1556,12 +1625,12 @@ def train(args):
     args.curriculum_scene_types = ",".join(curriculum_scene_types)
     env_config = replace(
         DEFAULT_ENV_CONFIG,
+        max_steps=args.max_steps,
         curriculum_stage=args.stage,
+        scene_pool_size=args.scene_pool_size,
         scene_family_schedule=family_schedule,
         use_hybrid_astar=bool(args.use_hybrid_astar),
-        rs_potential_enabled=not bool(
-            getattr(args, "disable_rs_potential", False)
-        ),
+        rs_potential_enabled=bool(args.enable_rs_potential),
         enable_hope_teacher=bool(args.enable_hope_teacher),
         hope_code_dir=args.hope_code_dir,
         hope_weight_path=args.hope_weight_path,
@@ -1590,22 +1659,32 @@ def train(args):
         hard_case_replay_xy_std=args.hard_case_replay_xy_std,
         hard_case_replay_heading_std_deg=args.hard_case_replay_heading_std_deg,
         hard_case_replay_phi_std_deg=args.hard_case_replay_phi_std_deg,
+        mask_cost_coef_final=args.mask_cost_coef_final,
+        disable_mask_observation=bool(args.disable_mask_observation),
+        rear_lidar_observation_mode=str(args.rear_lidar_observation_mode),
+        disable_action_mask_execution=bool(args.disable_action_mask_execution),
         enable_mask_floor_fallback=bool(args.enable_mask_floor_fallback)
         and not bool(args.disable_mask_floor_fallback),
         mask_degenerate_eps=args.mask_degenerate_eps,
         mask_floor_value=args.mask_floor_value,
         apply_floor_only_when_all_zero=bool(args.apply_floor_only_when_all_zero),
         enable_dwa_recovery=bool(args.enable_dwa_recovery),
+        dwa_recovery_mode=str(args.dwa_recovery_mode),
         dwa_override_policy_action=bool(args.dwa_override_policy_action),
+        dwa_override_policy_loss_weight=args.dwa_override_policy_loss_weight,
         dwa_enable_deadlock_termination=bool(args.dwa_deadlock_termination),
         dwa_all_zero_eps=args.dwa_all_zero_eps,
         dwa_low_safe_ratio=args.dwa_low_safe_ratio,
         dwa_unlock_safe_ratio=args.dwa_unlock_safe_ratio,
+        dwa_unlock_min_safe_ratio_improvement=args.dwa_unlock_min_safe_ratio_improvement,
         dwa_forced_stop_patience=args.dwa_forced_stop_patience,
         dwa_no_progress_patience=args.dwa_no_progress_patience,
         dwa_deadlock_patience=args.dwa_deadlock_patience,
         dwa_horizon_steps=args.dwa_horizon_steps,
         dwa_speed_ratios=dwa_speed_ratios,
+        dwa_unlock_speed_ratios=dwa_unlock_speed_ratios,
+        dwa_recovery_max_speed_ratio=args.dwa_recovery_max_speed_ratio,
+        dwa_recovery_phi_bin_radius=args.dwa_recovery_phi_bin_radius,
     )
     ppo_config = replace(
         DEFAULT_PPO_CONFIG,
@@ -1623,6 +1702,10 @@ def train(args):
         log_std_max=args.log_std_max,
         policy_loss_weight_head_in=args.policy_loss_weight_head_in,
         checkpoint_score_weight_head_in=args.checkpoint_score_weight_head_in,
+        dwa_bc_coef_initial=args.dwa_bc_coef_initial,
+        dwa_bc_coef_final=args.dwa_bc_coef_final,
+        dwa_bc_anneal_start_episode=args.dwa_bc_anneal_start_episode,
+        dwa_bc_anneal_end_episode=args.dwa_bc_anneal_end_episode,
     )
     output_dir = _resolve_output_dir(args.output_dir, args.seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -1635,7 +1718,7 @@ def train(args):
         ppo_config,
     )
 
-    curriculum = bool(args.curriculum)
+    curriculum = bool(args.curriculum) and str(args.curriculum_mode) != "fixed"
     stage_selector = None
     multi_pool = None
     if curriculum:
@@ -1646,9 +1729,13 @@ def train(args):
             family_schedule=env_config.scene_family_schedule,
             scene_type_schedule=curriculum_scene_types,
         )
-        stage_selector = CurriculumStageSelector(
-            target_success_rate=float(args.curriculum_target_success),
-        )
+        if str(args.curriculum_mode) == "uniform":
+            stage_selector = UniformStageSelector(seed=int(args.seed) + 3571)
+        else:
+            stage_selector = CurriculumStageSelector(
+                target_success_rate=float(args.curriculum_target_success),
+                seed=int(args.seed) + 3571,
+            )
         actual_stage = stage_selector.select_stage(0)
     else:
         actual_stage = args.stage
@@ -1715,6 +1802,13 @@ def train(args):
             current_mask_coef = mask_coef_final * progress
         else:
             current_mask_coef = mask_coef_final
+        current_dwa_bc_coef = _linear_schedule_value(
+            ppo_config.dwa_bc_coef_initial,
+            ppo_config.dwa_bc_coef_final,
+            ppo_config.dwa_bc_anneal_start_episode,
+            ppo_config.dwa_bc_anneal_end_episode,
+            episode_index,
+        )
 
         episode_reward = 0.0
         episode_steps = 0
@@ -1754,6 +1848,21 @@ def train(args):
                 pre_tanh_action=pre_tanh_action,
                 mask_cost=float(info.get("mask_cost", 0.0)),
                 task_family=task_family,
+                dwa_raw_action=info.get("dwa_raw_action", None),
+                dwa_teacher_action_valid=bool(
+                    info.get("dwa_teacher_action_valid", False)
+                ),
+                dwa_used=bool(info.get("dwa_used", False)),
+                dwa_policy_loss_weight=float(
+                    info.get("dwa_policy_loss_weight", 1.0)
+                ),
+                recovery_mask_applied=bool(
+                    info.get("recovery_mask_applied", False)
+                ),
+                recovery_mask_nonzero_count=int(
+                    info.get("recovery_mask_nonzero_count", 0)
+                ),
+                recovery_mask_max=float(info.get("recovery_mask_max", 0.0)),
             )
             info["task_family"] = task_family
             episode_degenerate_mask = bool(
@@ -2067,6 +2176,21 @@ def train(args):
             "dwa_override_policy_action": bool(
                 final_info.get("dwa_override_policy_action", False)
             ),
+            "dwa_teacher_action_valid": bool(
+                final_info.get("dwa_teacher_action_valid", False)
+            ),
+            "dwa_policy_loss_weight": float(
+                final_info.get("dwa_policy_loss_weight", 1.0)
+            ),
+            "normal_mask_max": float(final_info.get("normal_mask_max", 0.0)),
+            "recovery_mask_applied": bool(
+                final_info.get("recovery_mask_applied", False)
+            ),
+            "recovery_mask_nonzero_count": int(
+                final_info.get("recovery_mask_nonzero_count", 0)
+            ),
+            "recovery_mask_max": float(final_info.get("recovery_mask_max", 0.0)),
+            "effective_mask_max": float(final_info.get("effective_mask_max", 0.0)),
             "degenerate_mask": bool(final_info.get("degenerate_mask", False)),
             "mask_floor_applied": bool(final_info.get("mask_floor_applied", False)),
             "mask_max_before_floor": float(
@@ -2098,6 +2222,7 @@ def train(args):
             ),
             "raw_safe_ratio_final": float(final_info.get("raw_safe_ratio", 0.0)),
             "mask_coef": float(current_mask_coef),
+            "dwa_bc_coef": float(current_dwa_bc_coef),
             "gear_switch_count": int(episode_gear_switch_count),
         }
         _write_jsonl(episode_jsonl_path, episode_record)
@@ -2143,7 +2268,13 @@ def train(args):
         )
         update_stats = None
         if should_update:
-            update_stats = agent.update(buffer, observation, last_done, mask_coef=current_mask_coef)
+            update_stats = agent.update(
+                buffer,
+                observation,
+                last_done,
+                mask_coef=current_mask_coef,
+                dwa_bc_coef=current_dwa_bc_coef,
+            )
             update_index += 1
 
         if evaluation_due:
@@ -2286,6 +2417,12 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Train continuous PPO for local parking.")
     parser.add_argument("--total-episodes", type=int, default=20_000)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.max_steps,
+        help="Maximum environment steps per episode",
+    )
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument(
@@ -2348,6 +2485,26 @@ def main():
         type=float,
         default=DEFAULT_PPO_CONFIG.checkpoint_score_weight_head_in,
     )
+    parser.add_argument(
+        "--dwa-bc-coef-initial",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.dwa_bc_coef_initial,
+    )
+    parser.add_argument(
+        "--dwa-bc-coef-final",
+        type=float,
+        default=DEFAULT_PPO_CONFIG.dwa_bc_coef_final,
+    )
+    parser.add_argument(
+        "--dwa-bc-anneal-start-episode",
+        type=int,
+        default=DEFAULT_PPO_CONFIG.dwa_bc_anneal_start_episode,
+    )
+    parser.add_argument(
+        "--dwa-bc-anneal-end-episode",
+        type=int,
+        default=DEFAULT_PPO_CONFIG.dwa_bc_anneal_end_episode,
+    )
     parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument(
         "--scene-type",
@@ -2363,11 +2520,44 @@ def main():
         default=",".join(DEFAULT_ENV_CONFIG.scene_family_schedule),
         help="Comma-separated family schedule for cached scenes; currently only head_in",
     )
-    parser.add_argument("--use-hybrid-astar", action="store_true")
     parser.add_argument(
-        "--disable-rs-potential",
+        "--scene-pool-size",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.scene_pool_size,
+        help="Cached scene variants per stage/scene type",
+    )
+    parser.add_argument("--use-hybrid-astar", action="store_true")
+    _add_config_bool_argument(
+        parser,
+        "enable-rs-potential",
+        DEFAULT_ENV_CONFIG.rs_potential_enabled,
+        "Enable near-goal Reeds-Shepp potential shaping",
+        "Disable near-goal Reeds-Shepp potential shaping",
+    )
+    parser.add_argument(
+        "--mask-cost-coef-final",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.mask_cost_coef_final,
+        help="Final PPO mask-penalty coefficient; execution-layer action mask remains active",
+    )
+    parser.add_argument(
+        "--disable-mask-observation",
         action="store_true",
-        help="Disable near-goal Reeds-Shepp potential shaping",
+        help="Zero the action-mask observation slice while keeping safe execution active",
+    )
+    parser.add_argument(
+        "--rear-lidar-observation-mode",
+        choices=("normal", "zero"),
+        default=DEFAULT_ENV_CONFIG.rear_lidar_observation_mode,
+        help="Use normal rear LiDAR observations or zero only the rear LiDAR observation slice",
+    )
+    parser.add_argument(
+        "--disable-action-mask-execution",
+        action="store_true",
+        help=(
+            "Unsafe diagnostic: bypass safe-speed-ratio execution clipping while "
+            "leaving observation and collision truth unchanged"
+        ),
     )
     parser.add_argument(
         "--enable-mask-floor-fallback",
@@ -2410,6 +2600,18 @@ def main():
         "Allow DWA recovery to replace the policy action when it finds a candidate",
         "Keep DWA diagnostic-only and do not replace policy actions",
     )
+    parser.add_argument(
+        "--dwa-recovery-mode",
+        choices=("teacher_override", "policy_with_recovery_mask", "recovery_mask_only"),
+        default=DEFAULT_ENV_CONFIG.dwa_recovery_mode,
+        help="DWA recovery integration mode for degenerate action masks",
+    )
+    parser.add_argument(
+        "--dwa-override-policy-loss-weight",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.dwa_override_policy_loss_weight,
+        help="PPO policy-loss multiplier for transitions executed by DWA override",
+    )
     _add_config_bool_argument(
         parser,
         "dwa-deadlock-termination",
@@ -2431,6 +2633,11 @@ def main():
         "--dwa-unlock-safe-ratio",
         type=float,
         default=DEFAULT_ENV_CONFIG.dwa_unlock_safe_ratio,
+    )
+    parser.add_argument(
+        "--dwa-unlock-min-safe-ratio-improvement",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.dwa_unlock_min_safe_ratio_improvement,
     )
     parser.add_argument(
         "--dwa-forced-stop-patience",
@@ -2456,6 +2663,24 @@ def main():
         "--dwa-speed-ratios",
         default=",".join(str(item) for item in DEFAULT_ENV_CONFIG.dwa_speed_ratios),
         help="Comma-separated local DWA speed ratios, each inside (0, 1]",
+    )
+    parser.add_argument(
+        "--dwa-unlock-speed-ratios",
+        default=",".join(
+            str(item) for item in DEFAULT_ENV_CONFIG.dwa_unlock_speed_ratios
+        ),
+        help="Comma-separated small physical speed ratios for DWA unlock candidates",
+    )
+    parser.add_argument(
+        "--dwa-recovery-max-speed-ratio",
+        type=float,
+        default=DEFAULT_ENV_CONFIG.dwa_recovery_max_speed_ratio,
+    )
+    parser.add_argument(
+        "--dwa-recovery-phi-bin-radius",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.dwa_recovery_phi_bin_radius,
+        help="Number of neighboring phi-dot bins enabled around each recovery candidate",
     )
     parser.add_argument(
         "--enable-hope-teacher",
@@ -2624,6 +2849,15 @@ def main():
         "--curriculum",
         action="store_true",
         help="Enable multi-stage curriculum training (auto-selects stages 1-4)",
+    )
+    parser.add_argument(
+        "--curriculum-mode",
+        choices=("adaptive", "uniform", "fixed"),
+        default="adaptive",
+        help=(
+            "adaptive keeps the performance-weighted curriculum, uniform samples "
+            "stages 1-4 uniformly when --curriculum is set, fixed trains only --stage"
+        ),
     )
     parser.add_argument(
         "--curriculum-target-success",

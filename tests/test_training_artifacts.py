@@ -57,6 +57,33 @@ def test_training_config_snapshot_contains_effective_sections(tmp_path):
     assert "[ppo]" in contents
 
 
+def test_observation_ablation_flags_zero_only_policy_slices(synthetic_action_mask):
+    env = LocalParkingEnv(
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=1,
+            scene_pool_size=1,
+            disable_mask_observation=True,
+            rear_lidar_observation_mode="zero",
+        ),
+        action_mask=synthetic_action_mask,
+        seed=23,
+    )
+
+    observation, _ = env.reset(seed=23)
+    lidar_slice = LocalParkingEnv.OBS_SLICES["lidar"]
+    mask_slice = LocalParkingEnv.OBS_SLICES["mask"]
+    lidar = observation[lidar_slice]
+    rear_lidar = lidar[LocalParkingEnv.LIDAR_FEATURE_DIM // 2 :]
+
+    assert np.allclose(observation[mask_slice], 0.0)
+    assert np.allclose(rear_lidar, 0.0)
+    assert env.current_mask is not None
+    assert not np.allclose(env.current_mask.reshape(-1), 0.0)
+    assert env.last_rear_lidar_m is not None
+    assert not np.allclose(env.last_rear_lidar_m, 0.0)
+
+
 def test_dwa_cli_booleans_inherit_config_defaults():
     import argparse
 

@@ -170,6 +170,13 @@ class RolloutBuffer:
         self.values = []
         self.mask_costs = []
         self.task_families = []
+        self.dwa_raw_actions = []
+        self.dwa_teacher_action_valid = []
+        self.dwa_used = []
+        self.dwa_policy_loss_weights = []
+        self.recovery_mask_applied = []
+        self.recovery_mask_nonzero_counts = []
+        self.recovery_mask_maxes = []
 
     def add(
         self,
@@ -184,6 +191,13 @@ class RolloutBuffer:
         pre_tanh_action,
         mask_cost=0.0,
         task_family="head_in",
+        dwa_raw_action=None,
+        dwa_teacher_action_valid=False,
+        dwa_used=False,
+        dwa_policy_loss_weight=1.0,
+        recovery_mask_applied=False,
+        recovery_mask_nonzero_count=0,
+        recovery_mask_max=0.0,
     ):
         self.observations.append(np.asarray(observation, dtype=np.float32))
         self.pre_tanh_actions.append(
@@ -197,6 +211,20 @@ class RolloutBuffer:
         self.values.append(float(value))
         self.mask_costs.append(float(mask_cost))
         self.task_families.append(str(task_family))
+        dwa_raw = (
+            np.zeros(2, dtype=np.float32)
+            if dwa_raw_action is None
+            else np.asarray(dwa_raw_action, dtype=np.float32)
+        )
+        self.dwa_raw_actions.append(np.clip(dwa_raw, -1.0, 1.0))
+        self.dwa_teacher_action_valid.append(bool(dwa_teacher_action_valid))
+        self.dwa_used.append(bool(dwa_used))
+        self.dwa_policy_loss_weights.append(
+            float(np.clip(float(dwa_policy_loss_weight), 0.0, 1.0))
+        )
+        self.recovery_mask_applied.append(bool(recovery_mask_applied))
+        self.recovery_mask_nonzero_counts.append(int(recovery_mask_nonzero_count))
+        self.recovery_mask_maxes.append(float(recovery_mask_max))
 
     def __len__(self):
         return len(self.rewards)
@@ -293,7 +321,14 @@ class ContinuousPPOAgent:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages, returns
 
-    def update(self, buffer, last_observation, last_done, mask_coef=0.0):
+    def update(
+        self,
+        buffer,
+        last_observation,
+        last_done,
+        mask_coef=0.0,
+        dwa_bc_coef=0.0,
+    ):
         if len(buffer) == 0:
             raise ValueError("cannot update PPO from an empty rollout")
         last_value = 0.0 if last_done else self.value(last_observation)
@@ -338,12 +373,29 @@ class ContinuousPPOAgent:
             ),
             device=self.device,
         )
+        dwa_raw_actions_t = torch.as_tensor(
+            np.asarray(buffer.dwa_raw_actions, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        dwa_teacher_valid_t = torch.as_tensor(
+            np.asarray(buffer.dwa_teacher_action_valid, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        dwa_policy_weights_t = torch.as_tensor(
+            np.asarray(buffer.dwa_policy_loss_weights, dtype=np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         stats = {
             "policy_loss": [],
             "value_loss": [],
             "entropy": [],
             "aux_mask_loss": [],
+            "dwa_bc_loss": [],
+            "dwa_policy_loss_weight": [],
         }
         epoch_approx_kls = []
         epoch_clip_fractions = []
@@ -363,11 +415,13 @@ class ContinuousPPOAgent:
                     dtype=torch.long,
                     device=self.device,
                 )
-                new_log_prob, entropy, _ = self.network.evaluate_actions(
-                    observations[indices],
+                distribution = self.network.distribution(observations[indices])
+                new_log_prob = self.network._squashed_log_prob(
+                    distribution,
                     pre_tanh_actions[indices],
                     raw_actions[indices],
                 )
+                entropy = distribution.entropy().sum(dim=-1)
                 log_ratio = new_log_prob - old_log_probs[indices]
                 ratio = log_ratio.exp()
                 unclipped = ratio * advantages_t[indices]
@@ -379,10 +433,12 @@ class ContinuousPPOAgent:
                     )
                     * advantages_t[indices]
                 )
-                batch_family_weights = family_weights_t[indices]
-                weight_sum = torch.clamp(batch_family_weights.sum(), min=1e-8)
+                batch_policy_weights = (
+                    family_weights_t[indices] * dwa_policy_weights_t[indices]
+                )
+                weight_sum = torch.clamp(batch_policy_weights.sum(), min=1e-8)
                 policy_loss = -(
-                    torch.min(unclipped, clipped) * batch_family_weights
+                    torch.min(unclipped, clipped) * batch_policy_weights
                 ).sum() / weight_sum
 
                 aux_mask_loss = torch.tensor(0.0, device=self.device)
@@ -391,13 +447,23 @@ class ContinuousPPOAgent:
                     weighted_mask_loss = torch.max(
                         ratio * mask_costs_t[indices],
                         ratio_clip * mask_costs_t[indices],
-                    ) * batch_family_weights
+                    ) * batch_policy_weights
                     aux_mask_loss = weighted_mask_loss.sum() / weight_sum
+
+                dwa_bc_loss = torch.tensor(0.0, device=self.device)
+                batch_teacher_valid = dwa_teacher_valid_t[indices] > 0.5
+                if float(dwa_bc_coef) > 0.0 and bool(torch.any(batch_teacher_valid)):
+                    actor_mean_action = torch.tanh(distribution.mean)
+                    bc_error = (
+                        actor_mean_action - dwa_raw_actions_t[indices]
+                    ).pow(2).mean(dim=-1)
+                    dwa_bc_loss = bc_error[batch_teacher_valid].mean()
 
                 actor_loss = (
                     policy_loss
                     - self.config.entropy_coef * entropy.mean()
                     + mask_coef * aux_mask_loss
+                    + float(dwa_bc_coef) * dwa_bc_loss
                 )
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
@@ -422,6 +488,10 @@ class ContinuousPPOAgent:
                 stats["value_loss"].append(float(value_loss.item()))
                 stats["entropy"].append(float(entropy.mean().item()))
                 stats["aux_mask_loss"].append(float(aux_mask_loss.item()))
+                stats["dwa_bc_loss"].append(float(dwa_bc_loss.item()))
+                stats["dwa_policy_loss_weight"].append(
+                    float(dwa_policy_weights_t[indices].mean().item())
+                )
 
             with torch.no_grad():
                 new_log_prob, _, _ = self.network.evaluate_actions(
@@ -455,6 +525,13 @@ class ContinuousPPOAgent:
                 "clip_fraction": float(np.mean(epoch_clip_fractions)),
                 "ppo_epochs_completed": int(len(epoch_approx_kls)),
                 "kl_early_stopped": bool(early_stopped),
+                "dwa_bc_coef": float(dwa_bc_coef),
+                "dwa_teacher_fraction": float(
+                    np.mean(np.asarray(buffer.dwa_teacher_action_valid, dtype=np.float32))
+                ),
+                "dwa_override_policy_weight_mean": float(
+                    np.mean(np.asarray(buffer.dwa_policy_loss_weights, dtype=np.float32))
+                ),
             }
         )
         return result
