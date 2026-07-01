@@ -28,6 +28,33 @@ RULE_SCENE_TYPES = (
 )
 SUPPORTED_SCENE_TYPES = DEFAULT_SCENE_TYPES + RULE_SCENE_TYPES
 _RETRYABLE_SCENE_GENERATION_ERRORS = (RuntimeError, GEOSException)
+DEFAULT_TOPOLOGY_VARIANTS = (
+    "straight_main",
+    "t_branch",
+    "double_t",
+    "short_dead_end",
+    "offset_parallel_aisle",
+    "dogleg",
+    "bulb_turnaround",
+    "chicane",
+)
+DEFAULT_BRANCH_SIDE_MODES = (
+    "target_side",
+    "opposite_target",
+    "alternating",
+    "positive",
+    "negative",
+)
+DEFAULT_LOCAL_COMPLEXITY_VARIANTS = (
+    "corridor_edge_parked_equipment",
+    "offset_wall_stubs",
+    "chicane_wall_pair",
+    "equipment_pile",
+    "asymmetric_indentation",
+    "branch_mouth_obstacle",
+    "dead_end_blockage",
+    "parallel_aisle_divider",
+)
 
 
 @dataclass(frozen=True)
@@ -78,6 +105,9 @@ class _SceneLayout:
     branch_bay_along: float
     obstacle_variant: int
     jitter_token: int
+    topology_variant: str
+    branch_side_mode: str
+    local_complexity_variant: str
 
 
 def _quantize(value, resolution):
@@ -205,6 +235,15 @@ def _sample_layout(seed, scene_config, task_family):
             key=lambda value: abs(float(value) - target_along),
             reverse=True,
         )
+    topology_variant = DEFAULT_TOPOLOGY_VARIANTS[
+        int(rng.integers(0, len(DEFAULT_TOPOLOGY_VARIANTS)))
+    ]
+    branch_side_mode = DEFAULT_BRANCH_SIDE_MODES[
+        int(rng.integers(0, len(DEFAULT_BRANCH_SIDE_MODES)))
+    ]
+    local_complexity_variant = DEFAULT_LOCAL_COMPLEXITY_VARIANTS[
+        int(rng.integers(0, len(DEFAULT_LOCAL_COMPLEXITY_VARIANTS)))
+    ]
 
     return _SceneLayout(
         corridor_heading=float(corridor_heading),
@@ -217,6 +256,9 @@ def _sample_layout(seed, scene_config, task_family):
         branch_bay_along=sample_range(scene_config.branch_bay_along_range),
         obstacle_variant=int(rng.integers(0, 8)),
         jitter_token=int(rng.integers(0, 2**31 - 1)),
+        topology_variant=str(topology_variant),
+        branch_side_mode=str(branch_side_mode),
+        local_complexity_variant=str(local_complexity_variant),
     )
 
 
@@ -784,8 +826,189 @@ def _constrained_obstacle_features(
             )
         )
 
+    local_variant = str(
+        getattr(
+            layout,
+            "local_complexity_variant",
+            "corridor_edge_parked_equipment",
+        )
+    )
+    target_side = 1.0 if float(layout.target_side) >= 0.0 else -1.0
+    opposite_side = -target_side
+
+    def edge_lateral(side, width, margin=0.25):
+        side = 1.0 if float(side) >= 0.0 else -1.0
+        limit = 0.5 * float(corridor_width) - 0.5 * float(width) - float(margin)
+        return side * max(0.0, limit)
+
+    def add_main_wall(label, along, side, length, depth):
+        candidates.append(
+            (
+                label,
+                _wall_stub(
+                    layout.corridor_origin,
+                    corridor_heading,
+                    float(along),
+                    side,
+                    length,
+                    depth,
+                    corridor_width,
+                ),
+            )
+        )
+
+    def add_main_block(label, along, lateral, length, width):
+        candidates.append(
+            (
+                label,
+                _equipment_block(
+                    layout.corridor_origin,
+                    corridor_heading,
+                    float(along),
+                    float(lateral),
+                    float(length),
+                    float(width),
+                ),
+            )
+        )
+
+    if local_variant == "corridor_edge_parked_equipment":
+        for idx, delta in enumerate((-18.0, 16.0, 25.0)):
+            width = _jittered_dimension(2.0, layout, 410 + idx, 0.25, 1.6, 2.35)
+            length = _jittered_dimension(3.4, layout, 420 + idx, 0.40, 2.8, 4.2)
+            side = opposite_side if idx % 2 == 0 else target_side
+            add_main_block(
+                "corridor_edge_parked_equipment",
+                float(layout.target_along) + delta,
+                edge_lateral(side, width),
+                length,
+                width,
+            )
+    elif local_variant == "offset_wall_stubs":
+        for idx, delta in enumerate((-20.0, -12.0, 14.0, 23.0)):
+            side = target_side if idx % 2 else opposite_side
+            add_main_wall(
+                "offset_wall_stub",
+                float(layout.target_along) + delta,
+                side,
+                _jittered_dimension(4.8, layout, 440 + idx, 0.6, 3.8, 5.8),
+                _jittered_dimension(
+                    1.8,
+                    layout,
+                    450 + idx,
+                    0.25,
+                    1.3,
+                    min(2.4, 0.5 * float(corridor_width) - 0.10),
+                ),
+            )
+    elif local_variant == "chicane_wall_pair":
+        for idx, delta in enumerate((-15.0, 15.0, 24.0)):
+            side = target_side if idx % 2 == 0 else opposite_side
+            add_main_wall(
+                "chicane_wall_pair",
+                float(layout.target_along) + delta,
+                side,
+                _jittered_dimension(4.4, layout, 470 + idx, 0.45, 3.6, 5.4),
+                _jittered_dimension(
+                    2.15,
+                    layout,
+                    480 + idx,
+                    0.25,
+                    1.6,
+                    min(2.55, 0.5 * float(corridor_width) - 0.10),
+                ),
+            )
+    elif local_variant == "equipment_pile":
+        pile_origin = float(layout.target_along) + (
+            -18.0 if float(layout.target_along) > 0.0 else 18.0
+        )
+        for idx, offset in enumerate((-2.2, 1.8, 4.2)):
+            width = _jittered_dimension(1.8, layout, 500 + idx, 0.30, 1.4, 2.25)
+            length = _jittered_dimension(2.6, layout, 510 + idx, 0.45, 2.0, 3.5)
+            add_main_block(
+                "equipment_pile",
+                pile_origin + offset,
+                edge_lateral(opposite_side if idx != 1 else target_side, width),
+                length,
+                width,
+            )
+    elif local_variant == "asymmetric_indentation":
+        add_main_wall(
+            "asymmetric_indentation_wall",
+            float(layout.target_along) - 19.0,
+            opposite_side,
+            6.4,
+            min(2.7, 0.5 * float(corridor_width) - 0.10),
+        )
+        add_main_block(
+            "asymmetric_indentation_equipment",
+            float(layout.target_along) + 21.0,
+            edge_lateral(target_side, 2.0),
+            3.2,
+            2.0,
+        )
+    elif local_variant == "branch_mouth_obstacle" and branches:
+        for idx, (branch_origin, branch_heading) in enumerate(branches[:2]):
+            width = _jittered_dimension(2.0, layout, 540 + idx, 0.25, 1.6, 2.30)
+            candidates.append(
+                (
+                    "branch_mouth_obstacle",
+                    _equipment_block(
+                        branch_origin,
+                        branch_heading,
+                        7.0 + _layout_unit_noise(layout, 550 + idx) * 1.5,
+                        _bounded_lateral_center(
+                            _layout_unit_noise(layout, 560 + idx) * 1.2,
+                            width,
+                            branch_width,
+                        ),
+                        _jittered_dimension(3.0, layout, 570 + idx, 0.45, 2.4, 3.8),
+                        width,
+                    ),
+                )
+            )
+    elif local_variant == "dead_end_blockage":
+        if branches:
+            branch_origin, branch_heading = branches[0]
+            candidates.append(
+                (
+                    "dead_end_blockage",
+                    _wall_stub(
+                        branch_origin,
+                        branch_heading,
+                        23.0,
+                        1.0,
+                        5.6,
+                        min(2.6, 0.5 * float(branch_width) - 0.10),
+                        branch_width,
+                    ),
+                )
+            )
+        add_main_block(
+            "dead_end_blockage_equipment",
+            float(layout.target_along) + (
+                24.0 if float(layout.target_along) <= 0.0 else -24.0
+            ),
+            edge_lateral(opposite_side, 2.2),
+            3.2,
+            2.2,
+        )
+    elif local_variant == "parallel_aisle_divider":
+        for idx, delta in enumerate((-18.0, 18.0)):
+            width = 0.8
+            add_main_block(
+                "parallel_aisle_divider",
+                float(layout.target_along) + delta,
+                edge_lateral(opposite_side if idx == 0 else target_side, width, 0.10),
+                7.0,
+                width,
+            )
+
     if int(stage) >= 4:
         yard_offsets = ((-4.0, -3.0), (4.0, 3.0), (0.0, 5.0))
+        yard_side = -target_side
+        yard_along_center = float(layout.target_along) * 0.25
+        yard_lateral_center = yard_side * 18.0
         for idx, offset in enumerate(yard_offsets):
             length = _jittered_dimension(
                 scene_config.equipment_obstacle_length,
@@ -804,12 +1027,12 @@ def _constrained_obstacle_features(
                 2.50,
             )
             along_center = (
-                2.0
+                yard_along_center
                 + float(offset[0])
                 + _layout_unit_noise(layout, 340 + idx) * 1.20
             )
             lateral_center = (
-                -18.0
+                yard_lateral_center
                 + float(offset[1])
                 + _layout_unit_noise(layout, 360 + idx) * 1.20
             )
@@ -877,6 +1100,7 @@ def _constrained_obstacle_features(
 
 
 def _corridor_polygons(stage, layout, scene_config):
+    stage = int(stage)
     corridor_width = scene_config.corridor_width_for_stage(stage)
     branch_width = max(
         11.0,
@@ -886,52 +1110,199 @@ def _corridor_polygons(stage, layout, scene_config):
     origin = tuple(layout.corridor_origin)
     axis, normal = _cardinal_frame(corridor_heading)
     main_half_length = 0.5 * float(scene_config.main_corridor_length)
-    main = _frame_polygon(
-        origin,
-        corridor_heading,
-        -main_half_length,
-        main_half_length,
-        -0.5 * corridor_width,
-        0.5 * corridor_width,
-    )
-    polygons = [main]
+    polygons = []
     branch_specs = []
 
-    if stage >= 2:
-        branch_origin = np.asarray(origin) + axis * float(layout.first_branch_along)
-        branch_heading = wrap_to_pi(corridor_heading + 0.5 * math.pi)
+    def add_polygon(polygon):
+        if polygon.is_empty or float(polygon.area) <= 0.0:
+            return
+        polygons.append(polygon)
+
+    def side_for_branch(branch_index):
+        mode = str(getattr(layout, "branch_side_mode", "target_side"))
+        if mode == "target_side":
+            return 1.0 if float(layout.target_side) >= 0.0 else -1.0
+        if mode == "opposite_target":
+            return -1.0 if float(layout.target_side) >= 0.0 else 1.0
+        if mode == "positive":
+            return 1.0
+        if mode == "negative":
+            return -1.0
+        if mode == "alternating":
+            base = 1.0 if float(layout.target_side) >= 0.0 else -1.0
+            return base if int(branch_index) % 2 == 0 else -base
+        return 1.0
+
+    def add_full_branch(along_center, branch_index):
+        branch_origin = np.asarray(origin) + axis * float(along_center)
+        branch_heading = wrap_to_pi(
+            corridor_heading + side_for_branch(branch_index) * 0.5 * math.pi
+        )
         branch = _frame_polygon(
             branch_origin,
             branch_heading,
-            -0.5 * scene_config.branch_corridor_length,
-            0.5 * scene_config.branch_corridor_length,
+            -0.5 * float(scene_config.branch_corridor_length),
+            0.5 * float(scene_config.branch_corridor_length),
             -0.5 * branch_width,
             0.5 * branch_width,
         )
-        polygons.append(branch)
+        add_polygon(branch)
         branch_specs.append((branch_origin, branch_heading))
-    if stage >= 3:
-        branch_origin = np.asarray(origin) + axis * float(layout.second_branch_along)
-        branch_heading = wrap_to_pi(corridor_heading + 0.5 * math.pi)
-        branch = _frame_polygon(
+
+    def add_side_segment(along_center, side, length, width):
+        side = 1.0 if float(side) >= 0.0 else -1.0
+        branch_origin = np.asarray(origin) + axis * float(along_center)
+        branch_heading = wrap_to_pi(corridor_heading + side * 0.5 * math.pi)
+        segment = _frame_polygon(
             branch_origin,
             branch_heading,
-            -0.5 * scene_config.branch_corridor_length,
-            6.0,
-            -0.5 * branch_width,
-            0.5 * branch_width,
+            0.0,
+            float(length),
+            -0.5 * float(width),
+            0.5 * float(width),
         )
-        polygons.append(branch)
-        branch_specs.append((branch_origin, branch_heading))
+        add_polygon(segment)
+
+    def add_parallel_aisle(along_center, side, length, offset, width):
+        side = 1.0 if float(side) >= 0.0 else -1.0
+        offset = abs(float(offset))
+        aux_origin = np.asarray(origin) + normal * side * offset
+        half_length = 0.5 * float(length)
+        add_polygon(
+            _frame_polygon(
+                aux_origin,
+                corridor_heading,
+                float(along_center) - half_length,
+                float(along_center) + half_length,
+                -0.5 * float(width),
+                0.5 * float(width),
+            )
+        )
+        connector_width = max(float(corridor_width), 0.75 * float(width))
+        for delta in (-0.65 * half_length, 0.65 * half_length):
+            connector_origin = np.asarray(origin) + axis * (float(along_center) + delta)
+            connector_heading = wrap_to_pi(corridor_heading + side * 0.5 * math.pi)
+            add_polygon(
+                _frame_polygon(
+                    connector_origin,
+                    connector_heading,
+                    0.0,
+                    offset,
+                    -0.5 * connector_width,
+                    0.5 * connector_width,
+                )
+            )
+
+    add_polygon(
+        _frame_polygon(
+            origin,
+            corridor_heading,
+            -main_half_length,
+            main_half_length,
+            -0.5 * corridor_width,
+            0.5 * corridor_width,
+        )
+    )
+
+    variant = str(getattr(layout, "topology_variant", "straight_main"))
+    if variant == "straight_main":
+        pass
+    elif variant == "t_branch":
+        if stage >= 2:
+            add_full_branch(layout.first_branch_along, 0)
+    elif variant == "double_t":
+        if stage >= 2:
+            add_full_branch(layout.first_branch_along, 0)
+        if stage >= 3:
+            add_full_branch(layout.second_branch_along, 1)
+    elif variant == "short_dead_end":
+        side = -float(layout.target_side)
+        along = float(layout.target_along) + 10.0 * (
+            -1.0 if float(layout.target_along) > 0.0 else 1.0
+        )
+        add_side_segment(
+            along,
+            side,
+            min(13.0, 0.35 * float(scene_config.branch_corridor_length)),
+            max(float(corridor_width), 7.0),
+        )
+    elif variant == "offset_parallel_aisle":
+        side = -float(layout.target_side)
+        add_parallel_aisle(
+            float(layout.target_along),
+            side,
+            30.0 if stage < 4 else 38.0,
+            float(corridor_width) + 7.0,
+            max(float(corridor_width), 6.5),
+        )
+        if stage >= 3:
+            add_full_branch(layout.first_branch_along, 0)
+    elif variant == "dogleg":
+        side = side_for_branch(0)
+        add_parallel_aisle(
+            float(layout.target_along),
+            side,
+            26.0,
+            float(corridor_width) + 4.5,
+            max(float(corridor_width), 6.0),
+        )
+        if stage >= 3:
+            add_full_branch(layout.second_branch_along, 1)
+    elif variant == "bulb_turnaround":
+        side = -float(layout.target_side)
+        edge = side * 0.5 * float(corridor_width)
+        outer = edge + side * max(7.0, 1.3 * float(corridor_width))
+        n0, n1 = sorted((edge, outer))
+        add_polygon(
+            _frame_polygon(
+                origin,
+                corridor_heading,
+                float(layout.target_along) - 7.0,
+                float(layout.target_along) + 11.0,
+                n0,
+                n1,
+            )
+        )
+        if stage >= 2:
+            add_full_branch(layout.first_branch_along, 0)
+    elif variant == "chicane":
+        for idx, delta in enumerate((-13.0, 0.0, 13.0)):
+            side = side_for_branch(idx)
+            edge = side * 0.5 * float(corridor_width)
+            outer = edge + side * max(3.5, 0.8 * float(corridor_width))
+            n0, n1 = sorted((edge, outer))
+            add_polygon(
+                _frame_polygon(
+                    origin,
+                    corridor_heading,
+                    float(layout.target_along) + delta - 4.5,
+                    float(layout.target_along) + delta + 4.5,
+                    n0,
+                    n1,
+                )
+            )
+        if stage >= 3:
+            add_full_branch(layout.first_branch_along, 0)
+    else:
+        if stage >= 2:
+            add_full_branch(layout.first_branch_along, 0)
+
     if stage >= 4:
-        turning_yard_center = np.asarray(origin) + axis * 2.0 - normal * 18.0
-        yard = box(
-            turning_yard_center[0] - 9.0,
-            turning_yard_center[1] - 9.0,
-            turning_yard_center[0] + 9.0,
-            turning_yard_center[1] + 9.0,
+        yard_side = -float(layout.target_side)
+        turning_yard_center = (
+            np.asarray(origin)
+            + axis * (float(layout.target_along) * 0.25)
+            + normal * yard_side * 18.0
         )
-        polygons.append(yard)
+        yard = _frame_polygon(
+            turning_yard_center,
+            corridor_heading,
+            -9.0,
+            9.0,
+            -9.0,
+            9.0,
+        )
+        add_polygon(yard)
     return polygons, corridor_heading, corridor_width, branch_width, branch_specs
 
 
@@ -1088,6 +1459,141 @@ def _build_rule_parking_bay(index, target_index, config, offset):
         goal_heading=float(-0.5 * math.pi),
         is_target=bool(int(index) == int(target_index)),
     )
+
+
+def _bay_frame_extents(bay):
+    mouth = np.asarray(bay.mouth_center, dtype=np.float64)
+    inward = np.asarray(
+        [math.cos(float(bay.inward_heading)), math.sin(float(bay.inward_heading))],
+        dtype=np.float64,
+    )
+    lateral = np.asarray([-inward[1], inward[0]], dtype=np.float64)
+    coords = np.asarray(bay.polygon.exterior.coords[:-1], dtype=np.float64)
+    delta = coords - mouth
+    longitudinal = delta.dot(inward)
+    lateral_projection = delta.dot(lateral)
+    return (
+        inward,
+        lateral,
+        float(np.min(longitudinal)),
+        float(np.max(longitudinal)),
+        float(np.min(lateral_projection)),
+        float(np.max(lateral_projection)),
+    )
+
+
+def _generate_bay_parked_vehicles(config, rng, parking_bays, target_index, walls):
+    if not bool(getattr(config, "bay_parked_vehicle_enabled", True)):
+        return [], [], []
+    non_target_indices = [
+        int(index)
+        for index in range(len(parking_bays))
+        if int(index) != int(target_index)
+    ]
+    if not non_target_indices:
+        return [], [], []
+    count_range = tuple(
+        int(value)
+        for value in getattr(config, "bay_parked_vehicle_count_range", (0, 0))
+    )
+    if len(count_range) < 2:
+        count_range = (count_range[0], count_range[0])
+    min_count = max(0, min(count_range[0], count_range[1]))
+    max_count = max(min_count, max(count_range[0], count_range[1]))
+    desired = int(rng.integers(min_count, max_count + 1))
+    desired = min(desired, len(non_target_indices))
+    if desired <= 0:
+        return [], [], []
+
+    length = float(getattr(config, "bay_parked_vehicle_length", 5.2))
+    width = float(getattr(config, "bay_parked_vehicle_width", 2.4))
+    longitudinal_noise = float(
+        getattr(config, "bay_parked_vehicle_longitudinal_noise", 0.0)
+    )
+    lateral_noise = float(getattr(config, "bay_parked_vehicle_lateral_noise", 0.0))
+    heading_noise = math.radians(
+        float(getattr(config, "bay_parked_vehicle_heading_noise_deg", 0.0))
+    )
+    wall_clearance = max(
+        0.0,
+        float(getattr(config, "bay_parked_vehicle_wall_clearance", 0.0)),
+    )
+    pair_spacing = max(
+        0.0,
+        float(getattr(config, "bay_parked_vehicle_pair_spacing", 0.0)),
+    )
+    target_keepout = max(
+        0.0,
+        float(getattr(config, "bay_parked_vehicle_target_keepout", 0.0)),
+    )
+    target_keepout_polygon = parking_bays[int(target_index)].polygon.buffer(
+        target_keepout,
+        cap_style=2,
+        join_style=2,
+    )
+    wall_union = unary_union(list(walls))
+    order = [non_target_indices[int(index)] for index in rng.permutation(len(non_target_indices))]
+    selected = []
+    labels = []
+    headings = []
+
+    for bay_index in order:
+        if len(selected) >= desired:
+            break
+        bay = parking_bays[int(bay_index)]
+        inward, lateral, long_min, long_max, lat_min, lat_max = _bay_frame_extents(bay)
+        min_longitudinal = long_min + 0.5 * length + wall_clearance
+        max_longitudinal = long_max - 0.5 * length - wall_clearance
+        min_lateral = lat_min + 0.5 * width + wall_clearance
+        max_lateral = lat_max - 0.5 * width - wall_clearance
+        if max_longitudinal < min_longitudinal or max_lateral < min_lateral:
+            continue
+        center_longitudinal = 0.5 * (min_longitudinal + max_longitudinal)
+        center_lateral = 0.5 * (min_lateral + max_lateral)
+        if longitudinal_noise > 0.0:
+            center_longitudinal += float(
+                rng.uniform(-longitudinal_noise, longitudinal_noise)
+            )
+        if lateral_noise > 0.0:
+            center_lateral += float(rng.uniform(-lateral_noise, lateral_noise))
+        center_longitudinal = float(
+            np.clip(center_longitudinal, min_longitudinal, max_longitudinal)
+        )
+        center_lateral = float(np.clip(center_lateral, min_lateral, max_lateral))
+        heading = float(bay.inward_heading)
+        if heading_noise > 0.0:
+            heading = float(wrap_to_pi(heading + rng.uniform(-heading_noise, heading_noise)))
+        center = (
+            np.asarray(bay.mouth_center, dtype=np.float64)
+            + inward * center_longitudinal
+            + lateral * center_lateral
+        )
+        candidate = oriented_box(
+            (float(center[0]), float(center[1])),
+            heading,
+            length,
+            width,
+        )
+        inner_bay = bay.polygon.buffer(
+            -wall_clearance,
+            cap_style=2,
+            join_style=2,
+        )
+        bay_container = bay.polygon if inner_bay.is_empty else inner_bay
+        if not bay_container.covers(candidate):
+            continue
+        if candidate.intersects(wall_union):
+            continue
+        if candidate.intersects(target_keepout_polygon):
+            continue
+        if any(candidate.intersects(existing) for existing in selected):
+            continue
+        if any(candidate.distance(existing) < pair_spacing for existing in selected):
+            continue
+        selected.append(candidate)
+        labels.append("parked_vehicle_bay_{}".format(int(bay_index)))
+        headings.append(float(heading))
+    return selected, labels, headings
 
 
 def _target_bay_index(config, rng, bay_count, stage):
@@ -1275,7 +1781,15 @@ def generate_mixing_station_bay_corridor_scene(
         for index in range(bay_count)
     ]
     target_bay = parking_bays[target_index]
-    obstacle_union = unary_union(walls)
+    parked_vehicles, parked_labels, parked_headings = _generate_bay_parked_vehicles(
+        config,
+        rng,
+        parking_bays,
+        target_index,
+        walls,
+    )
+    obstacle_polygons = list(walls) + list(parked_vehicles)
+    obstacle_union = unary_union(obstacle_polygons)
     prepared_obstacles = prep(obstacle_union)
     target_state, target_attempts = _sample_mixing_target_pose(
         config,
@@ -1316,6 +1830,9 @@ def generate_mixing_station_bay_corridor_scene(
         "generation_mode": "rule_bay_corridor_walls",
         "goal_type": "parking_bay",
         "goal_orientation_mode": "head_in",
+        "topology_variant": "bay_corridor",
+        "branch_side_mode": "none",
+        "local_complexity_variant": "non_target_bay_parked_vehicles",
         "bay_count": int(bay_count),
         "bay_width": float(bay_width),
         "bay_depth": float(bay_depth),
@@ -1353,10 +1870,15 @@ def generate_mixing_station_bay_corridor_scene(
         "corridor_end_wall_count": 0,
         "corridor_ends_open": True,
         "bottom_wall_exists": True,
-        "constructed_obstacle_labels": tuple(wall_labels),
-        "constructed_obstacle_feature_count": 0,
+        "constructed_obstacle_labels": tuple(wall_labels + parked_labels),
+        "constructed_obstacle_feature_count": int(len(parked_vehicles)),
         "constructed_wall_feature_count": int(len(walls)),
-        "obstacle_count": int(len(walls)),
+        "obstacle_count": int(len(obstacle_polygons)),
+        "wall_obstacle_count": int(len(walls)),
+        "parked_vehicle_obstacle_start_index": int(len(walls)),
+        "parked_vehicle_count": int(len(parked_vehicles)),
+        "parked_vehicle_labels": tuple(parked_labels),
+        "parked_vehicle_headings": tuple(float(v) for v in parked_headings),
         "corridor_region_bounds": tuple(float(v) for v in corridor_region.bounds),
         "target_heading_into_bay": True,
         "free_ratio": 0.0,
@@ -1371,7 +1893,9 @@ def generate_mixing_station_bay_corridor_scene(
                 target_audit["nominal_target_clearance_m"]
             ),
             "approach_side_bucket": "multi_bay",
-            "scene_complexity_bucket": _scene_complexity_bucket(len(walls)),
+            "scene_complexity_bucket": _scene_complexity_bucket(
+                len(parked_vehicles)
+            ),
             "difficulty_label": "mixing_station_bay_corridor|bay{}".format(
                 target_index
             ),
@@ -1379,7 +1903,7 @@ def generate_mixing_station_bay_corridor_scene(
         }
     )
     scene = _build_scene_from_rule_polygons(
-        obstacle_polygons=walls,
+        obstacle_polygons=obstacle_polygons,
         parking_bays=parking_bays,
         target_bay=target_bay,
         slot=slot,
@@ -1792,6 +2316,9 @@ def generate_loading_truck_rectangle_space_scene(
         "generation_mode": "rule_rectangle_truck_grid_obstacles",
         "goal_type": "loading_truck_target",
         "goal_orientation_mode": "head_in",
+        "topology_variant": "rectangle_space",
+        "branch_side_mode": "none",
+        "local_complexity_variant": "truck_and_discrete_obstacles",
         "world_length": float(config.world_length),
         "world_width": float(config.world_width),
         "boundary_wall_thickness": float(config.boundary_wall_thickness),
@@ -1834,6 +2361,9 @@ def generate_loading_truck_rectangle_space_scene(
         "constructed_obstacle_feature_count": int(1 + len(discrete_obstacles)),
         "constructed_wall_feature_count": 0,
         "constructed_obstacle_labels": tuple(["truck_obstacle"] + obstacle_labels),
+        "parked_vehicle_count": 0,
+        "parked_vehicle_labels": tuple(),
+        "parked_vehicle_headings": tuple(),
         "obstacle_exclusion_radius_around_initial": float(
             config.obstacle_exclusion_radius_around_initial
         ),
@@ -2040,7 +2570,13 @@ def generate_cached_mixing_plant_scene(
         "goal_type": "parking_bay",
         "goal_orientation_mode": target_bay.goal_orientation_mode,
         "obstacle_layout_variant": int(layout.obstacle_variant),
+        "topology_variant": str(layout.topology_variant),
+        "branch_side_mode": str(layout.branch_side_mode),
+        "local_complexity_variant": str(layout.local_complexity_variant),
         "constructed_obstacle_labels": tuple(constructed_labels),
+        "parked_vehicle_count": 0,
+        "parked_vehicle_labels": tuple(),
+        "parked_vehicle_headings": tuple(),
         "bay_inward_heading": float(target_bay.inward_heading),
         "free_ratio": free_ratio,
         "obstacle_count": len(obstacle_polygons),

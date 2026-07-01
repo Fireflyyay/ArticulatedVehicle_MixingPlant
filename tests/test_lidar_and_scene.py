@@ -5,11 +5,12 @@ import numpy as np
 import pytest
 from shapely.errors import GEOSException
 from shapely.geometry import Point
+from shapely.ops import unary_union
 
 from config import DEFAULT_SCENE_CONFIG, DEFAULT_VEHICLE_PARAMS
 from dataclasses import replace
 from config import DEFAULT_ENV_CONFIG
-from env.geometry import oriented_box
+from env.geometry import oriented_box, wrap_to_pi
 from env.lidar import DualBodyLidar
 from env.local_parking_env import LocalParkingEnv, ResetInitialStateError
 from env.mixing_plant_scene import (
@@ -85,11 +86,20 @@ def test_stage4_scene_keeps_narrow_corridor_obstacle_categories_and_reset_audit(
         scene = generate_cached_mixing_plant_scene(stage=4, seed=600 + seed)
         labels = set(scene.metadata["constructed_obstacle_labels"])
         assert float(scene.metadata["corridor_width"]) == 5.0
-        assert scene.metadata["constructed_obstacle_feature_count"] == 7
-        assert "wall_stub" in labels
-        assert "equipment_island" in labels
-        assert any(label.startswith("branch_") for label in labels)
-        assert "yard_equipment_island" in labels
+        assert 0 < scene.metadata["constructed_obstacle_feature_count"] <= 7
+        assert scene.metadata["constructed_wall_feature_count"] >= 0
+        assert labels
+        assert scene.metadata["topology_variant"] in {
+            "straight_main",
+            "t_branch",
+            "double_t",
+            "short_dead_end",
+            "offset_parallel_aisle",
+            "dogleg",
+            "bulb_turnaround",
+            "chicane",
+        }
+        assert scene.metadata["local_complexity_variant"]
         assert scene.metadata["success_neighborhood_feasible_count"] > 0
         assert scene.metadata["reset_geometry_candidate_count"] > 0
         assert scene.metadata["reset_geometry_recovery_band_count"] > 0
@@ -169,6 +179,22 @@ def test_different_seeds_produce_distinct_parameterized_layouts():
     assert {scene.metadata["task_family"] for scene in scenes} == {"head_in"}
     assert {scene.metadata["goal_orientation_mode"] for scene in scenes} == {"head_in"}
     assert len({scene.metadata["obstacle_layout_variant"] for scene in scenes}) > 1
+    assert len({scene.metadata["topology_variant"] for scene in scenes}) > 1
+    assert len({scene.metadata["local_complexity_variant"] for scene in scenes}) > 1
+
+
+def test_default_scene_topology_variants_cover_multiple_seeded_layouts():
+    scenes = [
+        generate_cached_mixing_plant_scene(
+            stage=3,
+            seed=900 + index,
+            task_family="head_in",
+        )
+        for index in range(32)
+    ]
+    variants = {scene.metadata["topology_variant"] for scene in scenes}
+    assert len(variants) >= 4
+    assert all(scene.metadata["task_family"] == "head_in" for scene in scenes)
 
 
 def test_scene_pool_uses_explicit_family_schedule_and_derived_seeds():
@@ -284,10 +310,13 @@ def test_mixing_station_bay_corridor_geometry_and_reset(synthetic_action_mask):
     assert float(np.dot(target_direction, inward)) > 0.999
 
     corridor_y0 = float(scene.metadata["corridor_region_bounds"][1])
-    for wall in scene.obstacle_polygons[2:]:
+    wall_count = int(scene.metadata["wall_obstacle_count"])
+    assert wall_count == 4 + cfg.bay_count - 1
+    assert len(scene.obstacle_polygons) == wall_count + scene.metadata["parked_vehicle_count"]
+    for wall in scene.obstacle_polygons[2:wall_count]:
         assert wall.bounds[3] <= corridor_y0 + 1e-8
-    for partition in scene.obstacle_polygons[4:]:
-        assert partition.bounds[3] <= corridor_y0 + 1e-8
+    for parked_vehicle in scene.obstacle_polygons[wall_count:]:
+        assert parked_vehicle.bounds[3] <= corridor_y0 + 1e-8
 
     env = LocalParkingEnv(
         config=replace(DEFAULT_ENV_CONFIG, scene_pool_size=1),
@@ -303,6 +332,49 @@ def test_mixing_station_bay_corridor_geometry_and_reset(synthetic_action_mask):
     assert info["initial_bay_index"] == -1
     assert info["reset_feasible_mask_available"] is True
     assert not info["initial_collision"]
+
+
+def test_mixing_station_parked_vehicles_stay_in_non_target_bays():
+    cfg = replace(
+        DEFAULT_SCENE_CONFIG,
+        scene_type="mixing_station_bay_corridor",
+        target_bay_sampling_mode="fixed",
+        fixed_target_bay_index=0,
+        bay_parked_vehicle_count_range=(4, 4),
+    )
+    scene = generate_cached_mixing_plant_scene(
+        stage=1,
+        seed=707,
+        scene_config=cfg,
+        task_family="head_in",
+    )
+    wall_count = int(scene.metadata["wall_obstacle_count"])
+    parked_count = int(scene.metadata["parked_vehicle_count"])
+    parked_vehicles = scene.obstacle_polygons[wall_count : wall_count + parked_count]
+    wall_union = unary_union(scene.obstacle_polygons[:wall_count])
+    assert parked_count > 0
+    assert len(parked_vehicles) == parked_count
+    assert len(scene.metadata["parked_vehicle_labels"]) == parked_count
+    assert len(scene.metadata["parked_vehicle_headings"]) == parked_count
+
+    max_heading_error = math.radians(cfg.bay_parked_vehicle_heading_noise_deg) + 1e-8
+    for vehicle, label, heading in zip(
+        parked_vehicles,
+        scene.metadata["parked_vehicle_labels"],
+        scene.metadata["parked_vehicle_headings"],
+    ):
+        bay_index = int(str(label).split("_")[-1])
+        bay = scene.parking_bays[bay_index]
+        assert bay is not scene.target_bay
+        assert bay.polygon.covers(vehicle)
+        assert not vehicle.intersects(wall_union)
+        assert not vehicle.intersects(scene.target_bay.polygon)
+        assert abs(wrap_to_pi(float(heading) - bay.inward_heading)) <= max_heading_error
+
+    for index, first in enumerate(parked_vehicles):
+        for second in parked_vehicles[index + 1 :]:
+            assert not first.intersects(second)
+            assert first.distance(second) >= cfg.bay_parked_vehicle_pair_spacing - 1e-8
 
 
 def test_loading_truck_rectangle_space_geometry_and_obstacle_exclusion(

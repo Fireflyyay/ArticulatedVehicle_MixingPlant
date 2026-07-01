@@ -2134,6 +2134,9 @@ class LocalParkingEnv:
             "approach_side_bucket",
             "scene_complexity_bucket",
             "difficulty_label",
+            "topology_variant",
+            "branch_side_mode",
+            "local_complexity_variant",
             "corridor_width",
             "bay_count",
             "bay_width",
@@ -2175,6 +2178,10 @@ class LocalParkingEnv:
             "reset_geometry_recovery_band_count",
             "constructed_obstacle_feature_count",
             "constructed_wall_feature_count",
+            "constructed_obstacle_labels",
+            "parked_vehicle_count",
+            "parked_vehicle_labels",
+            "parked_vehicle_headings",
             "scene_generation_attempt_count",
         ):
             if key in self.scene.metadata:

@@ -141,6 +141,16 @@ class MixingPlantSceneConfig:
     )
     ensure_feasible_reset: bool = True
     max_pose_sampling_attempts: int = 32
+    bay_parked_vehicle_enabled: bool = True
+    bay_parked_vehicle_count_range: Tuple[int, int] = (1, 3)
+    bay_parked_vehicle_length: float = 5.2
+    bay_parked_vehicle_width: float = 2.4
+    bay_parked_vehicle_longitudinal_noise: float = 1.0
+    bay_parked_vehicle_lateral_noise: float = 0.55
+    bay_parked_vehicle_heading_noise_deg: float = 5.0
+    bay_parked_vehicle_wall_clearance: float = 0.35
+    bay_parked_vehicle_pair_spacing: float = 1.0
+    bay_parked_vehicle_target_keepout: float = 0.50
 
     # --- Rule-based loading-truck rectangle scene ---
     world_length: float = 42.0
