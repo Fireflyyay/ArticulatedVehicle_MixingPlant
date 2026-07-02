@@ -54,7 +54,7 @@ articulated sweep table before advancing the vehicle model.
 
 The main paper method is `full`: articulated local parking with dual-body
 LiDAR, geometry-aware safe action-mask execution, PPO, adaptive curriculum,
-hard-case replay, and optional near-goal RS potential shaping. RS is a
+and optional near-goal RS potential shaping. RS is a
 potential-shaping signal only; it is not a teacher or expert action source.
 HOPE teacher code remains diagnostic and is not part of the main ablation
 table.
@@ -117,7 +117,6 @@ flags `--log-std-init 0.0 --log-std-max 0.0 --total-episodes 50000` and the
 mkdir -p runs/ablation_suite/full && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --curriculum --curriculum-mode adaptive \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --mask-cost-coef-final 0.8 \
   --total-episodes 50000 \
@@ -127,7 +126,6 @@ mkdir -p runs/ablation_suite/full && nohup conda run -n HOPE python scripts/trai
 mkdir -p runs/ablation_suite/no_rs_potential && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --curriculum --curriculum-mode adaptive \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --disable-rs-potential \
   --mask-cost-coef-final 0.8 \
@@ -138,7 +136,6 @@ mkdir -p runs/ablation_suite/no_rs_potential && nohup conda run -n HOPE python s
 mkdir -p runs/ablation_suite/uniform_curriculum && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --curriculum --curriculum-mode uniform \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --mask-cost-coef-final 0.8 \
   --total-episodes 50000 \
@@ -148,7 +145,6 @@ mkdir -p runs/ablation_suite/uniform_curriculum && nohup conda run -n HOPE pytho
 mkdir -p runs/ablation_suite/fixed_stage4_only && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --stage 4 --curriculum-mode fixed \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --mask-cost-coef-final 0.8 \
   --total-episodes 50000 \
@@ -158,7 +154,6 @@ mkdir -p runs/ablation_suite/fixed_stage4_only && nohup conda run -n HOPE python
 mkdir -p runs/ablation_suite/no_mask_cost && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --curriculum --curriculum-mode adaptive \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --mask-cost-coef-final 0.0 \
   --total-episodes 50000 \
@@ -168,7 +163,6 @@ mkdir -p runs/ablation_suite/no_mask_cost && nohup conda run -n HOPE python scri
 mkdir -p runs/ablation_suite/no_mask_observation && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --curriculum --curriculum-mode adaptive \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --mask-cost-coef-final 0.8 \
   --disable-mask-observation \
@@ -179,7 +173,6 @@ mkdir -p runs/ablation_suite/no_mask_observation && nohup conda run -n HOPE pyth
 mkdir -p runs/ablation_suite/front_lidar_only && nohup conda run -n HOPE python scripts/train_local_parking.py \
   --log-std-init 0.0 --log-std-max 0.0 \
   --curriculum --curriculum-mode adaptive \
-  --hard-case-replay-ratio 0.0 \
   --disable-dwa-recovery \
   --mask-cost-coef-final 0.8 \
   --rear-lidar-observation-mode zero \

@@ -196,7 +196,11 @@ class LocalParkingEnvConfig:
     success_overlap: float = 0.80
     success_heading_error: float = math.radians(15.0)
     curriculum_stage: int = 1
-    scene_pool_size: int = 18
+    scene_pool_size: int = 64
+    scene_refresh_enabled: bool = True
+    scene_refresh_interval: int = 1000
+    scene_refresh_count: int = 16
+    scene_refresh_start_episode: int = 0
     scene_family_schedule: Tuple[str, ...] = (
         "head_in",
     )
@@ -319,16 +323,6 @@ class LocalParkingEnvConfig:
     enable_offpath_reset: bool = False
     enable_failure_aggregation: bool = False
     no_guide_eval_interval: int = 0
-
-    # --- Training-only hard-case replay from actual failed rollouts ---
-    hard_case_replay_enabled: bool = False
-    hard_case_replay_ratio: float = 0.20
-    hard_case_replay_capacity: int = 4096
-    hard_case_replay_tail_steps: int = 12
-    hard_case_replay_attempts: int = 32
-    hard_case_replay_xy_std: float = 0.45
-    hard_case_replay_heading_std_deg: float = 6.0
-    hard_case_replay_phi_std_deg: float = 5.0
 
 
 @dataclass(frozen=True)

@@ -72,7 +72,6 @@ FAILED_RUNS="${SUITE_DIR}/failed_runs.txt"
 EXPERIMENTS=(
   full
   no_rs_potential
-  no_hard_case_replay
   uniform_curriculum
   fixed_stage4_only
   no_mask_cost
@@ -165,37 +164,34 @@ experiment_args() {
   local experiment="$1"
   case "${experiment}" in
     full)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     no_rs_potential)
-      echo "--disable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
-      ;;
-    no_hard_case_replay)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --disable-hard-case-replay --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--disable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     uniform_curriculum)
-      echo "--enable-rs-potential --curriculum --curriculum-mode uniform --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode uniform --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     fixed_stage4_only)
-      echo "--enable-rs-potential --stage 4 --curriculum-mode fixed --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --stage 4 --curriculum-mode fixed --mask-cost-coef-final 0.8 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     no_mask_cost)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.0 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.0 --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     no_mask_observation)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --disable-mask-observation --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --disable-mask-observation --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     front_lidar_only)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --rear-lidar-observation-mode zero --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --rear-lidar-observation-mode zero --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     dwa_assisted)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --enable-dwa-recovery --enable-dwa-override-policy-action --enable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --enable-dwa-recovery --enable-dwa-override-policy-action --enable-dwa-deadlock-termination"
       ;;
     mask_floor_fallback)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --enable-mask-floor-fallback --apply-floor-only-when-all-zero --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --enable-mask-floor-fallback --apply-floor-only-when-all-zero --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     unsafe_no_action_mask_execution)
-      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --hard-case-replay-ratio 0.20 --mask-cost-coef-final 0.8 --disable-action-mask-execution --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
+      echo "--enable-rs-potential --curriculum --curriculum-mode adaptive --mask-cost-coef-final 0.8 --disable-action-mask-execution --disable-dwa-recovery --disable-dwa-override-policy-action --disable-dwa-deadlock-termination"
       ;;
     *)
       echo "unknown experiment: ${experiment}" >&2

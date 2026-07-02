@@ -25,7 +25,6 @@ from env.mixing_plant_scene import (
     TASK_FAMILIES as SCENE_TASK_FAMILIES,
     normalize_family_schedule,
 )
-from env.vehicle import ArticulatedState
 from model.continuous_ppo import ContinuousPPOAgent, RolloutBuffer
 from planning.passenger_hybrid_astar import PassengerHybridAStar
 from train.curriculum import (
@@ -133,6 +132,18 @@ def _parse_float_tuple(value):
     return result
 
 
+def _scene_seed_base(seed, split):
+    split = str(split)
+    offsets = {
+        "train": 0,
+        "eval": 100_000,
+        "test": 1_000_000,
+    }
+    if split not in offsets:
+        raise ValueError("unsupported scene split: {}".format(split))
+    return int(seed) + int(offsets[split])
+
+
 def _success_by_family(completed):
     result = {}
     for family in TASK_FAMILIES:
@@ -200,94 +211,6 @@ def _rs_metrics_by_mode(infos):
             ),
         }
     return grouped
-
-
-def _copy_articulated_state(state):
-    return ArticulatedState(
-        x_front=float(state.x_front),
-        y_front=float(state.y_front),
-        theta_front=float(state.theta_front),
-        theta_rear=float(state.theta_rear),
-        v=0.0,
-        phi_dot=0.0,
-    )
-
-
-class HardCaseReplayBuffer:
-    def __init__(self, capacity, tail_steps, replay_ratio, rng):
-        self.capacity = max(0, int(capacity))
-        self.tail_steps = max(1, int(tail_steps))
-        self.replay_ratio = float(np.clip(replay_ratio, 0.0, 1.0))
-        self.rng = rng
-        self._entries = []
-        self._next_index = 0
-
-    def __len__(self):
-        return len(self._entries)
-
-    def _append(self, entry):
-        if self.capacity <= 0:
-            return
-        if len(self._entries) < self.capacity:
-            self._entries.append(entry)
-            return
-        self._entries[self._next_index] = entry
-        self._next_index = (self._next_index + 1) % self.capacity
-
-    def record_failure(
-        self,
-        scene,
-        slot,
-        tail_states,
-        final_info,
-        reset_info,
-        stage,
-        episode_index,
-    ):
-        if self.capacity <= 0:
-            return 0
-        if bool(final_info.get("success", False)):
-            return 0
-        if bool(final_info.get("rs_latched", False)):
-            return 0
-        collision = bool(final_info.get("collision", False))
-        timeout = bool(final_info.get("timeout", False))
-        deadlock = bool(final_info.get("deadlock", False))
-        if not (collision or timeout or deadlock):
-            return 0
-        selected_states = list(tail_states)[-self.tail_steps:]
-        if not selected_states:
-            return 0
-        failure_type = str(final_info.get("failure_type", ""))
-        if not failure_type:
-            failure_type = "collision" if collision else ("deadlock" if deadlock else "timeout")
-        count = 0
-        for state in selected_states:
-            self._append(
-                {
-                    "scene": scene,
-                    "slot": slot,
-                    "state": _copy_articulated_state(state),
-                    "stage": int(stage),
-                    "episode": int(episode_index),
-                    "scene_seed": int(reset_info.get("scene_seed", -1)),
-                    "scenario_type": str(reset_info.get("scenario_type", "")),
-                    "task_family": str(reset_info.get("task_family", "")),
-                    "failure_type": failure_type,
-                }
-            )
-            count += 1
-        return count
-
-    def sample(self):
-        if not self._entries:
-            return None
-        if self.replay_ratio <= 0.0:
-            return None
-        if float(self.rng.random()) >= self.replay_ratio:
-            return None
-        index = int(self.rng.integers(0, len(self._entries)))
-        return self._entries[index]
 
 
 def _resolve_output_dir(output_dir, seed, timestamp=None):
@@ -1064,6 +987,7 @@ def _evaluate_policy_by_family(
     episodes_per_family,
     eval_modes=("no_guide",),
     scene_type_schedule=None,
+    split="eval",
 ):
     episodes_per_family = int(episodes_per_family)
     if episodes_per_family < MIN_EVAL_EPISODES_PER_FAMILY:
@@ -1087,7 +1011,8 @@ def _evaluate_policy_by_family(
         remainder = eval_pool_size % schedule_size
         if remainder:
             eval_pool_size += schedule_size - remainder
-    base_seed = ((int(seed) + 100_000) // eval_pool_size) * eval_pool_size
+    split = str(split)
+    base_seed = _scene_seed_base(seed, split)
     cuda_devices = []
     if agent.device.type == "cuda":
         cuda_devices = [
@@ -1110,6 +1035,7 @@ def _evaluate_policy_by_family(
             use_teacher_reward=use_teacher_reward,
             enable_offpath_reset=False,
             enable_failure_aggregation=False,
+            scene_refresh_enabled=False,
             enable_dwa_recovery=bool(enable_dwa),
             dwa_recovery_mode="teacher_override",
             dwa_override_policy_action=bool(enable_dwa),
@@ -1124,15 +1050,18 @@ def _evaluate_policy_by_family(
                 multi_pool = MultiStageScenePool(
                     pool_size=eval_pool_size,
                     base_seed=base_seed,
+                    split=split,
                     scene_config=scene_config,
                     family_schedule=TASK_FAMILIES,
                     scene_type_schedule=scene_type_schedule,
+                    scene_refresh_enabled=False,
                 )
             env = LocalParkingEnv(
                 config=eval_config,
                 scene_config=scene_config,
                 seed=base_seed,
                 multi_stage_pool=multi_pool,
+                scene_split=split,
             )
             if multi_pool is not None:
                 env.set_active_stage(stage)
@@ -1170,6 +1099,10 @@ def _evaluate_policy_by_family(
                     done = terminated or truncated
                 outcomes_by_group[group_key].append(
                     {
+                        "split": str(reset_info.get("split", split)),
+                        "seed_base": int(reset_info.get("seed_base", base_seed)),
+                        "scene_seed": int(reset_info.get("scene_seed", -1)),
+                        "stage": int(stage),
                         "success": bool(final_info["success"]),
                         "collision": bool(final_info["collision"]),
                         "timeout": bool(final_info["timeout"]),
@@ -1195,6 +1128,12 @@ def _evaluate_policy_by_family(
                             reset_info.get("requested_scene_type", scene_type)
                         ),
                         "task_family": family,
+                        "scene_pool_index": int(
+                            reset_info.get("scene_pool_index", -1)
+                        ),
+                        "scene_config_hash": str(
+                            reset_info.get("scene_config_hash", "")
+                        ),
                     }
                 )
             mode = "deterministic" if deterministic else "stochastic"
@@ -1254,6 +1193,7 @@ def _evaluate_policy_by_family(
             all_outcomes = []
             for scene_type, family in group_keys:
                 all_outcomes.extend(outcomes_by_group.get((scene_type, family), ()))
+            mode_results["{}_episodes".format(mode)] = list(all_outcomes)
             mode_results["{}_summary".format(mode)] = _summarize_eval_outcomes(
                 all_outcomes
             )
@@ -1288,6 +1228,9 @@ def _evaluate_policy_by_family(
     results["timeout_rate"] = float(deterministic_summary.get("timeout_rate", 0.0))
     results["deadlock_rate"] = float(deterministic_summary.get("deadlock_rate", 0.0))
     results["stage"] = int(stage)
+    results["split"] = split
+    results["seed_base"] = int(base_seed)
+    results["test_seed_base"] = int(_scene_seed_base(seed, "test"))
     results["episodes_per_family"] = episodes_per_family
     results["eval_modes"] = list(eval_modes)
     results["scene_type_schedule"] = list(scene_type_schedule)
@@ -1303,6 +1246,7 @@ def _evaluate_policy_across_stages(
     episodes_per_family,
     eval_modes=("no_guide",),
     scene_type_schedule=None,
+    split="eval",
 ):
     scene_type_schedule = tuple(scene_type_schedule or ())
     if not scene_type_schedule:
@@ -1316,10 +1260,11 @@ def _evaluate_policy_across_stages(
             env_config=env_config,
             scene_config=scene_config,
             stage=int(stage),
-            seed=int(seed) + 10_000 * int(stage),
+            seed=int(seed),
             episodes_per_family=episodes_per_family,
             eval_modes=eval_modes,
             scene_type_schedule=scene_type_schedule,
+            split=split,
         )
         stage_results[str(int(stage))] = result
 
@@ -1330,10 +1275,19 @@ def _evaluate_policy_across_stages(
 
     aggregate = {
         "stages": stage_results,
+        "split": str(split),
+        "seed_base": int(_scene_seed_base(seed, split)),
+        "eval_seed_base": int(_scene_seed_base(seed, "eval")),
+        "test_seed_base": int(_scene_seed_base(seed, "test")),
         "eval_stages": [int(stage) for stage in stages],
         "episodes_per_family": int(episodes_per_family),
         "eval_modes": list(eval_modes),
         "scene_type_schedule": list(scene_type_schedule),
+        "evaluation_episodes": [
+            dict(item)
+            for result in stage_results.values()
+            for item in result.get("deterministic_episodes", ())
+        ],
         "deterministic": _aggregate_success_by_family(
             primary_stage_results,
             "deterministic",
@@ -1555,22 +1509,14 @@ def train(args):
         raise ValueError("--teacher-reward-clip must be positive")
     if args.no_guide_eval_interval < 0:
         raise ValueError("--no-guide-eval-interval must be non-negative")
-    if not 0.0 <= args.hard_case_replay_ratio <= 1.0:
-        raise ValueError("--hard-case-replay-ratio must be inside [0, 1]")
-    if args.hard_case_replay_capacity < 0:
-        raise ValueError("--hard-case-replay-capacity must be non-negative")
-    if args.hard_case_replay_tail_steps <= 0:
-        raise ValueError("--hard-case-replay-tail-steps must be positive")
-    if args.hard_case_replay_attempts <= 0:
-        raise ValueError("--hard-case-replay-attempts must be positive")
-    if args.hard_case_replay_xy_std < 0.0:
-        raise ValueError("--hard-case-replay-xy-std must be non-negative")
-    if args.hard_case_replay_heading_std_deg < 0.0:
-        raise ValueError("--hard-case-replay-heading-std-deg must be non-negative")
-    if args.hard_case_replay_phi_std_deg < 0.0:
-        raise ValueError("--hard-case-replay-phi-std-deg must be non-negative")
     if args.scene_pool_size <= 0:
         raise ValueError("--scene-pool-size must be positive")
+    if args.scene_refresh_interval <= 0:
+        raise ValueError("--scene-refresh-interval must be positive")
+    if args.scene_refresh_count < 0:
+        raise ValueError("--scene-refresh-count must be non-negative")
+    if args.scene_refresh_start_episode < 0:
+        raise ValueError("--scene-refresh-start-episode must be non-negative")
     if args.mask_cost_coef_final < 0.0:
         raise ValueError("--mask-cost-coef-final must be non-negative")
     if args.mask_degenerate_eps < 0.0:
@@ -1613,6 +1559,9 @@ def train(args):
         )
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    train_seed_base = _scene_seed_base(args.seed, "train")
+    eval_seed_base = _scene_seed_base(args.seed, "eval")
+    test_seed_base = _scene_seed_base(args.seed, "test")
     scene_config = replace(
         DEFAULT_SCENE_CONFIG,
         scene_type=str(args.scene_type),
@@ -1628,6 +1577,10 @@ def train(args):
         max_steps=args.max_steps,
         curriculum_stage=args.stage,
         scene_pool_size=args.scene_pool_size,
+        scene_refresh_enabled=bool(args.scene_refresh_enabled),
+        scene_refresh_interval=args.scene_refresh_interval,
+        scene_refresh_count=args.scene_refresh_count,
+        scene_refresh_start_episode=args.scene_refresh_start_episode,
         scene_family_schedule=family_schedule,
         use_hybrid_astar=bool(args.use_hybrid_astar),
         rs_potential_enabled=bool(args.enable_rs_potential),
@@ -1651,14 +1604,6 @@ def train(args):
         enable_offpath_reset=bool(args.enable_offpath_reset),
         enable_failure_aggregation=bool(args.enable_failure_aggregation),
         no_guide_eval_interval=args.no_guide_eval_interval,
-        hard_case_replay_enabled=not bool(args.disable_hard_case_replay),
-        hard_case_replay_ratio=args.hard_case_replay_ratio,
-        hard_case_replay_capacity=args.hard_case_replay_capacity,
-        hard_case_replay_tail_steps=args.hard_case_replay_tail_steps,
-        hard_case_replay_attempts=args.hard_case_replay_attempts,
-        hard_case_replay_xy_std=args.hard_case_replay_xy_std,
-        hard_case_replay_heading_std_deg=args.hard_case_replay_heading_std_deg,
-        hard_case_replay_phi_std_deg=args.hard_case_replay_phi_std_deg,
         mask_cost_coef_final=args.mask_cost_coef_final,
         disable_mask_observation=bool(args.disable_mask_observation),
         rear_lidar_observation_mode=str(args.rear_lidar_observation_mode),
@@ -1710,6 +1655,9 @@ def train(args):
     output_dir = _resolve_output_dir(args.output_dir, args.seed)
     os.makedirs(output_dir, exist_ok=True)
     args.output_dir = output_dir
+    args.train_seed_base = train_seed_base
+    args.eval_seed_base = eval_seed_base
+    args.test_seed_base = test_seed_base
     _write_config_snapshot(
         os.path.join(output_dir, "config.txt"),
         args,
@@ -1724,10 +1672,15 @@ def train(args):
     if curriculum:
         multi_pool = MultiStageScenePool(
             pool_size=env_config.scene_pool_size,
-            base_seed=args.seed,
+            base_seed=train_seed_base,
+            split="train",
             scene_config=scene_config,
             family_schedule=env_config.scene_family_schedule,
             scene_type_schedule=curriculum_scene_types,
+            scene_refresh_enabled=env_config.scene_refresh_enabled,
+            scene_refresh_interval=env_config.scene_refresh_interval,
+            scene_refresh_count=env_config.scene_refresh_count,
+            scene_refresh_start_episode=env_config.scene_refresh_start_episode,
         )
         if str(args.curriculum_mode) == "uniform":
             stage_selector = UniformStageSelector(seed=int(args.seed) + 3571)
@@ -1745,8 +1698,9 @@ def train(args):
         config=env_config,
         hybrid_planner=planner,
         scene_config=scene_config,
-        seed=args.seed,
+        seed=train_seed_base,
         multi_stage_pool=multi_pool,
+        scene_split="train",
     )
     if curriculum:
         env.set_active_stage(actual_stage)
@@ -1766,7 +1720,7 @@ def train(args):
         else None
     )
 
-    observation, reset_info = env.reset(seed=args.seed)
+    observation, reset_info = env.reset(seed=train_seed_base)
     global_step = 0
     episode_index = 0
     update_index = 0
@@ -1781,16 +1735,6 @@ def train(args):
     best_scores["checkpoint_selection_score"] = -float("inf")
     best_scores["stage3_no_latch_success"] = -float("inf")
     best_scores["stage4_recovery_success"] = -float("inf")
-    hard_case_replay = HardCaseReplayBuffer(
-        capacity=env_config.hard_case_replay_capacity
-        if bool(env_config.hard_case_replay_enabled)
-        else 0,
-        tail_steps=env_config.hard_case_replay_tail_steps,
-        replay_ratio=env_config.hard_case_replay_ratio
-        if bool(env_config.hard_case_replay_enabled)
-        else 0.0,
-        rng=np.random.default_rng(int(args.seed) + 97_531),
-    )
     start_time = time.perf_counter()
 
     while episode_index < args.total_episodes:
@@ -1816,7 +1760,6 @@ def train(args):
         previous_motion_gear = None
         final_info = None
         done = False
-        episode_tail_states = []
         episode_degenerate_mask = False
         episode_mask_floor_applied = False
         episode_collision_after_mask_floor = False
@@ -1885,9 +1828,6 @@ def train(args):
             episode_steps += 1
             episode_reward += float(reward)
             final_info = info
-            episode_tail_states.append(_copy_articulated_state(env.state))
-            if len(episode_tail_states) > env_config.hard_case_replay_tail_steps:
-                episode_tail_states.pop(0)
             last_done = done
 
         episode_index += 1
@@ -1918,15 +1858,7 @@ def train(args):
             reset_info.get("initial_mask_max_before_floor", 0.0)
         )
         rollout_completed.append(final_info)
-        hard_case_recorded_count = hard_case_replay.record_failure(
-            scene=env.scene,
-            slot=env.slot,
-            tail_states=episode_tail_states,
-            final_info=final_info,
-            reset_info=reset_info,
-            stage=actual_stage,
-            episode_index=episode_index,
-        )
+        scene_refresh_info = env.refresh_scene_pool(episode_index)
         episode_record = {
             "episode": episode_index,
             "global_step": global_step,
@@ -1943,12 +1875,39 @@ def train(args):
             "distance_to_goal": float(final_info["distance_to_goal"]),
             "scenario_type": reset_info.get("scenario_type", ""),
             "scene_seed": int(reset_info.get("scene_seed", -1)),
+            "split": str(reset_info.get("split", "train")),
+            "seed_base": int(reset_info.get("seed_base", train_seed_base)),
             "scene_type": str(reset_info.get("scene_type", "")),
             "requested_scene_type": str(
                 reset_info.get("requested_scene_type", reset_info.get("scene_type", ""))
             ),
+            "scene_pool_index": int(reset_info.get("scene_pool_index", -1)),
+            "scene_config_hash": str(reset_info.get("scene_config_hash", "")),
             "goal_orientation_mode": str(reset_info.get("goal_orientation_mode", "")),
             "task_family": task_family,
+            "scene_refresh_used": bool(
+                scene_refresh_info.get("scene_refresh_used", False)
+            ),
+            "scene_refresh_count": int(
+                scene_refresh_info.get("scene_refresh_count", 0)
+            ),
+            "refreshed_scene_seed": int(
+                scene_refresh_info.get("refreshed_scene_seed", -1)
+            ),
+            "refreshed_scene_seeds": list(
+                scene_refresh_info.get("refreshed_scene_seeds", ())
+            ),
+            "scene_pool_slot": int(scene_refresh_info.get("scene_pool_slot", -1)),
+            "scene_pool_slots": list(scene_refresh_info.get("scene_pool_slots", ())),
+            "scene_refresh_config_hash": str(
+                scene_refresh_info.get("scene_config_hash", "")
+            ),
+            "scene_refresh_failed_count": int(
+                scene_refresh_info.get("scene_refresh_failed_count", 0)
+            ),
+            "scene_refresh_error": str(
+                scene_refresh_info.get("scene_refresh_error", "")
+            ),
             "bay_count": int(reset_info.get("bay_count", 0)),
             "bay_width": float(reset_info.get("bay_width", 0.0)),
             "bay_depth": float(reset_info.get("bay_depth", 0.0)),
@@ -1981,23 +1940,6 @@ def train(args):
                 reset_info.get("scene_complexity_bucket", "")
             ),
             "difficulty_label": str(reset_info.get("difficulty_label", "")),
-            "hard_case_replay_attempted": bool(
-                reset_info.get("hard_case_replay_attempted", False)
-            ),
-            "hard_case_replay_used": bool(
-                reset_info.get("hard_case_replay_used", False)
-            ),
-            "hard_case_replay_source_episode": int(
-                reset_info.get("hard_case_replay_source_episode", -1)
-            ),
-            "hard_case_replay_source_stage": int(
-                reset_info.get("hard_case_replay_source_stage", -1)
-            ),
-            "hard_case_replay_source_failure": str(
-                reset_info.get("hard_case_replay_source_failure", "")
-            ),
-            "hard_case_replay_recorded_count": int(hard_case_recorded_count),
-            "hard_case_replay_buffer_size": int(len(hard_case_replay)),
             "nominal_target_collision": bool(
                 reset_info.get("nominal_target_collision", False)
             ),
@@ -2389,13 +2331,7 @@ def train(args):
             env.set_active_stage(actual_stage)
 
         if episode_index < args.total_episodes:
-            replay_case = hard_case_replay.sample()
-            if replay_case is not None:
-                replay_stage = int(replay_case.get("stage", actual_stage))
-                if curriculum and replay_stage != int(actual_stage):
-                    actual_stage = replay_stage
-                    env.set_active_stage(actual_stage)
-            observation, reset_info = env.reset(replay_case=replay_case)
+            observation, reset_info = env.reset()
 
     agent.save(
         os.path.join(output_dir, "checkpoint_final.pt"),
@@ -2525,6 +2461,38 @@ def main():
         type=int,
         default=DEFAULT_ENV_CONFIG.scene_pool_size,
         help="Cached scene variants per stage/scene type",
+    )
+    scene_refresh_group = parser.add_mutually_exclusive_group()
+    scene_refresh_group.add_argument(
+        "--enable-scene-refresh",
+        dest="scene_refresh_enabled",
+        action="store_true",
+        default=DEFAULT_ENV_CONFIG.scene_refresh_enabled,
+        help="Enable fixed-interval rolling replacement of train cached scenes",
+    )
+    scene_refresh_group.add_argument(
+        "--disable-scene-refresh",
+        dest="scene_refresh_enabled",
+        action="store_false",
+        help="Disable fixed-interval rolling scene replacement",
+    )
+    parser.add_argument(
+        "--scene-refresh-interval",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.scene_refresh_interval,
+        help="Completed episodes between rolling train-scene refreshes",
+    )
+    parser.add_argument(
+        "--scene-refresh-count",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.scene_refresh_count,
+        help="Number of cached train scene slots replaced at each refresh",
+    )
+    parser.add_argument(
+        "--scene-refresh-start-episode",
+        type=int,
+        default=DEFAULT_ENV_CONFIG.scene_refresh_start_episode,
+        help="First completed episode eligible for rolling train-scene refresh",
     )
     parser.add_argument("--use-hybrid-astar", action="store_true")
     _add_config_bool_argument(
@@ -2782,48 +2750,6 @@ def main():
         type=int,
         default=DEFAULT_ENV_CONFIG.no_guide_eval_interval,
         help="Optional extra no-guide evaluation interval; 0 disables the extra trigger",
-    )
-    parser.add_argument(
-        "--disable-hard-case-replay",
-        action="store_true",
-        help="Disable automatic replay resets from no-RS collision/timeout failures",
-    )
-    parser.add_argument(
-        "--hard-case-replay-ratio",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_ratio,
-        help="Probability of sampling a reset from the hard-case replay buffer",
-    )
-    parser.add_argument(
-        "--hard-case-replay-capacity",
-        type=int,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_capacity,
-    )
-    parser.add_argument(
-        "--hard-case-replay-tail-steps",
-        type=int,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_tail_steps,
-        help="Number of terminal tail states recorded from each eligible failure",
-    )
-    parser.add_argument(
-        "--hard-case-replay-attempts",
-        type=int,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_attempts,
-    )
-    parser.add_argument(
-        "--hard-case-replay-xy-std",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_xy_std,
-    )
-    parser.add_argument(
-        "--hard-case-replay-heading-std-deg",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_heading_std_deg,
-    )
-    parser.add_argument(
-        "--hard-case-replay-phi-std-deg",
-        type=float,
-        default=DEFAULT_ENV_CONFIG.hard_case_replay_phi_std_deg,
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)

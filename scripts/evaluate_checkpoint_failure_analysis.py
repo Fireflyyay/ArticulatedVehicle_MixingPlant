@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 from config import DEFAULT_ENV_CONFIG, DEFAULT_SCENE_CONFIG
 from env.local_parking_env import LocalParkingEnv
+from env.mixing_plant_scene import SUPPORTED_SCENE_TYPES
 from env.vehicle import ArticulatedState
 from model.continuous_ppo import ContinuousPPOAgent
 from train.curriculum import MultiStageScenePool
@@ -77,7 +78,7 @@ def _plot_bay(ax, bay):
 # ---------------------------------------------------------------------------
 #  helpers
 # ---------------------------------------------------------------------------
-def _eval_config():
+def _eval_config(scene_type=None):
     return replace(
         DEFAULT_ENV_CONFIG,
         use_hybrid_astar=False,
@@ -86,6 +87,9 @@ def _eval_config():
         use_teacher_reward=False,
         enable_offpath_reset=False,
         enable_failure_aggregation=False,
+    ), replace(
+        DEFAULT_SCENE_CONFIG,
+        scene_type=str(scene_type) if scene_type else DEFAULT_SCENE_CONFIG.scene_type,
     )
 
 
@@ -269,6 +273,7 @@ def evaluate_checkpoint_with_failures(
     stages,
     output_dir,
     show_lidar=False,
+    scene_type=None,
 ):
     episodes_per_family = int(episodes_per_family)
     if episodes_per_family < 20:
@@ -290,15 +295,16 @@ def evaluate_checkpoint_with_failures(
     agent.network.load_state_dict(payload["network"])
     agent.network.eval()
 
-    mode_config = _eval_config()
+    mode_config, scene_config = _eval_config(scene_type=scene_type)
     multi_pool = MultiStageScenePool(
         pool_size=mode_config.scene_pool_size,
         base_seed=int(seed),
-        scene_config=DEFAULT_SCENE_CONFIG,
+        scene_config=scene_config,
         family_schedule=mode_config.scene_family_schedule,
     )
     env = LocalParkingEnv(
         config=mode_config,
+        scene_config=scene_config,
         multi_stage_pool=multi_pool,
         seed=int(seed),
     )
@@ -1290,6 +1296,12 @@ def main():
         "--show-lidar", action="store_true",
         help="Overlay LiDAR rays on failure images",
     )
+    parser.add_argument(
+        "--scene-type",
+        default=None,
+        choices=SUPPORTED_SCENE_TYPES,
+        help="Scene type to evaluate (default: DEFAULT_SCENE_CONFIG.scene_type)",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.checkpoint):
@@ -1304,6 +1316,7 @@ def main():
         stages=args.stages,
         output_dir=args.output_dir,
         show_lidar=args.show_lidar,
+        scene_type=args.scene_type,
     )
 
 

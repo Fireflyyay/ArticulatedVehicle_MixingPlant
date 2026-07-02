@@ -3,13 +3,14 @@ from dataclasses import replace
 from datetime import datetime
 import os
 
-from config import DEFAULT_ENV_CONFIG, DEFAULT_PPO_CONFIG
+from config import DEFAULT_ENV_CONFIG, DEFAULT_PPO_CONFIG, DEFAULT_SCENE_CONFIG
 from env.local_parking_env import LocalParkingEnv
+from model.continuous_ppo import ContinuousPPOAgent
 from train.train_local_parking import (
-    HardCaseReplayBuffer,
     REPO_ROOT,
     _add_config_bool_argument,
     _checkpoint_selection_score,
+    _evaluate_policy_by_family,
     _resolve_output_dir,
     _update_reward_plot,
     _weighted_checkpoint_score,
@@ -158,35 +159,37 @@ def test_checkpoint_selection_score_prefers_scene_type_equal_slices():
     assert score == 0.58
 
 
-def test_hard_case_replay_buffer_records_no_rs_collision_tail(synthetic_action_mask):
-    env = LocalParkingEnv(
-        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=3),
-        action_mask=synthetic_action_mask,
-        seed=17,
-    )
-    _, reset_info = env.reset(seed=17)
-    buffer = HardCaseReplayBuffer(
-        capacity=4,
-        tail_steps=2,
-        replay_ratio=1.0,
-        rng=np.random.default_rng(3),
+def test_evaluation_uses_eval_split_seed_namespace():
+    agent = ContinuousPPOAgent(device="cpu")
+    env_config = replace(
+        DEFAULT_ENV_CONFIG,
+        max_steps=1,
+        scene_pool_size=1,
+        scene_refresh_enabled=True,
+        scene_refresh_interval=1,
+        scene_refresh_count=1,
     )
 
-    recorded = buffer.record_failure(
-        scene=env.scene,
-        slot=env.slot,
-        tail_states=[env.state],
-        final_info={"success": False, "rs_latched": False, "collision": True},
-        reset_info=reset_info,
-        stage=3,
-        episode_index=9,
+    result = _evaluate_policy_by_family(
+        agent=agent,
+        env_config=env_config,
+        scene_config=DEFAULT_SCENE_CONFIG,
+        stage=1,
+        seed=5,
+        episodes_per_family=20,
+        eval_modes=("no_guide",),
+        scene_type_schedule=(DEFAULT_SCENE_CONFIG.scene_type,),
     )
-    sample = buffer.sample()
 
-    assert recorded == 1
-    assert len(buffer) == 1
-    assert sample["stage"] == 3
-    assert sample["failure_type"] == "collision"
+    assert result["split"] == "eval"
+    assert result["seed_base"] == 100_005
+    assert result["test_seed_base"] == 1_000_005
+    assert result["deterministic_episodes"]
+    assert all(item["split"] == "eval" for item in result["deterministic_episodes"])
+    assert all(
+        int(item["seed_base"]) == 100_005
+        for item in result["deterministic_episodes"]
+    )
 
 
 def test_default_ppo_stability_configuration():

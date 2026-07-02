@@ -8,16 +8,26 @@ class MultiStageScenePool:
         self,
         pool_size=16,
         base_seed=0,
+        split="train",
         scene_config=None,
         family_schedule=None,
         scene_type_schedule=None,
+        scene_refresh_enabled=False,
+        scene_refresh_interval=1000,
+        scene_refresh_count=1,
+        scene_refresh_start_episode=0,
     ):
         self._pools = {}
         self._pool_size = int(pool_size)
         self._base_seed = int(base_seed)
+        self._split = str(split)
         self._scene_config = scene_config
         self._family_schedule = family_schedule
         self._scene_type_schedule = scene_type_schedule
+        self._scene_refresh_enabled = bool(scene_refresh_enabled)
+        self._scene_refresh_interval = int(scene_refresh_interval)
+        self._scene_refresh_count = int(scene_refresh_count)
+        self._scene_refresh_start_episode = int(scene_refresh_start_episode)
 
     def pool_for(self, stage):
         stage = int(stage)
@@ -26,9 +36,14 @@ class MultiStageScenePool:
                 stage=stage,
                 pool_size=self._pool_size,
                 base_seed=self._base_seed,
+                split=self._split,
                 scene_config=self._scene_config,
                 family_schedule=self._family_schedule,
                 scene_type_schedule=self._scene_type_schedule,
+                scene_refresh_enabled=self._scene_refresh_enabled,
+                scene_refresh_interval=self._scene_refresh_interval,
+                scene_refresh_count=self._scene_refresh_count,
+                scene_refresh_start_episode=self._scene_refresh_start_episode,
             )
         return self._pools[stage]
 

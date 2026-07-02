@@ -218,6 +218,135 @@ def test_scene_pool_uses_explicit_family_schedule_and_derived_seeds():
     assert seeds != [23 + index for index in range(4)]
 
 
+def test_scene_pool_is_reproducible_without_refresh():
+    first = CachedScenePool(
+        stage=1,
+        pool_size=2,
+        base_seed=23,
+        family_schedule=("head_in",),
+        scene_refresh_enabled=False,
+    )
+    second = CachedScenePool(
+        stage=1,
+        pool_size=2,
+        base_seed=23,
+        family_schedule=("head_in",),
+        scene_refresh_enabled=False,
+    )
+
+    assert first.maybe_refresh(1)["scene_refresh_used"] is False
+    assert [
+        int(first.get(index).metadata["seed"]) for index in range(2)
+    ] == [
+        int(second.get(index).metadata["seed"]) for index in range(2)
+    ]
+    assert [
+        str(first.get(index).metadata["scene_config_hash"]) for index in range(2)
+    ] == [
+        str(second.get(index).metadata["scene_config_hash"]) for index in range(2)
+    ]
+
+
+def test_scene_pool_refresh_replaces_slot_at_interval():
+    pool = CachedScenePool(
+        stage=1,
+        pool_size=2,
+        base_seed=29,
+        family_schedule=("head_in",),
+        scene_refresh_enabled=True,
+        scene_refresh_interval=2,
+        scene_refresh_count=1,
+        scene_refresh_start_episode=0,
+    )
+    before = [int(pool.get(index).metadata["seed"]) for index in range(2)]
+
+    early = pool.maybe_refresh(1)
+    info = pool.maybe_refresh(2)
+    after = [int(pool.get(index).metadata["seed"]) for index in range(2)]
+
+    assert early["scene_refresh_used"] is False
+    assert info["scene_refresh_used"] is True
+    assert info["scene_refresh_count"] == 1
+    assert info["scene_pool_slot"] in (0, 1)
+    assert info["refreshed_scene_seed"] in after
+    assert before != after
+
+
+def test_eval_and_test_scene_pools_do_not_refresh():
+    eval_pool = CachedScenePool(
+        stage=1,
+        pool_size=1,
+        base_seed=100023,
+        split="eval",
+        family_schedule=("head_in",),
+        scene_refresh_enabled=True,
+        scene_refresh_interval=1,
+        scene_refresh_count=1,
+    )
+    test_pool = CachedScenePool(
+        stage=1,
+        pool_size=1,
+        base_seed=1000023,
+        split="test",
+        family_schedule=("head_in",),
+        scene_refresh_enabled=True,
+        scene_refresh_interval=1,
+        scene_refresh_count=1,
+    )
+    eval_seed = int(eval_pool.get(0).metadata["seed"])
+    test_seed = int(test_pool.get(0).metadata["seed"])
+
+    assert eval_pool.maybe_refresh(1)["scene_refresh_used"] is False
+    assert test_pool.maybe_refresh(1)["scene_refresh_used"] is False
+    assert int(eval_pool.get(0).metadata["seed"]) == eval_seed
+    assert int(test_pool.get(0).metadata["seed"]) == test_seed
+
+
+def test_train_eval_test_scene_seed_namespaces_do_not_overlap():
+    train_base = 7
+    eval_base = train_base + 100_000
+    test_base = train_base + 1_000_000
+    train_seeds = set()
+    eval_seeds = set()
+    test_seeds = set()
+    for stage in (1, 2, 3, 4):
+        for pool_index in range(4):
+            train_seeds.add(
+                derive_scene_seed(
+                    train_base,
+                    pool_index,
+                    "head_in",
+                    stage,
+                    split="train",
+                    scene_type=DEFAULT_SCENE_CONFIG.scene_type,
+                )
+            )
+            eval_seeds.add(
+                derive_scene_seed(
+                    eval_base,
+                    pool_index,
+                    "head_in",
+                    stage,
+                    split="eval",
+                    scene_type=DEFAULT_SCENE_CONFIG.scene_type,
+                )
+            )
+            test_seeds.add(
+                derive_scene_seed(
+                    test_base,
+                    pool_index,
+                    "head_in",
+                    stage,
+                    split="test",
+                    scene_type=DEFAULT_SCENE_CONFIG.scene_type,
+                )
+            )
+
+    assert train_seeds.isdisjoint(eval_seeds)
+    assert train_seeds.isdisjoint(test_seeds)
+    assert eval_seeds.isdisjoint(test_seeds)
+
+
 def test_scene_pool_expands_default_schedule_to_balanced_family_counts():
     pool = CachedScenePool(
         stage=1,
@@ -733,3 +862,36 @@ def test_reset_replaces_scene_seed_after_recovery_sampling_failure(
     assert info["reset_scene_last_failed_seed"] == failed_seed
     assert info["scene_seed"] != failed_seed
     assert info["reset_scene_success_seed"] == info["scene_seed"]
+
+
+def test_scene_refresh_invalidates_reset_candidate_cache(synthetic_action_mask):
+    env = LocalParkingEnv(
+        config=replace(
+            DEFAULT_ENV_CONFIG,
+            curriculum_stage=1,
+            scene_pool_size=1,
+            scene_family_schedule=("head_in",),
+            scene_refresh_enabled=True,
+            scene_refresh_interval=1,
+            scene_refresh_count=1,
+            scene_refresh_start_episode=0,
+        ),
+        action_mask=synthetic_action_mask,
+        seed=43,
+    )
+    _, first_info = env.reset(seed=43)
+    old_seed = int(first_info["scene_seed"])
+    assert env._reset_candidate_cache
+    assert any(int(key[0]) == old_seed for key in env._reset_candidate_cache)
+
+    refresh_info = env.refresh_scene_pool(1)
+    new_seed = int(refresh_info["refreshed_scene_seed"])
+
+    assert refresh_info["scene_refresh_used"] is True
+    assert new_seed != old_seed
+    assert not any(int(key[0]) == old_seed for key in env._reset_candidate_cache)
+    assert any(int(key[0]) == new_seed for key in env._reset_candidate_cache)
+
+    _, second_info = env.reset()
+    assert int(second_info["scene_seed"]) == new_seed
+    assert not any(int(key[0]) == old_seed for key in env._reset_candidate_cache)

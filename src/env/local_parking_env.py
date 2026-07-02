@@ -68,6 +68,7 @@ class LocalParkingEnv:
         scene_config=DEFAULT_SCENE_CONFIG,
         seed=0,
         multi_stage_pool=None,
+        scene_split="train",
     ):
         self.config = config
         self.vehicle_params = vehicle_params
@@ -95,8 +96,17 @@ class LocalParkingEnv:
                 stage=config.curriculum_stage,
                 pool_size=config.scene_pool_size,
                 base_seed=int(seed),
+                split=scene_split,
                 scene_config=scene_config,
                 family_schedule=config.scene_family_schedule,
+                scene_refresh_enabled=getattr(config, "scene_refresh_enabled", False),
+                scene_refresh_interval=getattr(config, "scene_refresh_interval", 1000),
+                scene_refresh_count=getattr(config, "scene_refresh_count", 1),
+                scene_refresh_start_episode=getattr(
+                    config,
+                    "scene_refresh_start_episode",
+                    0,
+                ),
             )
         self.hybrid_reward = OptionalHybridAStarReward(
             planner=hybrid_planner if config.use_hybrid_astar else None,
@@ -194,6 +204,118 @@ class LocalParkingEnv:
             raise RuntimeError("set_active_stage requires a MultiStageScenePool")
         self._active_stage = stage
         self.scene_pool = self._multi_pool.pool_for(stage)
+
+    def _reset_candidate_cache_key(self, stage):
+        metadata = self.scene.metadata
+        scene_type = str(
+            metadata.get("requested_scene_type", metadata.get("scene_type", ""))
+        )
+        return (
+            int(metadata["seed"]),
+            int(stage),
+            scene_type,
+            self._task_family_from_scene(),
+            str(metadata.get("scene_config_hash", "")),
+        )
+
+    def invalidate_reset_candidate_cache(self, scene_seed=None, scene_pool_slot=None):
+        remove_keys = []
+        for key, bank in self._reset_candidate_cache.items():
+            key_seed = int(key[0]) if key else -1
+            bank_slot = int(bank.get("scene_pool_slot", -1))
+            if scene_seed is not None and key_seed == int(scene_seed):
+                remove_keys.append(key)
+                continue
+            if scene_pool_slot is not None and bank_slot == int(scene_pool_slot):
+                remove_keys.append(key)
+        for key in remove_keys:
+            self._reset_candidate_cache.pop(key, None)
+        if remove_keys:
+            self._reset_candidate_bucket_counts = dict(
+                (key, value)
+                for key, value in self._reset_candidate_bucket_counts.items()
+                if key[0] not in remove_keys
+            )
+
+    def _rule_scene_has_reset_viability(self, stage):
+        candidates = tuple(self.scene.metadata.get("initial_pose_candidates", ()))
+        if not candidates:
+            return False
+        ensure_feasible = bool(self.scene.metadata.get("ensure_feasible_reset", True))
+        max_attempts = max(
+            1,
+            int(self.scene.metadata.get("max_pose_sampling_attempts", 32)),
+        )
+        for candidate in candidates[:max_attempts]:
+            state, region, _ = self._rule_scene_candidate_state(candidate, 0)
+            if not self._rule_scene_heading_valid(state, region):
+                continue
+            separation_valid, _ = self._rule_scene_separation_valid(state)
+            if not separation_valid:
+                continue
+            if ensure_feasible:
+                valid, _, _ = self._reset_candidate_viability(state, stage=stage)
+            else:
+                valid = not self._state_collides(state)
+            if valid:
+                return True
+        return False
+
+    def _scene_has_reset_viability(self, scene_slot, scene):
+        del scene_slot
+        old_scene = self.scene
+        old_slot = self.slot
+        try:
+            self.scene = scene
+            self.slot = scene.slot
+            stage = int(np.clip(self._active_stage, 1, 4))
+            if self._is_rule_scene():
+                return self._rule_scene_has_reset_viability(stage)
+            goal = self.slot
+            axis = np.asarray(
+                [math.cos(goal.theta_goal), math.sin(goal.theta_goal)],
+                dtype=np.float64,
+            )
+            normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+            bank = self._build_reset_candidate_bank(stage, goal, axis, normal)
+            return int(bank.get("valid_count", 0)) > 0
+        finally:
+            self.scene = old_scene
+            self.slot = old_slot
+
+    def refresh_scene_pool(self, episode_index):
+        refresh = getattr(self.scene_pool, "maybe_refresh", None)
+        if refresh is None:
+            return {
+                "scene_refresh_used": False,
+                "scene_refresh_count": 0,
+                "refreshed_scene_seed": -1,
+                "refreshed_scene_seeds": [],
+                "scene_pool_slot": -1,
+                "scene_pool_slots": [],
+                "scene_config_hash": "",
+                "scene_refresh_failed_count": 0,
+                "scene_refresh_error": "",
+            }
+        before = dict(
+            (
+                int(index),
+                int(scene.metadata.get("seed", -1)),
+            )
+            for index, scene in enumerate(getattr(self.scene_pool, "_scenes", ()))
+        )
+        diagnostics = refresh(
+            episode_index,
+            validate_callback=self._scene_has_reset_viability,
+        )
+        for slot in diagnostics.get("scene_pool_slots", ()):
+            old_seed = before.get(int(slot))
+            if old_seed is not None:
+                self.invalidate_reset_candidate_cache(
+                    scene_seed=old_seed,
+                    scene_pool_slot=int(slot),
+                )
+        return diagnostics
 
     def _state_collides(self, state):
         front_box, rear_box = self.vehicle_model.body_boxes(state)
@@ -792,13 +914,14 @@ class LocalParkingEnv:
 
     def _build_reset_candidate_bank(self, stage, goal, axis, normal):
         scene_seed = int(self.scene.metadata["seed"])
-        cache_key = (scene_seed, int(stage))
+        cache_key = self._reset_candidate_cache_key(stage)
         cached = self._reset_candidate_cache.get(cache_key)
         if cached is not None:
             return cached
 
         bank = {
             "cache_key": cache_key,
+            "scene_pool_slot": int(self.scene.metadata.get("scene_pool_index", -1)),
             "size": 0,
             "candidates": [],
             "reject_counts": self._reset_reject_counts(),
@@ -971,159 +1094,6 @@ class LocalParkingEnv:
         valid, _, _ = self._reset_candidate_viability(state, stage=4)
         return bool(valid)
 
-    def _sample_hard_case_replay_state(self, replay_case):
-        diagnostics = {
-            "hard_case_replay_attempted": True,
-            "hard_case_replay_used": False,
-            "hard_case_replay_reject_reason": "",
-        }
-        if replay_case is None:
-            diagnostics["hard_case_replay_attempted"] = False
-            return None, "", False, diagnostics
-        scene = replay_case.get("scene")
-        state = replay_case.get("state")
-        if scene is None or state is None:
-            diagnostics["hard_case_replay_reject_reason"] = "missing_scene_or_state"
-            return None, "", False, diagnostics
-
-        self.scene = scene
-        self.slot = replay_case.get("slot", scene.slot)
-        self.step_count = 0
-        stage = int(np.clip(replay_case.get("stage", self._active_stage), 1, 4))
-        attempts = max(1, int(self.config.hard_case_replay_attempts))
-        xy_std = float(self.config.hard_case_replay_xy_std)
-        heading_std = math.radians(float(self.config.hard_case_replay_heading_std_deg))
-        phi_std = math.radians(float(self.config.hard_case_replay_phi_std_deg))
-        reject_counts = {
-            "collision": 0,
-            "mask": 0,
-            "clearance": 0,
-            "recovery_clearance": 0,
-            "recovery_lidar": 0,
-            "target_access": 0,
-        }
-        last_reason = ""
-        last_metrics = {}
-        for attempt_index in range(attempts):
-            if attempt_index == 0:
-                dx = 0.0
-                dy = 0.0
-                dtheta = 0.0
-                dphi = 0.0
-            else:
-                dx = float(self.rng.normal(0.0, xy_std))
-                dy = float(self.rng.normal(0.0, xy_std))
-                dtheta = float(self.rng.normal(0.0, heading_std))
-                dphi = float(self.rng.normal(0.0, phi_std))
-            phi = float(
-                np.clip(
-                    state.phi + dphi,
-                    -self.vehicle_params.phi_max,
-                    self.vehicle_params.phi_max,
-                )
-            )
-            theta_front = float(wrap_to_pi(state.theta_front + dtheta))
-            candidate = ArticulatedState(
-                x_front=float(state.x_front + dx),
-                y_front=float(state.y_front + dy),
-                theta_front=theta_front,
-                theta_rear=float(wrap_to_pi(theta_front - phi)),
-            )
-            valid, reject_reason, metrics = self._reset_candidate_viability(
-                candidate,
-                stage=stage,
-            )
-            if not valid:
-                reject_counts[reject_reason] = reject_counts.get(reject_reason, 0) + 1
-                last_reason = str(reject_reason)
-                last_metrics = metrics
-                continue
-            scenario = "{}_hard_case_replay".format(
-                str(replay_case.get("scenario_type", "hard_case"))
-            )
-            distance = math.hypot(
-                candidate.x_front - self.slot.x_goal,
-                candidate.y_front - self.slot.y_goal,
-            )
-            diagnostics.update(
-                {
-                    "hard_case_replay_used": True,
-                    "hard_case_replay_source_episode": int(
-                        replay_case.get("episode", -1)
-                    ),
-                    "hard_case_replay_source_stage": int(stage),
-                    "hard_case_replay_source_scene_seed": int(
-                        replay_case.get("scene_seed", self.scene.metadata["seed"])
-                    ),
-                    "hard_case_replay_source_failure": str(
-                        replay_case.get("failure_type", "")
-                    ),
-                    "hard_case_replay_attempt_count": int(attempt_index + 1),
-                    "initial_distance_min": float(distance),
-                    "initial_distance_max": float(distance),
-                    "initial_lateral_range": 0.0,
-                    "initial_heading_range_deg": float(
-                        math.degrees(abs(dtheta))
-                    ),
-                    "initial_phi_range_deg": float(math.degrees(abs(dphi))),
-                    "reset_candidate_reject_collision_count": int(
-                        reject_counts.get("collision", 0)
-                    ),
-                    "reset_candidate_reject_mask_count": int(
-                        reject_counts.get("mask", 0)
-                    ),
-                    "reset_candidate_reject_clearance_count": int(
-                        reject_counts.get("clearance", 0)
-                    ),
-                    "reset_candidate_reject_recovery_clearance_count": int(
-                        reject_counts.get("recovery_clearance", 0)
-                    ),
-                    "reset_candidate_reject_recovery_lidar_count": int(
-                        reject_counts.get("recovery_lidar", 0)
-                    ),
-                    "reset_candidate_reject_target_access_count": int(
-                        reject_counts.get("target_access", 0)
-                    ),
-                    "reset_initial_mask_max": float(metrics.get("mask_max", 0.0)),
-                    "reset_initial_mask_degenerate": bool(
-                        metrics.get("mask_degenerate", False)
-                    ),
-                    "reset_initial_mask_all_zero": bool(
-                        metrics.get("mask_all_zero_before_floor", False)
-                    ),
-                    "reset_initial_mask_required": float(
-                        metrics.get("mask_required", self._reset_mask_threshold(stage))
-                    ),
-                    "reset_initial_body_clearance_m": float(
-                        metrics.get("body_clearance", 0.0)
-                    ),
-                    "reset_initial_min_lidar_m": float(
-                        metrics.get("min_lidar", 0.0)
-                    ),
-                    "initial_task_family": str(
-                        replay_case.get("task_family", self._task_family_from_scene())
-                    ),
-                }
-            )
-            return candidate, scenario, False, diagnostics
-
-        diagnostics.update(
-            {
-                "hard_case_replay_reject_reason": last_reason,
-                "hard_case_replay_attempt_count": int(attempts),
-                "hard_case_replay_last_mask_max": float(
-                    last_metrics.get("mask_max", 0.0)
-                ),
-                "hard_case_replay_last_body_clearance_m": float(
-                    last_metrics.get("body_clearance", 0.0)
-                ),
-                "hard_case_replay_last_min_lidar_m": float(
-                    last_metrics.get("min_lidar", 0.0)
-                ),
-            }
-        )
-        return None, "", False, diagnostics
-
     def _task_family_from_scene(self):
         task_family = str(self.scene.metadata.get("task_family", ""))
         if task_family in TASK_FAMILIES:
@@ -1201,13 +1171,9 @@ class LocalParkingEnv:
             self.slot,
             self.vehicle_model,
         )
-        hard_case_replay_used = bool(
-            self.initial_sampling_diagnostics.get("hard_case_replay_used", False)
-        )
         if (
             bool(self.config.enable_offpath_reset)
             and trajectory.reward_available
-            and not hard_case_replay_used
         ):
             offpath_state, offpath_reason = self.hope_teacher.sample_offpath_state(
                 trajectory,
@@ -1989,80 +1955,70 @@ class LocalParkingEnv:
             "prev_gear_in_obs": float(new_prev_gear_in_obs),
         }
 
-    def reset(self, seed=None, replay_case=None):
+    def reset(self, seed=None):
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
-        replay_state, replay_scenario, replay_fallback, replay_diagnostics = (
-            self._sample_hard_case_replay_state(replay_case)
+        max_scene_attempts = max(
+            1,
+            int(getattr(self.config, "reset_scene_retry_count", 1)),
         )
-        if replay_state is not None:
-            self.state = replay_state
-            scenario_type = replay_scenario
-            fallback_used = replay_fallback
-            self.initial_sampling_diagnostics = dict(replay_diagnostics)
-            self.episode_index += 1
-            scene_failures = []
-        else:
-            max_scene_attempts = max(
-                1,
-                int(getattr(self.config, "reset_scene_retry_count", 1)),
-            )
-            start_episode_index = int(self.episode_index)
-            scene_failures = []
-            last_error = None
-            for _ in range(max_scene_attempts):
-                scene_episode_index = int(self.episode_index)
-                self.scene = self.scene_pool.get(scene_episode_index)
-                self.slot = self.scene.slot
-                self.step_count = 0
-                try:
-                    self.state, scenario_type, fallback_used = (
-                        self._sample_initial_state()
-                    )
-                except ResetInitialStateError as exc:
-                    last_error = exc
-                    failed_seed = int(self.scene.metadata["seed"])
-                    failed_family = self._task_family_from_scene()
-                    scene_failures.append(
-                        {
-                            "seed": failed_seed,
-                            "task_family": failed_family,
-                            "requested_scene_type": str(
-                                self.scene.metadata.get("requested_scene_type", "")
-                            ),
-                            "reason": str(exc),
-                        }
-                    )
-                    replace_scene = getattr(self.scene_pool, "replace", None)
-                    if replace_scene is None:
-                        self.episode_index = scene_episode_index + 1
-                        continue
-                    try:
-                        replace_scene(
-                            scene_episode_index,
-                            task_family=failed_family,
-                        )
-                    except RuntimeError as replace_exc:
-                        last_error = replace_exc
-                        self.episode_index = scene_episode_index + 1
+        start_episode_index = int(self.episode_index)
+        scene_failures = []
+        last_error = None
+        for _ in range(max_scene_attempts):
+            scene_episode_index = int(self.episode_index)
+            self.scene = self.scene_pool.get(scene_episode_index)
+            self.slot = self.scene.slot
+            self.step_count = 0
+            try:
+                self.state, scenario_type, fallback_used = self._sample_initial_state()
+            except ResetInitialStateError as exc:
+                last_error = exc
+                failed_seed = int(self.scene.metadata["seed"])
+                failed_family = self._task_family_from_scene()
+                scene_failures.append(
+                    {
+                        "seed": failed_seed,
+                        "task_family": failed_family,
+                        "requested_scene_type": str(
+                            self.scene.metadata.get("requested_scene_type", "")
+                        ),
+                        "reason": str(exc),
+                    }
+                )
+                replace_scene = getattr(self.scene_pool, "replace", None)
+                if replace_scene is None:
+                    self.episode_index = scene_episode_index + 1
                     continue
-                self.episode_index = scene_episode_index + 1
-                break
-            else:
-                failed_seeds = ",".join(
-                    str(item["seed"]) for item in scene_failures[-5:]
-                )
-                raise RuntimeError(
-                    "reset viability failed after {} scene seeds from episode index {}; "
-                    "recent failed seeds [{}]; last failure: {}".format(
-                        len(scene_failures),
-                        start_episode_index,
-                        failed_seeds,
-                        last_error,
+                try:
+                    failed_slot = int(
+                        self.scene.metadata.get("scene_pool_index", -1)
                     )
+                    replace_scene(
+                        scene_episode_index,
+                        task_family=failed_family,
+                    )
+                    self.invalidate_reset_candidate_cache(
+                        scene_seed=failed_seed,
+                        scene_pool_slot=failed_slot,
+                    )
+                except RuntimeError as replace_exc:
+                    last_error = replace_exc
+                    self.episode_index = scene_episode_index + 1
+                continue
+            self.episode_index = scene_episode_index + 1
+            break
+        else:
+            failed_seeds = ",".join(str(item["seed"]) for item in scene_failures[-5:])
+            raise RuntimeError(
+                "reset viability failed after {} scene seeds from episode index {}; "
+                "recent failed seeds [{}]; last failure: {}".format(
+                    len(scene_failures),
+                    start_episode_index,
+                    failed_seeds,
+                    last_error,
                 )
-            if replay_diagnostics.get("hard_case_replay_attempted", False):
-                self.initial_sampling_diagnostics.update(replay_diagnostics)
+            )
         if scene_failures:
             last_failure = scene_failures[-1]
             self.initial_sampling_diagnostics.update(
@@ -2108,6 +2064,14 @@ class LocalParkingEnv:
         info = self._base_info(metrics)
         info["scenario_type"] = str(self.scenario_type)
         info["scene_seed"] = int(self.scene.metadata["seed"])
+        info["split"] = str(self.scene.metadata.get("scene_seed_split", "train"))
+        info["seed_base"] = int(self.scene.metadata.get("seed_base", 0))
+        info["scene_pool_index"] = int(
+            self.scene.metadata.get("scene_pool_index", -1)
+        )
+        info["scene_config_hash"] = str(
+            self.scene.metadata.get("scene_config_hash", "")
+        )
         info["goal_orientation_mode"] = str(
             self.scene.metadata.get("goal_orientation_mode", "")
         )
@@ -2183,6 +2147,11 @@ class LocalParkingEnv:
             "parked_vehicle_labels",
             "parked_vehicle_headings",
             "scene_generation_attempt_count",
+            "scene_seed_split",
+            "seed_base",
+            "scene_pool_index",
+            "scene_config_hash",
+            "scene_generation_index",
         ):
             if key in self.scene.metadata:
                 info[key] = self.scene.metadata[key]

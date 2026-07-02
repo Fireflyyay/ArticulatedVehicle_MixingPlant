@@ -1,5 +1,7 @@
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
+import hashlib
+import json
 import math
 from typing import Dict, List, Tuple
 
@@ -21,6 +23,11 @@ from env.vehicle import ArticulatedState, ArticulatedVehicleModel
 
 TASK_FAMILIES = ("head_in",)
 _TASK_FAMILY_TO_INDEX = dict((family, index) for index, family in enumerate(TASK_FAMILIES))
+_SEED_SPLIT_TO_INDEX = {
+    "train": 0,
+    "eval": 1,
+    "test": 2,
+}
 DEFAULT_SCENE_TYPES = ("default", "existing", "cached_rule_carved_mixing_plant")
 RULE_SCENE_TYPES = (
     "mixing_station_bay_corridor",
@@ -169,11 +176,55 @@ def family_to_goal_mode(task_family):
     return "head_in"
 
 
-def derive_scene_seed(base_seed, pool_index, task_family, stage):
+def normalize_seed_split(split):
+    split = str(split)
+    if split not in _SEED_SPLIT_TO_INDEX:
+        raise ValueError(
+            "unsupported scene seed split {}; expected one of {}".format(
+                split,
+                sorted(_SEED_SPLIT_TO_INDEX),
+            )
+        )
+    return split
+
+
+def _stable_token32(value):
+    digest = hashlib.blake2s(
+        str(value).encode("utf-8"),
+        digest_size=4,
+    ).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def scene_config_hash(scene_config):
+    values = asdict(DEFAULT_SCENE_CONFIG if scene_config is None else scene_config)
+    payload = json.dumps(
+        values,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.blake2s(payload.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def derive_scene_seed(
+    base_seed,
+    pool_index=0,
+    task_family="head_in",
+    stage=1,
+    split="train",
+    scene_type=None,
+):
     task_family = normalize_task_family(task_family)
+    split = normalize_seed_split(split)
+    scene_type = normalize_scene_type(
+        DEFAULT_SCENE_CONFIG.scene_type if scene_type is None else scene_type
+    )
     seed_items = [
         int(base_seed) & 0xFFFFFFFF,
+        _SEED_SPLIT_TO_INDEX[split],
         int(stage) & 0xFFFFFFFF,
+        _stable_token32(scene_type),
         int(pool_index) & 0xFFFFFFFF,
         _TASK_FAMILY_TO_INDEX[task_family],
     ]
@@ -2604,15 +2655,22 @@ class CachedScenePool:
         stage=1,
         pool_size=16,
         base_seed=0,
+        split="train",
         scene_config=DEFAULT_SCENE_CONFIG,
         family_schedule=TASK_FAMILIES,
         scene_type_schedule=None,
         validate_scene_audit=True,
+        scene_refresh_enabled=False,
+        scene_refresh_interval=1000,
+        scene_refresh_count=1,
+        scene_refresh_start_episode=0,
     ):
         self.stage = int(stage)
         requested_pool_size = max(1, int(pool_size))
         self.base_seed = int(base_seed)
+        self.split = normalize_seed_split(split)
         self.scene_config = DEFAULT_SCENE_CONFIG if scene_config is None else scene_config
+        self.scene_config_hash = scene_config_hash(self.scene_config)
         self.family_schedule = normalize_family_schedule(family_schedule)
         if scene_type_schedule is None:
             scene_type_schedule = (
@@ -2626,8 +2684,13 @@ class CachedScenePool:
                 requested_pool_size += schedule_size - remainder
         self.pool_size = requested_pool_size
         self.validate_scene_audit = bool(validate_scene_audit)
+        self.scene_refresh_enabled = bool(scene_refresh_enabled) and self.split == "train"
+        self.scene_refresh_interval = max(1, int(scene_refresh_interval))
+        self.scene_refresh_count = max(0, int(scene_refresh_count))
+        self.scene_refresh_start_episode = max(0, int(scene_refresh_start_episode))
         self._scenes = []
         self._next_replacement_index = self.pool_size
+        self._next_refresh_slot = 0
         for index in range(self.pool_size):
             self._scenes.append(self._generate_scene_with_retries(index))
 
@@ -2658,15 +2721,22 @@ class CachedScenePool:
             pool_index=pool_index,
             task_family=task_family,
             stage=self.stage,
+            split=self.split,
+            scene_type=scene_type,
         )
+        typed_scene_config = self._scene_config_for_type(scene_type)
         scene = generate_cached_mixing_plant_scene(
             stage=self.stage,
             seed=scene_seed,
-            scene_config=self._scene_config_for_type(scene_type),
+            scene_config=typed_scene_config,
             task_family=task_family,
         )
         scene.metadata["requested_scene_type"] = scene_type
         scene.metadata["scene_type_schedule_size"] = int(len(self.scene_type_schedule))
+        scene.metadata["scene_seed_split"] = self.split
+        scene.metadata["seed_base"] = int(self.base_seed)
+        scene.metadata["scene_generation_index"] = int(pool_index)
+        scene.metadata["scene_config_hash"] = scene_config_hash(typed_scene_config)
         if self.validate_scene_audit:
             if bool(scene.metadata.get("nominal_target_collision", True)):
                 raise RuntimeError(
@@ -2726,6 +2796,7 @@ class CachedScenePool:
                 continue
             scene.metadata["scene_generation_attempt_count"] = int(attempt + 1)
             scene.metadata["scene_generation_attempts"] = int(attempt + 1)
+            scene.metadata["scene_pool_index"] = int(pool_index) % self.pool_size
             return scene
         raise RuntimeError(
             "failed to generate valid scene family {} type {} after {} attempts: {}".format(
@@ -2739,7 +2810,14 @@ class CachedScenePool:
     def get(self, episode_index):
         return self._scenes[int(episode_index) % len(self._scenes)]
 
-    def replace(self, episode_index, task_family=None, scene_type=None, max_attempts=16):
+    def replace(
+        self,
+        episode_index,
+        task_family=None,
+        scene_type=None,
+        max_attempts=16,
+        validate_callback=None,
+    ):
         scene_slot = int(episode_index) % len(self._scenes)
         if task_family is None:
             task_family = self._scenes[scene_slot].metadata.get("task_family")
@@ -2763,7 +2841,20 @@ class CachedScenePool:
             except _RETRYABLE_SCENE_GENERATION_ERRORS as exc:
                 last_error = exc
                 continue
+            if validate_callback is not None:
+                try:
+                    valid = bool(validate_callback(scene_slot, scene))
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                if not valid:
+                    last_error = RuntimeError(
+                        "replacement scene failed reset viability validation"
+                    )
+                    continue
             scene.metadata["scene_generation_attempt_count"] = int(attempt_index)
+            scene.metadata["scene_generation_attempts"] = int(attempt_index)
+            scene.metadata["scene_pool_index"] = int(scene_slot)
             self._scenes[scene_slot] = scene
             return scene
         raise RuntimeError(
@@ -2775,3 +2866,86 @@ class CachedScenePool:
                 last_error,
             )
         )
+
+    def _empty_refresh_diagnostics(self):
+        return {
+            "scene_refresh_used": False,
+            "scene_refresh_count": 0,
+            "refreshed_scene_seed": -1,
+            "refreshed_scene_seeds": [],
+            "scene_pool_slot": -1,
+            "scene_pool_slots": [],
+            "scene_config_hash": self.scene_config_hash,
+            "scene_refresh_failed_count": 0,
+            "scene_refresh_error": "",
+        }
+
+    def _refresh_due(self, episode_index):
+        if not self.scene_refresh_enabled:
+            return False
+        if self.split != "train":
+            return False
+        if self.scene_refresh_count <= 0:
+            return False
+        episode_index = int(episode_index)
+        if episode_index < self.scene_refresh_start_episode:
+            return False
+        return (episode_index - self.scene_refresh_start_episode) % self.scene_refresh_interval == 0
+
+    def maybe_refresh(self, episode_index, validate_callback=None):
+        diagnostics = self._empty_refresh_diagnostics()
+        if not self._refresh_due(episode_index):
+            return diagnostics
+
+        refreshed = []
+        failed_count = 0
+        last_error = ""
+        requested_count = min(int(self.scene_refresh_count), len(self._scenes))
+        for _ in range(requested_count):
+            slot = int(self._next_refresh_slot) % len(self._scenes)
+            self._next_refresh_slot = (slot + 1) % len(self._scenes)
+            old_scene = self._scenes[slot]
+            try:
+                scene = self.replace(
+                    slot,
+                    task_family=old_scene.metadata.get("task_family"),
+                    scene_type=old_scene.metadata.get(
+                        "requested_scene_type",
+                        old_scene.metadata.get("scene_type"),
+                    ),
+                    validate_callback=validate_callback,
+                )
+            except RuntimeError as exc:
+                failed_count += 1
+                last_error = str(exc)
+                continue
+            refreshed.append(
+                {
+                    "slot": int(slot),
+                    "seed": int(scene.metadata["seed"]),
+                    "scene_config_hash": str(
+                        scene.metadata.get("scene_config_hash", self.scene_config_hash)
+                    ),
+                }
+            )
+
+        if refreshed:
+            last = refreshed[-1]
+            diagnostics.update(
+                {
+                    "scene_refresh_used": True,
+                    "scene_refresh_count": int(len(refreshed)),
+                    "refreshed_scene_seed": int(last["seed"]),
+                    "refreshed_scene_seeds": [
+                        int(item["seed"]) for item in refreshed
+                    ],
+                    "scene_pool_slot": int(last["slot"]),
+                    "scene_pool_slots": [
+                        int(item["slot"]) for item in refreshed
+                    ],
+                    "scene_config_hash": str(last["scene_config_hash"]),
+                }
+            )
+        diagnostics["scene_refresh_failed_count"] = int(failed_count)
+        diagnostics["scene_refresh_error"] = str(last_error)
+        return diagnostics

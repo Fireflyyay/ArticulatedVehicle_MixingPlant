@@ -125,40 +125,47 @@ def test_env_step_can_disable_mask_floor_fallback(synthetic_action_mask):
     assert env.prev_gear_in_obs == 1.0
 
 
-def test_env_can_reset_from_viable_hard_case_replay_state(synthetic_action_mask):
+def test_env_regular_reset_records_scene_split_and_pool_metadata(synthetic_action_mask):
     config = replace(
         DEFAULT_ENV_CONFIG,
         curriculum_stage=3,
-        hard_case_replay_attempts=1,
-        hard_case_replay_xy_std=0.0,
-        hard_case_replay_heading_std_deg=0.0,
-        hard_case_replay_phi_std_deg=0.0,
     )
     env = LocalParkingEnv(
         config=config,
         action_mask=synthetic_action_mask,
         seed=31,
     )
-    _, reset_info = env.reset(seed=31)
-    replay_case = {
-        "scene": env.scene,
-        "slot": env.slot,
-        "state": env.state,
-        "stage": 3,
-        "episode": 4,
-        "scene_seed": reset_info["scene_seed"],
-        "scenario_type": reset_info["scenario_type"],
-        "task_family": reset_info["task_family"],
-        "failure_type": "timeout",
-    }
-
-    obs, info = env.reset(replay_case=replay_case)
+    obs, info = env.reset(seed=31)
 
     assert obs.shape == (149,)
-    assert info["hard_case_replay_attempted"] is True
-    assert info["hard_case_replay_used"] is True
-    assert info["hard_case_replay_source_episode"] == 4
-    assert info["scenario_type"].endswith("_hard_case_replay")
+    assert info["split"] == "train"
+    assert info["seed_base"] == 31
+    assert info["scene_pool_index"] >= 0
+    assert info["scene_config_hash"]
+    assert not any("replay" in key for key in info)
+
+
+def test_collect_one_regular_episode(synthetic_action_mask):
+    env = LocalParkingEnv(
+        config=replace(DEFAULT_ENV_CONFIG, curriculum_stage=1, max_steps=1),
+        action_mask=synthetic_action_mask,
+        seed=33,
+    )
+    agent = ContinuousPPOAgent(device="cpu")
+    observation, reset_info = env.reset(seed=33)
+    done = False
+    steps = 0
+    final_info = None
+    while not done:
+        raw_action, _, _ = agent.act(observation, deterministic=True)
+        observation, _, terminated, truncated, final_info = env.step(raw_action)
+        done = terminated or truncated
+        steps += 1
+
+    assert steps == 1
+    assert final_info is not None
+    assert reset_info["split"] == "train"
+    assert not any("replay" in key for key in reset_info)
 
 
 def test_actor_uses_bounded_global_log_std():
